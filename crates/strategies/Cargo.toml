@@ -1,0 +1,9 @@
+[package]
+name = "st-strategies"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+st-core.workspace = true
+rust_decimal.workspace = true
