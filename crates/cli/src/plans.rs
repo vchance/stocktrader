@@ -325,6 +325,10 @@ impl Plan {
         if self.name.is_empty() || !self.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
             bail!("name may only use lowercase letters, digits and dashes");
         }
+        // Each plan's paper files live in data/live/<name>/, beside the shared KILL file and journal.
+        if matches!(self.name.as_str(), "kill" | "journal") {
+            bail!("\"{}\" is reserved; choose another name", self.name);
+        }
         if self.capital <= Decimal::ZERO {
             bail!("capital must be positive");
         }
@@ -595,18 +599,34 @@ fn paper(dir: &Path, names: &[String], run: &PaperRunArgs) -> Result<()> {
         return Ok(());
     }
     // Every plan needs its own account: two plans sharing one would trade against each other's positions.
+    // Checked by key and then by the account each key opens (one account can have several key pairs), and
+    // against the shared keys used by `stocktrader paper`, all before anything trades.
+    let shared_key = std::env::var("APCA_API_KEY_ID").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let mut clients = Vec::new();
     let mut by_key: HashMap<String, &str> = HashMap::new();
     for plan in &plans {
         let (client, key_id) = crate::paper::client_from_env(&account_suffix(&plan.name), &run.trading_url)
             .with_context(|| format!("plan {} needs its own Alpaca paper account", plan.name))?;
+        if shared_key.as_deref() == Some(key_id.as_str()) {
+            bail!("plan {} uses the shared APCA_API_KEY_ID account; give each plan its own paper account", plan.name);
+        }
         if let Some(other) = by_key.insert(key_id, &plan.name) {
             bail!("plans {other} and {} use the same Alpaca account; give each plan its own paper account", plan.name);
         }
         clients.push(client);
     }
-
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut by_account: HashMap<String, &str> = HashMap::new();
+    for (plan, client) in plans.iter().zip(&clients) {
+        let account = rt.block_on(client.account()).with_context(|| format!("reading plan {}'s Alpaca account", plan.name))?;
+        if account.id.is_empty() {
+            bail!("Alpaca returned no account ID for plan {}; can't confirm it has its own account", plan.name);
+        }
+        if let Some(other) = by_account.insert(account.id, &plan.name) {
+            bail!("plans {other} and {} use keys for the same Alpaca account; give each plan its own paper account", plan.name);
+        }
+    }
+
     let mut failed = Vec::new();
     for (plan, client) in plans.iter().zip(&clients) {
         println!();
@@ -685,6 +705,7 @@ mod tests {
         let half = "name = \"q\"\n[strategy]\nkind = \"quality-value\"\n[risk]\nmax_gross_exposure = 0.5\n";
         assert!(parse(half).is_err(), "quality-value can't fit 1/N weights under half exposure");
         assert!(parse("name = \"Bad Name\"\n[strategy]\nkind = \"quality-value\"\n").is_err());
+        assert!(parse("name = \"kill\"\n[strategy]\nkind = \"quality-value\"\n").is_err(), "reserved name");
     }
 
     #[test]

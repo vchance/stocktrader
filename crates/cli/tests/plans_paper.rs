@@ -35,7 +35,8 @@ fn write_bars(dir: &Path) {
     }
 }
 
-/// Two accounts behind one mock, told apart by key: `ka` holds 30 DOWN, `kb` holds nothing.
+/// Two accounts behind one mock, told apart by key: `ka` (account A) holds 30 DOWN, `kb` (account B) holds
+/// nothing. `kc` is a second key pair for account A; `kblocked` opens a blocked account.
 async fn mock_alpaca() -> MockServer {
     let server = MockServer::start().await;
     let ok = |body: Value| ResponseTemplate::new(200).set_body_json(body);
@@ -45,9 +46,12 @@ async fn mock_alpaca() -> MockServer {
     Mock::given(method("GET")).and(path("/v2/calendar"))
         .respond_with(ok(json!([{"date": "2026-10-23"}, {"date": "2026-10-26"}, {"date": "2026-10-27"}])))
         .mount(&server).await;
-    for (key, positions) in [("ka", json!([{"symbol": "DOWN", "qty": "30", "avg_entry_price": "60", "current_price": "41"}])), ("kb", json!([]))] {
+    let down = json!([{"symbol": "DOWN", "qty": "30", "avg_entry_price": "60", "current_price": "41"}]);
+    for (key, id, blocked, positions) in
+        [("ka", "A", false, down.clone()), ("kb", "B", false, json!([])), ("kc", "A", false, down), ("kblocked", "C", true, json!([]))]
+    {
         Mock::given(method("GET")).and(path("/v2/account")).and(header("APCA-API-KEY-ID", key))
-            .respond_with(ok(json!({"status": "ACTIVE", "currency": "USD", "cash": "100000", "equity": "100000", "last_equity": "100000", "trading_blocked": false, "account_blocked": false})))
+            .respond_with(ok(json!({"id": id, "status": "ACTIVE", "currency": "USD", "cash": "100000", "equity": "100000", "last_equity": "100000", "trading_blocked": blocked, "account_blocked": false})))
             .mount(&server).await;
         Mock::given(method("GET")).and(path("/v2/positions")).and(header("APCA-API-KEY-ID", key)).respond_with(ok(positions)).mount(&server).await;
     }
@@ -76,6 +80,9 @@ fn write_plans(dir: &Path) {
 fn run(dir: &Path, server: &MockServer, keys: &[(&str, &str)], args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stocktrader"));
     cmd.current_dir(dir).env_remove("APCA_API_KEY_ID").env_remove("APCA_API_SECRET_KEY");
+    for plan in ["ALPHA", "BETA", "GAMMA"] {
+        cmd.env_remove(format!("APCA_API_KEY_ID_{plan}")).env_remove(format!("APCA_API_SECRET_KEY_{plan}"));
+    }
     for (k, v) in keys {
         cmd.env(k, v);
     }
@@ -175,4 +182,47 @@ async fn accounts_must_be_separate_and_present_and_plans_in_paper_mode() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("is in backtest mode"));
     assert!(posted(&server).await.is_empty(), "nothing is sent when the setup is wrong");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_keys_for_one_account_or_the_shared_keys_are_refused() {
+    let dir = setup();
+    let server = mock_alpaca().await;
+    let same_account = [("APCA_API_KEY_ID_ALPHA", "ka"), ("APCA_API_SECRET_KEY_ALPHA", "sa"), ("APCA_API_KEY_ID_BETA", "kc"), ("APCA_API_SECRET_KEY_BETA", "sc")];
+    let out = run(dir.path(), &server, &same_account, &["--submit"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("keys for the same Alpaca account"), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let mut with_shared = KEYS.to_vec();
+    with_shared.extend([("APCA_API_KEY_ID", "kb"), ("APCA_API_SECRET_KEY", "sb")]);
+    let out = run(dir.path(), &server, &with_shared, &["--submit"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uses the shared APCA_API_KEY_ID account"));
+    assert!(posted(&server).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_global_kill_file_stops_every_plan() {
+    let dir = setup();
+    let server = mock_alpaca().await;
+    std::fs::create_dir_all(dir.path().join("live")).unwrap();
+    std::fs::write(dir.path().join("live/KILL"), "market stress\n").unwrap();
+    let out = run(dir.path(), &server, &KEYS, &["--submit"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Only alpha's exit goes out; no plan buys.
+    assert_eq!(posted(&server).await, vec![("ka".into(), "st-2026-10-27-DOWN-sell".into())]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_failing_plan_doesnt_stop_the_others() {
+    let dir = setup();
+    let server = mock_alpaca().await;
+    let keys = [("APCA_API_KEY_ID_ALPHA", "kblocked"), ("APCA_API_SECRET_KEY_ALPHA", "sx"), ("APCA_API_KEY_ID_BETA", "kb"), ("APCA_API_SECRET_KEY_BETA", "sb")];
+    let out = run(dir.path(), &server, &keys, &["--submit"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "a failed plan fails the run");
+    assert!(stdout.contains("blocked from trading"), "{stdout}");
+    assert!(stdout.contains("paper plan        alpha                    FAILED"), "{stdout}");
+    assert!(stdout.contains("paper plan        beta                     ok"), "{stdout}");
+    assert_eq!(posted(&server).await, vec![("kb".into(), "st-2026-10-27-UP2-buy".into())]);
 }

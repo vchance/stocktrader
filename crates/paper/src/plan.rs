@@ -389,6 +389,7 @@ mod tests {
     #[test]
     fn broker_state_becomes_a_portfolio_and_pending_orders() {
         let account = Account {
+            id: "a1".into(),
             status: "ACTIVE".into(),
             currency: "USD".into(),
             cash: dec!(1_000),
