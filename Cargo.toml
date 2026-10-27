@@ -27,7 +27,7 @@ csv = "1"
 dotenvy = "0.15"
 flate2 = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 wiremock = "0.6"

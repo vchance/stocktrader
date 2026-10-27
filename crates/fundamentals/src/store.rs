@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, Date32Array, Float64Array, Int32Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use chrono::{Days, NaiveDate};
+use chrono::{NaiveDate, TimeDelta};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
@@ -41,8 +41,9 @@ fn days(d: NaiveDate) -> i32 {
     (d - epoch()).num_days() as i32
 }
 
+/// Signed: a filer's mistyped pre-1970 date must not make the whole file unreadable.
 fn date(days: i32) -> Result<NaiveDate> {
-    Ok(epoch() + Days::new(u64::try_from(days).context("date before 1970")?))
+    epoch().checked_add_signed(TimeDelta::days(i64::from(days))).context("date out of range")
 }
 
 fn to_batch(facts: &[Fact]) -> Result<RecordBatch> {
@@ -140,8 +141,9 @@ impl StagedFacts {
 pub struct FactFilter {
     pub ciks: Option<HashSet<u32>>,
     pub concepts: Option<HashSet<String>>,
-    /// Only facts filed on or before this date: what was public then.
-    pub filed_by: Option<NaiveDate>,
+    /// Only facts usable at the start of this date, i.e. filed before it. This is the same rule as
+    /// [`crate::available_at`], which releases a fact at midnight after its filing date.
+    pub as_of: Option<NaiveDate>,
 }
 
 fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
@@ -177,7 +179,7 @@ pub fn read_facts(path: &Path, filter: &FactFilter) -> Result<Vec<Fact>> {
             let filed_on = date(filed.value(i))?;
             if filter.ciks.as_ref().is_some_and(|c| !c.contains(&cik.value(i)))
                 || filter.concepts.as_ref().is_some_and(|c| !c.contains(concept.value(i)))
-                || filter.filed_by.is_some_and(|d| filed_on > d)
+                || filter.as_of.is_some_and(|d| filed_on >= d)
             {
                 continue;
             }
@@ -245,13 +247,34 @@ mod tests {
         assert_eq!(summarize(&path).unwrap().rows, 4);
 
         // As of 2024-12-31 the 10-Q/A restatement wasn't public yet.
-        let as_of = FactFilter {
-            concepts: Some(HashSet::from(["EarningsPerShareDiluted".to_string()])),
-            filed_by: NaiveDate::from_ymd_opt(2024, 12, 31),
-            ..FactFilter::default()
+        let eps = |as_of: NaiveDate| {
+            let filter = FactFilter {
+                concepts: Some(HashSet::from(["EarningsPerShareDiluted".to_string()])),
+                as_of: Some(as_of),
+                ..FactFilter::default()
+            };
+            read_facts(&path, &filter).unwrap().iter().map(|f| f.value).collect::<Vec<_>>()
         };
-        let eps = read_facts(&path, &as_of).unwrap();
-        assert_eq!(eps.len(), 1);
-        assert_eq!(eps[0].value, 0.97);
+        assert_eq!(eps(NaiveDate::from_ymd_opt(2024, 12, 31).unwrap()), vec![0.97]);
+
+        // The restatement was filed 2025-01-31: not usable that day, usable from the next.
+        let filed = NaiveDate::from_ymd_opt(2025, 1, 31).unwrap();
+        assert_eq!(eps(filed), vec![0.97]);
+        assert_eq!(eps(filed + chrono::Days::new(1)), vec![0.97, 0.98]);
+        // Same rule as the events: available at midnight New York at the start of the next day.
+        let next_midnight = crate::available_at(filed).with_timezone(&chrono_tz::America::New_York);
+        assert_eq!(next_midnight.date_naive(), filed + chrono::Days::new(1));
+    }
+
+    #[test]
+    fn pre_1970_dates_do_not_break_the_file() {
+        let mut fact = parse_company(apple().as_bytes()).unwrap().facts.remove(0);
+        fact.end = NaiveDate::from_ymd_opt(201, 9, 28).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.parquet");
+        let mut writer = FactWriter::create(&path).unwrap();
+        writer.write(std::slice::from_ref(&fact)).unwrap();
+        writer.finish().unwrap().commit().unwrap();
+        assert_eq!(read_facts(&path, &FactFilter::default()).unwrap(), vec![fact]);
     }
 }

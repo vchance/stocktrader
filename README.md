@@ -52,12 +52,20 @@ clients) writes to `data/fundamentals/`:
 | `manifest.json` | What the committed file contains |
 
 Restatements and the prior-period comparatives that every filing repeats are all kept, each with the
-date it became public, so `fundamentals show AAPL --as-of 2024-12-31` shows exactly what was known that
-day. In backtests a fact becomes available at midnight New York time after its filing date (the bulk
-data has no time of day, and EDGAR accepts filings until 22:00). The SEC's ~1 GB bulk file is fetched
-with `If-Modified-Since`, so an unchanged night costs one request; results are staged and only replace
-the previous file if non-empty, fresh, and not much smaller. Known limits: tickers are today's mapping,
-so renamed or delisted companies may lack one; concept coverage varies by filer.
+date it became public. A fact becomes usable at midnight New York time after its filing date (the bulk
+data has no time of day, and EDGAR accepts filings until 22:00), both as a backtest event and in
+`fundamentals show AAPL --as-of 2024-12-31`, which shows what was known at the start of that day. Same-day
+duplicates (an amendment filed with the original) resolve to the later accession. Values come per
+reported period: quarterly, year-to-date and annual figures share a period end and are told apart by
+`period_start`; fourth quarters are not reported separately (derive them as annual minus nine months).
+
+The SEC's ~1 GB bulk file is fetched with `If-Modified-Since`, so an unchanged night costs one request;
+results are staged and only replace the previous file if non-empty, fresh, and not much smaller.
+
+**Known limit (important for backtests):** tickers come from the SEC's *current* CIK→ticker map. Applied
+to history, a ticker that once belonged to another company gets this company's fundamentals, renamed
+companies lose their old symbol, and delisted companies have none. Daily ticker snapshots are kept from
+deployment onward so symbols can later be resolved as of each date. Concept coverage also varies by filer.
 
 ## Data collector
 

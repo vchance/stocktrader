@@ -78,6 +78,8 @@ pub async fn sync(client: &SecClient, cfg: &SyncConfig) -> Result<SyncReport> {
     let (staged, documents, failed, malformed) = extract(&zip, &facts_path(&cfg.root))?;
     if let Err(e) = check(&staged, cfg, documents, failed) {
         let _ = staged.discard();
+        // Over a gigabyte, and the next run downloads afresh anyway (state.json was not advanced).
+        let _ = fs::remove_file(&zip);
         return Err(e);
     }
     let stats = staged.stats.clone();
@@ -94,8 +96,11 @@ pub async fn sync(client: &SecClient, cfg: &SyncConfig) -> Result<SyncReport> {
         "malformed_entries": malformed,
     });
     write_atomic(&cfg.root.join("manifest.json"), &serde_json::to_vec_pretty(&manifest)?)?;
-    // Over a gigabyte, and the SEC republishes it nightly; the Parquet file is what we keep.
-    fs::remove_file(&zip)?;
+    // Over a gigabyte, and the SEC republishes it nightly; the Parquet file is what we keep. The sync has
+    // already succeeded, so failing to delete is only worth a warning.
+    if let Err(e) = fs::remove_file(&zip) {
+        tracing::warn!("could not delete {}: {e}", zip.display());
+    }
     Ok(SyncReport::Updated { tickers, stats, documents, failed, malformed })
 }
 
@@ -144,6 +149,9 @@ fn check(file: &StagedFacts, cfg: &SyncConfig, documents: usize, failed: usize) 
     }
     if s.last_filed.is_none_or(|d| d + Days::new(MAX_STALENESS_DAYS) < cfg.today) {
         bail!("newest filing {:?} is too far before {}; keeping the previous file", s.last_filed, cfg.today);
+    }
+    if s.last_filed.is_some_and(|d| d > cfg.today + Days::new(1)) {
+        bail!("newest filing {:?} is after {}; check the clock; keeping the previous file", s.last_filed, cfg.today);
     }
     if cfg.force || !file.path().exists() {
         return Ok(());

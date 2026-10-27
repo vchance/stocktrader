@@ -357,11 +357,11 @@ install_ops() {
     enable_timers stocktrader-health.timer stocktrader-housekeeping.timer
 }
 
-# Writes the service and timer for a sync job. Args: script units-dir name description subcommand calendar.
-# Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the start
-# limit stops a persistent failure from retrying all day.
+# Writes the service and timer for a sync job. Args: script units-dir name service-description
+# timer-description subcommand calendar. Retries cover a catch-up run firing at boot before Docker is up,
+# or a transient API outage; the start limit stops a persistent failure from retrying all day.
 write_sync_units() {
-    local self units="$2" name="$3" description="$4" subcommand="$5" calendar="$6"
+    local self units="$2" name="$3" description="$4" timer_description="$5" subcommand="$6" calendar="$7"
     self="$(unit_path "$1")"
     mkdir -p "$units"
     cat >"$units/$name.service" <<EOF
@@ -382,7 +382,7 @@ RestartSec=20min
 EOF
     cat >"$units/$name.timer" <<EOF
 [Unit]
-Description=stocktrader: $description
+Description=stocktrader: $timer_description
 
 [Timer]
 OnCalendar=$calendar
@@ -398,7 +398,7 @@ install_timer() {
     local units="${2:-$HOME/.config/systemd/user}"
     # After each US session (Mon-Fri), once Alpaca has the final daily bars.
     write_sync_units "$1" "$units" stocktrader-marketdata "download universe and daily price history" \
-        sync-marketdata "Tue..Sat 03:00 America/New_York"
+        "nightly market data sync" sync-marketdata "Tue..Sat 03:00 America/New_York"
     if [[ -n "${2:-}" ]]; then
         echo "Wrote units to $units without installing them."
         return 0
@@ -410,7 +410,7 @@ install_fundamentals_timer() {
     local units="${2:-$HOME/.config/systemd/user}"
     # The SEC regenerates its bulk files overnight; an unchanged file costs one conditional request.
     write_sync_units "$1" "$units" stocktrader-fundamentals "SEC company fundamentals" \
-        sync-fundamentals "*-*-* 06:00 America/New_York"
+        "daily SEC fundamentals sync" sync-fundamentals "*-*-* 06:00 America/New_York"
     if [[ -n "${2:-}" ]]; then
         echo "Wrote units to $units without installing them."
         return 0

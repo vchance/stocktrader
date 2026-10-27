@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 /// Concepts extracted from each company, as (taxonomy, concept). Different filers report the same idea
 /// under different tags (revenue especially), so several are kept and reconciled downstream.
@@ -10,11 +11,17 @@ pub const CONCEPTS: &[(&str, &str)] = &[
     // Income statement
     ("us-gaap", "Revenues"),
     ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
+    ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
     ("us-gaap", "SalesRevenueNet"),
+    ("us-gaap", "SalesRevenueGoodsNet"),
     ("us-gaap", "CostOfRevenue"),
+    ("us-gaap", "CostOfGoodsAndServicesSold"),
     ("us-gaap", "GrossProfit"),
     ("us-gaap", "ResearchAndDevelopmentExpense"),
+    ("us-gaap", "OperatingExpenses"),
     ("us-gaap", "OperatingIncomeLoss"),
+    ("us-gaap", "InterestExpense"),
+    ("us-gaap", "IncomeTaxExpenseBenefit"),
     ("us-gaap", "NetIncomeLoss"),
     ("us-gaap", "EarningsPerShareBasic"),
     ("us-gaap", "EarningsPerShareDiluted"),
@@ -26,9 +33,12 @@ pub const CONCEPTS: &[(&str, &str)] = &[
     ("us-gaap", "Liabilities"),
     ("us-gaap", "LiabilitiesCurrent"),
     ("us-gaap", "StockholdersEquity"),
+    ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
     ("us-gaap", "CashAndCashEquivalentsAtCarryingValue"),
     ("us-gaap", "LongTermDebt"),
     ("us-gaap", "LongTermDebtNoncurrent"),
+    ("us-gaap", "LongTermDebtCurrent"),
+    ("us-gaap", "DebtCurrent"),
     ("us-gaap", "InventoryNet"),
     // Cash flow
     ("us-gaap", "NetCashProvidedByUsedInOperatingActivities"),
@@ -40,13 +50,19 @@ pub const CONCEPTS: &[(&str, &str)] = &[
     ("us-gaap", "CommonStockSharesOutstanding"),
     // Foreign filers (20-F / 40-F) using IFRS
     ("ifrs-full", "Revenue"),
+    ("ifrs-full", "CostOfSales"),
+    ("ifrs-full", "GrossProfit"),
     ("ifrs-full", "ProfitLoss"),
     ("ifrs-full", "Assets"),
+    ("ifrs-full", "Liabilities"),
     ("ifrs-full", "Equity"),
 ];
 
-/// Periodic reports. Current reports (8-K) and registration statements are left out.
-pub const FORMS: &[&str] = &["10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "20-F/A", "40-F", "40-F/A"];
+/// Periodic reports, including transition-period reports (10-KT/10-QT) after a fiscal-year change.
+/// Current reports (8-K, 6-K) and registration statements are left out.
+pub const FORMS: &[&str] = &[
+    "10-K", "10-K/A", "10-Q", "10-Q/A", "10-KT", "10-KT/A", "10-QT", "10-QT/A", "20-F", "20-F/A", "40-F", "40-F/A",
+];
 
 /// One reported value as of one filing.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,17 +84,20 @@ pub struct Fact {
     pub frame: Option<String>,
 }
 
+/// Concepts are kept as borrowed raw JSON and only the curated ones are parsed further. Parsing every
+/// concept into `serde_json::Value` trees costs several times the document size, and the largest company
+/// documents are tens of megabytes.
 #[derive(Deserialize)]
-struct CompanyFacts {
+struct CompanyFacts<'a> {
     cik: serde_json::Value,
-    #[serde(default)]
-    facts: HashMap<String, HashMap<String, ConceptFacts>>,
+    #[serde(default, borrow)]
+    facts: HashMap<String, HashMap<String, &'a RawValue>>,
 }
 
 #[derive(Deserialize)]
-struct ConceptFacts {
-    #[serde(default)]
-    units: HashMap<String, Vec<serde_json::Value>>,
+struct ConceptFacts<'a> {
+    #[serde(default, borrow)]
+    units: HashMap<String, Vec<&'a RawValue>>,
 }
 
 #[derive(Deserialize)]
@@ -116,14 +135,18 @@ pub fn parse_company(json: &[u8]) -> Result<Parsed> {
     let mut facts = Vec::new();
     let mut malformed = 0;
     for &(taxonomy, concept) in CONCEPTS {
-        let Some(found) = doc.facts.get(taxonomy).and_then(|t| t.get(concept)) else {
+        let Some(raw_concept) = doc.facts.get(taxonomy).and_then(|t| t.get(concept)) else {
             continue;
         };
-        let mut units: Vec<(&String, &Vec<serde_json::Value>)> = found.units.iter().collect();
+        let Ok(found) = serde_json::from_str::<ConceptFacts>(raw_concept.get()) else {
+            malformed += 1;
+            continue;
+        };
+        let mut units: Vec<(&String, &Vec<&RawValue>)> = found.units.iter().collect();
         units.sort_by_key(|(unit, _)| unit.as_str());
         for (unit, entries) in units {
             for entry in entries {
-                let Ok(raw) = RawFact::deserialize(entry) else {
+                let Ok(raw) = serde_json::from_str::<RawFact>(entry.get()) else {
                     malformed += 1;
                     continue;
                 };

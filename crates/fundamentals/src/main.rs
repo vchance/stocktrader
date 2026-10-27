@@ -35,7 +35,8 @@ enum Command {
     /// Print what was known about one company as of a date.
     Show {
         ticker: String,
-        /// Only facts filed on or before this date (default: everything).
+        /// Only facts usable at the start of this date, i.e. filed before it, matching when backtests see
+        /// them (default: everything).
         #[arg(long)]
         as_of: Option<NaiveDate>,
         /// Comma-separated concepts, e.g. Revenues,NetIncomeLoss.
@@ -86,7 +87,7 @@ async fn main() -> Result<()> {
             let filter = FactFilter {
                 ciks: Some(ciks),
                 concepts: (!concepts.is_empty()).then(|| concepts.into_iter().collect()),
-                filed_by: as_of,
+                as_of,
             };
             let names = primary_tickers(&listings);
             let mut facts = read_facts(&facts_path(&cli.data_dir), &filter)?;
