@@ -67,6 +67,25 @@ to history, a ticker that once belonged to another company gets this company's f
 companies lose their old symbol, and delisted companies have none. Daily ticker snapshots are kept from
 deployment onward so symbols can later be resolved as of each date. Concept coverage also varies by filer.
 
+## Social signals
+
+`signals apewisdom` rebuilds `data/signals/apewisdom.parquet` from the raw archive (both `.jsonl` and
+compacted `.jsonl.gz`): one row per ticker per ApeWisdom snapshot with rank, 24h mentions, net upvotes
+(can be negative), and the same figures 24h earlier. Each row is stamped with the time its page was
+fetched, so in a backtest it becomes an `Attention` event exactly when we knew it. It is derived data:
+nightly housekeeping rebuilds it, and backups skip it. `signals show TSLA` prints a ticker's history.
+
+```
+cargo run -p st-signals -- apewisdom
+cargo run -p st-cli -- backtest --strategy attention-spike --attention data/signals/apewisdom.parquet \
+    --parquet data/marketdata/bars_daily_all.parquet --min-price 0
+```
+
+`attention-spike` buys when mentions are at least `--spike-ratio` (3) times the previous 24h and at least
+`--spike-min-mentions` (50), and sells `--spike-hold-days` (5) after the latest spike. It shows the
+pipeline end to end; it is not a validated strategy. Real backtests need weeks of collected attention
+data overlapping the price history.
+
 ## Data collector
 
 `collector` archives news and social data that **cannot be backfilled later**, verbatim, to
@@ -208,7 +227,8 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 2. ~~Start archiving news and social feeds~~ (`collector`, running on `jabrony`). Next: compress old files.
 3. ~~EDGAR fundamentals with point-in-time filing dates~~ (`fundamentals`). Next: historical ticker
    mapping, and feeding facts into strategies.
-4. Text pipeline: ticker extraction, dedupe, sentiment scoring (FinBERT via ONNX, or an LLM), mention velocity.
+4. ~~Mention velocity from ApeWisdom~~ (`signals`, `attention-spike`). Next: Reddit and news text pipeline
+   (ticker extraction, dedupe, sentiment scoring via FinBERT/ONNX or an LLM) once those sources have keys.
 5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`. Before that: extract a mode-agnostic
    engine step from `Backtest` so paper/live don't duplicate the loop; decouple fills from market events
    (async fills, partials, rejects, cancels); reconcile positions and cash against the broker; give strategies

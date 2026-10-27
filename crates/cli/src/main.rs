@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::NaiveDate;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
-use st_core::Event;
+use st_core::{Event, Strategy};
 use st_data::{SyntheticConfig, VecEventSource, generate_daily_bars, load_daily_bars};
 use st_engine::{Backtest, FillModel, SimulatedBroker};
 use st_marketdata::{BarFilter, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
-use st_strategies::SmaCrossover;
+use st_strategies::{AttentionSpike, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -52,10 +52,26 @@ struct BacktestArgs {
     seed: u64,
     #[arg(long, default_value = "100000")]
     cash: Decimal,
+    #[arg(long, value_enum, default_value_t = StrategyName::Sma)]
+    strategy: StrategyName,
+    /// SMA crossover: fast window.
     #[arg(long, default_value_t = 20)]
     fast: usize,
+    /// SMA crossover: slow window.
     #[arg(long, default_value_t = 50)]
     slow: usize,
+    /// Attention table from `signals apewisdom` (data/signals/apewisdom.parquet), merged into the replay.
+    #[arg(long)]
+    attention: Option<PathBuf>,
+    /// Attention spike: minimum mentions in the last 24h.
+    #[arg(long, default_value_t = 50)]
+    spike_min_mentions: u32,
+    /// Attention spike: minimum ratio of mentions to the previous 24h.
+    #[arg(long, default_value_t = 3.0)]
+    spike_ratio: f64,
+    /// Attention spike: days to hold after the latest spike.
+    #[arg(long, default_value_t = 5)]
+    spike_hold_days: u32,
     /// Target weight per position when long.
     #[arg(long, default_value = "0.05")]
     weight: Decimal,
@@ -65,6 +81,14 @@ struct BacktestArgs {
     /// prices; set 0 to disable.
     #[arg(long, default_value = "5")]
     min_price: Decimal,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StrategyName {
+    /// Moving-average crossover on prices.
+    Sma,
+    /// Buy on a jump in social-media mentions (needs --attention).
+    AttentionSpike,
 }
 
 fn main() -> Result<()> {
@@ -113,11 +137,30 @@ fn backtest(args: BacktestArgs) -> Result<()> {
         }),
     };
     let n_bars = bars.len();
-    let source = VecEventSource::new(bars.into_iter().map(Event::bar).collect());
+    let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
+    if let Some(path) = &args.attention {
+        let attention = st_signals::to_events(&st_signals::read_rows(path, None)?);
+        println!("attention events  {}", attention.len());
+        events.extend(attention);
+    }
+    let source = VecEventSource::new(events);
+
+    let strategy: Box<dyn Strategy> = match args.strategy {
+        StrategyName::Sma => Box::new(SmaCrossover::new(args.fast, args.slow, args.weight).map_err(anyhow::Error::msg)?),
+        StrategyName::AttentionSpike => {
+            if args.attention.is_none() {
+                bail!("--strategy attention-spike needs --attention data/signals/apewisdom.parquet");
+            }
+            Box::new(
+                AttentionSpike::new(args.spike_min_mentions, args.spike_ratio, args.spike_hold_days, args.weight)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        }
+    };
 
     let report = Backtest::new(
         source,
-        SmaCrossover::new(args.fast, args.slow, args.weight).map_err(anyhow::Error::msg)?,
+        strategy,
         SimulatedBroker::new(FillModel { slippage_bps: args.slippage_bps, ..FillModel::default() }),
         RiskManager::new(RiskLimits { min_price: args.min_price, ..RiskLimits::default() }),
         args.cash,

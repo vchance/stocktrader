@@ -5,8 +5,88 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use chrono::TimeDelta;
 use rust_decimal::Decimal;
-use st_core::{Event, EventKind, Signal, Strategy, StrategyContext, Symbol};
+use st_core::{Event, EventKind, Signal, Strategy, StrategyContext, Symbol, Timestamp};
+
+/// Buys a stock when its social-media mentions jump versus a day earlier, and holds it for a fixed time
+/// after the latest spike. A worked example of trading on attention events; not a validated strategy.
+pub struct AttentionSpike {
+    min_mentions: u32,
+    min_ratio: f64,
+    hold: TimeDelta,
+    weight: Decimal,
+    /// Time of each held symbol's most recent qualifying spike.
+    last_spike: HashMap<Symbol, Timestamp>,
+}
+
+impl AttentionSpike {
+    /// Enter when mentions are at least `min_mentions` and at least `min_ratio` times the previous
+    /// window's; exit `hold_days` after the most recent such spike.
+    pub fn new(min_mentions: u32, min_ratio: f64, hold_days: u32, weight: Decimal) -> Result<Self, String> {
+        if !(min_ratio.is_finite() && min_ratio > 1.0) {
+            return Err(format!("ratio must be above 1, got {min_ratio}"));
+        }
+        if hold_days == 0 {
+            return Err("hold must be at least one day".into());
+        }
+        if weight <= Decimal::ZERO || weight > Decimal::ONE {
+            return Err(format!("weight must be in (0, 1], got {weight}"));
+        }
+        Ok(Self {
+            min_mentions,
+            min_ratio,
+            hold: TimeDelta::days(i64::from(hold_days)),
+            weight,
+            last_spike: HashMap::new(),
+        })
+    }
+}
+
+impl Strategy for AttentionSpike {
+    fn name(&self) -> &str {
+        "attention_spike"
+    }
+
+    fn on_event(&mut self, event: &Event, ctx: &StrategyContext<'_>) -> Vec<Signal> {
+        match &event.kind {
+            EventKind::Attention(a) => {
+                let Some(prev) = a.mentions_prev.filter(|p| *p > 0) else {
+                    return Vec::new();
+                };
+                let ratio = f64::from(a.mentions) / f64::from(prev);
+                if a.mentions < self.min_mentions || ratio < self.min_ratio {
+                    return Vec::new();
+                }
+                self.last_spike.insert(a.symbol.clone(), ctx.now);
+                vec![Signal {
+                    symbol: a.symbol.clone(),
+                    target_weight: self.weight,
+                    reason: format!("{} mentions vs {prev} a day earlier ({ratio:.1}x) on {}", a.mentions, a.source),
+                }]
+            }
+            // Restate the target on every bar while holding, so a rejected entry is retried and the exit
+            // happens on schedule.
+            EventKind::Bar(bar) => match self.last_spike.get(&bar.symbol) {
+                Some(&spike) if ctx.now - spike <= self.hold => vec![Signal {
+                    symbol: bar.symbol.clone(),
+                    target_weight: self.weight,
+                    reason: "holding after attention spike".into(),
+                }],
+                Some(_) => {
+                    self.last_spike.remove(&bar.symbol);
+                    vec![Signal {
+                        symbol: bar.symbol.clone(),
+                        target_weight: Decimal::ZERO,
+                        reason: format!("{} days since the last attention spike", self.hold.num_days()),
+                    }]
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+}
 
 /// Moving-average crossover: long `weight` while the fast SMA is above the slow SMA, flat otherwise.
 ///

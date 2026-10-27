@@ -13,6 +13,6 @@ pub mod runner;
 pub mod source;
 pub mod sources;
 
-pub use archive::{Archive, RawRecord};
+pub use archive::{Archive, RawRecord, ReadStats, read_source};
 pub use config::Config;
 pub use source::{AnySource, Source};

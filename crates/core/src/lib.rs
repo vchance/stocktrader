@@ -6,7 +6,7 @@ pub mod portfolio;
 pub mod traits;
 pub mod types;
 
-pub use event::{Bar, Event, EventKind, FundamentalRecord, NewsItem, SentimentObservation};
+pub use event::{AttentionObservation, Bar, Event, EventKind, FundamentalRecord, NewsItem, SentimentObservation};
 pub use order::{Fill, OrderId, OrderRequest, OrderType, Side, Signal};
 pub use portfolio::{Portfolio, Position};
 pub use traits::{Clock, EventSource, ExecutionAdapter, ExecutionError, Strategy, StrategyContext};

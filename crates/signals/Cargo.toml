@@ -1,0 +1,24 @@
+[package]
+name = "st-signals"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "signals"
+path = "src/main.rs"
+
+[dependencies]
+st-collector.workspace = true
+st-core.workspace = true
+anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+clap.workspace = true
+parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

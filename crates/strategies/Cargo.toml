@@ -6,4 +6,5 @@ publish.workspace = true
 
 [dependencies]
 st-core.workspace = true
+chrono.workspace = true
 rust_decimal.workspace = true

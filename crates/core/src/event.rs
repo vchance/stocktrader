@@ -49,12 +49,30 @@ pub struct SentimentObservation {
     pub mentions: u32,
 }
 
+/// How much attention a symbol is getting on social media, as counted by an aggregator, without any
+/// judgment of tone. Counts cover the trailing `window_hours` up to the event's `available_at`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttentionObservation {
+    pub symbol: Symbol,
+    pub source: String,
+    pub window_hours: u32,
+    pub mentions: u32,
+    /// Mentions in the window ending `window_hours` earlier, if the source reports it.
+    pub mentions_prev: Option<u32>,
+    /// Rank by mentions among all symbols the source tracks (1 = most mentioned).
+    pub rank: Option<u32>,
+    pub rank_prev: Option<u32>,
+    /// Net votes on the mentioning posts; negative when downvotes outnumber upvotes.
+    pub upvotes: Option<i32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     Bar(Bar),
     News(NewsItem),
     Fundamental(FundamentalRecord),
     Sentiment(SentimentObservation),
+    Attention(AttentionObservation),
 }
 
 /// Every piece of data entering the system is stamped with the moment it became public. Backtests only
