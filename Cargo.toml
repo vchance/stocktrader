@@ -11,6 +11,7 @@ publish = false
 st-core = { path = "crates/core" }
 st-data = { path = "crates/data" }
 st-engine = { path = "crates/engine" }
+st-fundamentals = { path = "crates/fundamentals" }
 st-marketdata = { path = "crates/marketdata" }
 st-risk = { path = "crates/risk" }
 st-strategies = { path = "crates/strategies" }
@@ -29,6 +30,7 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
 wiremock = "0.6"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 rust_decimal = { version = "1", features = ["serde"] }
 rust_decimal_macros = "1"
 serde = { version = "1", features = ["derive"] }

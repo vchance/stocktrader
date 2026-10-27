@@ -30,6 +30,9 @@ pub struct NewsItem {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FundamentalRecord {
     pub symbol: Symbol,
+    /// `None` for point-in-time values (balance sheet items, shares outstanding). Distinguishes quarterly,
+    /// year-to-date and annual figures that share a `period_end`.
+    pub period_start: Option<NaiveDate>,
     pub period_end: NaiveDate,
     pub metric: String,
     pub value: Decimal,
