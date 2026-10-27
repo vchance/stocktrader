@@ -1,11 +1,12 @@
-# Use deploy/collector.sh, which sets COLLECTOR_UID/GID and creates .env and data/ with the right owner.
+# Start with deploy/collector.sh, which sets COLLECTOR_UID/GID and creates .env and data/ with the right owner.
 services:
   collector:
     build: .
     image: stocktrader-collector
     restart: unless-stopped
-    # Run as the host user so archive files in ./data are owned by them, not root.
-    user: "${COLLECTOR_UID:?run via deploy/collector.sh}:${COLLECTOR_GID:?run via deploy/collector.sh}"
+    # Run as the host user so archive files in ./data are owned by them, not root. deploy/collector.sh
+    # exports the real IDs; the defaults only let plain `docker compose logs/stop` work without it.
+    user: "${COLLECTOR_UID:-1000}:${COLLECTOR_GID:-1000}"
     # Plain KEY=value lines; Docker does not strip quotes the way dotenv does.
     env_file: .env
     volumes:
