@@ -39,6 +39,11 @@ fn main() -> Result<()> {
         Command::Apewisdom => {
             let mut records = Vec::new();
             let read = read_source(&cli.archive, SOURCE, |r| records.push(r))?;
+            if read.records == 0 {
+                // A fresh install: nothing to derive yet, and any existing table is left as it is.
+                println!("no {SOURCE} records under {} yet; nothing to build", cli.archive.display());
+                return Ok(());
+            }
             let build = build_rows(records);
             write_rows(&table, &build.rows)?;
             println!(
