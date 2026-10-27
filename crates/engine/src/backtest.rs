@@ -11,9 +11,11 @@ use crate::clock::SimClock;
 use crate::exchange_date;
 use crate::metrics::{self, Metrics};
 
-/// Skip a resize smaller than this fraction of equity, so equity drift doesn't churn small trades.
-/// Exits to flat always go through.
+/// Skip resizing an existing position by less than this fraction of equity, so equity drift doesn't
+/// churn small trades. Entries and exits to flat always go through.
 const REBALANCE_BAND: Decimal = dec!(0.01);
+/// Buys smaller than this fraction of equity are skipped, so target weights below it never trade.
+const MIN_BUY: Decimal = dec!(0.0025);
 /// Headroom kept when sizing buys from cash, since a market order fills at the next open, not the last close.
 const CASH_BUFFER: Decimal = dec!(0.02);
 
@@ -134,9 +136,11 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
         let open = self.broker.open_orders();
         let equity = self.portfolio.equity();
         let target_qty = (equity * signal.target_weight / price).trunc().max(Decimal::ZERO);
-        let mut delta = target_qty - self.portfolio.projected_qty(&signal.symbol, &open);
+        let projected = self.portfolio.projected_qty(&signal.symbol, &open);
+        let mut delta = target_qty - projected;
 
-        if !target_qty.is_zero() && (delta * price).abs() < equity * REBALANCE_BAND {
+        let resize = !target_qty.is_zero() && !projected.is_zero();
+        if resize && (delta * price).abs() < equity * REBALANCE_BAND {
             return;
         }
         if delta > Decimal::ZERO {
@@ -148,6 +152,10 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
             let available = self.portfolio.cash() - reserved * (Decimal::ONE + CASH_BUFFER);
             let affordable = (available / (price * (Decimal::ONE + CASH_BUFFER))).trunc().max(Decimal::ZERO);
             delta = delta.min(affordable);
+            // Cash or gross-exposure headroom can shrink an order to a sliver; skip those.
+            if delta * price < equity * MIN_BUY {
+                return;
+            }
         }
         if delta.is_zero() {
             return;
