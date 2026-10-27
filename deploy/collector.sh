@@ -16,6 +16,8 @@
 #                                        (install-ops/install-timer DIR only write the units to DIR)
 set -euo pipefail
 
+# Every `docker compose run` reads from /dev/null: run attaches stdin by default and would otherwise swallow
+# input meant for whatever invoked this script.
 SYNC_CONTAINER=stocktrader-marketdata-sync
 # Exit status when another sync is already running; the systemd unit treats it as success.
 ALREADY_RUNNING=75
@@ -46,7 +48,7 @@ main() {
             ;;
         status)
             docker compose ps
-            docker compose run --rm --no-deps collector sources
+            docker compose run --rm --no-deps -T collector sources </dev/null
             ;;
         logs)
             docker compose logs -f --tail=100 collector
@@ -117,7 +119,7 @@ sync_marketdata() {
     docker compose build marketdata
     # Clear only an exited leftover; `docker rm` without -f refuses a running container.
     docker rm "$SYNC_CONTAINER" >/dev/null 2>&1 || true
-    docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "$@" &
+    docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "$@" </dev/null &
     local pid=$! status=0
     # On SIGTERM (e.g. a systemd timeout) stop the container this run started, not just the compose client.
     trap 'docker stop "$SYNC_CONTAINER" >/dev/null 2>&1 || true' TERM INT
@@ -136,7 +138,7 @@ health() {
     if [[ -z "$(docker compose ps -q --status running collector 2>/dev/null)" ]]; then
         problems+="collector NOT-RUNNING"$'\n'
     fi
-    report="$(docker compose run --rm --no-deps -T collector health 2>&1)" || status=$?
+    report="$(docker compose run --rm --no-deps -T collector health 2>&1 </dev/null)" || status=$?
     echo "$report"
     if ((status != 0)); then
         # Only names and states, so the alert key doesn't change as ages tick up.
@@ -183,7 +185,7 @@ alert_on_change() {
 housekeeping() {
     prepare
     local failed=""
-    docker compose run --rm --no-deps -T collector compact || failed+="compaction "
+    docker compose run --rm --no-deps -T collector compact </dev/null || failed+="compaction "
     backup || failed+="backup "
     if [[ -n "$failed" ]]; then
         notify "stocktrader on $(hostname): ${failed}failed" "See: journalctl --user -u stocktrader-housekeeping"
