@@ -55,6 +55,11 @@ fn benchmark_helpers() {
     let inverted: Vec<_> = curve.iter().map(|(t, v)| (*t, dec!(3000) - *v)).collect();
     assert!(correlation(&curve, &inverted).unwrap() < -0.9);
     assert_eq!(correlation(&curve[..2], &curve[..2]), None, "too few shared days");
+
+    // A benchmark missing every other day still correlates perfectly with the same path, because returns
+    // are only taken across dates both series have.
+    let sparse: Vec<_> = curve.iter().step_by(2).copied().collect();
+    assert!((correlation(&curve, &sparse).unwrap() - 1.0).abs() < 1e-9);
 }
 
 #[test]

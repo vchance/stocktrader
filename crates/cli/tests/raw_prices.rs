@@ -12,6 +12,11 @@ use st_marketdata::{BarWriter, DailyBar};
 /// putting all adjusted history under $5) and, optionally, `bars_daily_raw.parquet` with the prices as
 /// traded (roughly $10-300).
 fn write_pair(dir: &Path, with_raw: bool) {
+    write_pair_without(dir, with_raw, None);
+}
+
+/// As [`write_pair`], leaving `missing` out of the raw file only.
+fn write_pair_without(dir: &Path, with_raw: bool, missing: Option<&str>) {
     let bars = generate_daily_bars(&SyntheticConfig {
         symbols: 10,
         days: 200,
@@ -40,18 +45,35 @@ fn write_pair(dir: &Path, with_raw: bool) {
     };
     write("bars_daily_all.parquet", daily(100.0));
     if with_raw {
-        write("bars_daily_raw.parquet", daily(1.0));
+        let raw = daily(1.0).into_iter().filter(|b| Some(b.symbol.as_str()) != missing).collect();
+        write("bars_daily_raw.parquet", raw);
     }
 }
 
+fn command(dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stocktrader"));
+    cmd.args(["backtest", "--benchmark", "none", "--fast", "5", "--slow", "20", "--parquet"])
+        .arg(dir.join("bars_daily_all.parquet"));
+    cmd
+}
+
 fn run(dir: &Path) -> (String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_stocktrader"))
-        .args(["backtest", "--benchmark", "none", "--fast", "5", "--slow", "20", "--parquet"])
-        .arg(dir.join("bars_daily_all.parquet"))
-        .output()
-        .unwrap();
+    let out = command(dir).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     (String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+}
+
+#[test]
+fn symbols_missing_from_the_raw_file_fail_closed_and_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pair_without(dir.path(), true, Some("SYN000"));
+    let (stdout, stderr) = run(dir.path());
+    assert!(stderr.contains("have no as-traded price") && stderr.contains("SYN000"), "{stderr}");
+    assert!(fills(&stdout) > 0, "symbols with traded prices still trade");
+
+    let out = command(dir.path()).arg("--raw").arg(dir.path().join("typo.parquet")).output().unwrap();
+    assert!(!out.status.success(), "a mistyped --raw must not be silently ignored");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not exist"));
 }
 
 fn fills(stdout: &str) -> usize {

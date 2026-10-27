@@ -21,6 +21,9 @@ pub struct RiskLimits {
     pub min_avg_dollar_volume: Decimal,
     /// Bars in the liquidity window; values below 1 are treated as 1.
     pub liquidity_lookback: usize,
+    /// Reject entries for a symbol whose latest bar has no as-traded close, instead of falling back to the
+    /// (possibly adjusted) close. Set when traded prices are supplied, so a missing one fails closed.
+    pub require_traded_price: bool,
 }
 
 impl Default for RiskLimits {
@@ -32,6 +35,7 @@ impl Default for RiskLimits {
             min_price: dec!(5),
             min_avg_dollar_volume: dec!(5_000_000),
             liquidity_lookback: 20,
+            require_traded_price: false,
         }
     }
 }
@@ -48,8 +52,8 @@ pub struct RiskManager {
     kill_reason: Option<String>,
     session_start_equity: Option<Decimal>,
     dollar_volume: HashMap<Symbol, VecDeque<Decimal>>,
-    /// Latest as-traded close per symbol, for price-level filters.
-    traded_close: HashMap<Symbol, Decimal>,
+    /// Latest bar's as-traded close per symbol (`None` if that bar didn't carry one), for price filters.
+    traded_close: HashMap<Symbol, Option<Decimal>>,
 }
 
 impl RiskManager {
@@ -89,8 +93,10 @@ impl RiskManager {
 
     pub fn on_market_event(&mut self, event: &Event) {
         if let EventKind::Bar(bar) = &event.kind {
-            self.traded_close.insert(bar.symbol.clone(), bar.traded_close());
-            // Adjusted close times adjusted volume equals traded dollar volume (splits scale both).
+            self.traded_close.insert(bar.symbol.clone(), bar.traded_close);
+            // Splits scale adjusted price and volume inversely, so their product is the traded dollar
+            // volume; dividend adjustment lowers older prices only, so older dollar volume reads slightly
+            // low (conservative: it can only over-reject).
             let window = self.dollar_volume.entry(bar.symbol.clone()).or_default();
             window.push_back(bar.close * bar.volume);
             if window.len() > self.limits.liquidity_lookback {
@@ -148,7 +154,14 @@ impl RiskManager {
             return reject(signal, "no price available".into());
         }
         // The level filter uses the price the stock actually traded at, not split-adjusted history.
-        if let Some(p) = self.traded_close.get(&signal.symbol).copied()
+        let traded = match self.traded_close.get(&signal.symbol).copied().flatten() {
+            Some(p) => Some(p),
+            None if self.limits.require_traded_price => {
+                return reject(signal, "no traded price for this symbol; refusing to judge on adjusted prices".into());
+            }
+            None => portfolio.last_price(&signal.symbol),
+        };
+        if let Some(p) = traded
             && p < self.limits.min_price
         {
             return reject(signal, format!("traded price {p} below minimum {}", self.limits.min_price));
@@ -262,6 +275,19 @@ mod tests {
         assert!(matches!(with_traded(dec!(3), dec!(30)), RiskDecision::Approve(_)));
         // Traded at $3 before a later 1:10 reverse split: adjusted history shows $30.
         assert!(matches!(with_traded(dec!(30), dec!(3)), RiskDecision::Reject { .. }));
+    }
+
+    #[test]
+    fn missing_traded_price_fails_closed_when_required() {
+        let (mut lenient, portfolio) = warmed_up(&["ABC"], dec!(30), dec!(10_000_000));
+        assert!(matches!(lenient.check(signal("ABC", dec!(0.05)), &portfolio, &[]), RiskDecision::Approve(_)));
+
+        let mut strict = RiskManager::new(RiskLimits { require_traded_price: true, ..RiskLimits::default() });
+        for i in 0..20 {
+            strict.on_market_event(&bar("ABC", dec!(30), dec!(10_000_000), i));
+        }
+        let decision = strict.check(signal("ABC", dec!(0.05)), &portfolio, &[]);
+        assert!(matches!(decision, RiskDecision::Reject { ref reason, .. } if reason.contains("no traded price")));
     }
 
     #[test]

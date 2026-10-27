@@ -56,11 +56,20 @@ pub fn buy_and_hold(bars: &[&Bar], start_equity: Decimal) -> Vec<(Timestamp, Dec
     bars.iter().map(|b| (b.end, start_equity * b.close / first)).collect()
 }
 
-/// Pearson correlation of daily returns on the dates both curves have. `None` with fewer than 3 shared
-/// days or a flat series.
+/// Pearson correlation of daily returns, computed only between consecutive dates both curves have (so a
+/// day missing from one never pairs a two-day move with a one-day move). `None` with fewer than 3 such
+/// returns or a flat series.
 pub fn correlation(a: &[(Timestamp, Decimal)], b: &[(Timestamp, Decimal)]) -> Option<f64> {
-    let (ra, rb) = (daily_returns(a), daily_returns(b));
-    let pairs: Vec<(f64, f64)> = ra.iter().filter_map(|(d, x)| rb.get(d).map(|y| (*x, *y))).collect();
+    let by_date = |curve| -> BTreeMap<NaiveDate, f64> {
+        resample_daily(curve).into_iter().filter_map(|(t, v)| Some((exchange_date(t), v.to_f64()?))).collect()
+    };
+    let (va, vb) = (by_date(a), by_date(b));
+    let shared: Vec<(f64, f64)> = va.iter().filter_map(|(d, x)| vb.get(d).map(|y| (*x, *y))).collect();
+    let pairs: Vec<(f64, f64)> = shared
+        .windows(2)
+        .filter(|w| w[0].0 > 0.0 && w[0].1 > 0.0)
+        .map(|w| (w[1].0 / w[0].0 - 1.0, w[1].1 / w[0].1 - 1.0))
+        .collect();
     if pairs.len() < 3 {
         return None;
     }

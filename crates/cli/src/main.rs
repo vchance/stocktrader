@@ -49,8 +49,9 @@ enum Command {
         train_days: i64,
         #[arg(long, default_value_t = 91)]
         test_days: i64,
-        /// History replayed before each window without trading, so indicators are warm.
-        #[arg(long, default_value_t = 300)]
+        /// History replayed before each window without trading, so indicators are warm. The default covers
+        /// the slowest grid window (200 sessions) plus the 20-session liquidity lookback.
+        #[arg(long, default_value_t = 330)]
         warmup_days: i64,
     },
 }
@@ -196,6 +197,8 @@ struct Loaded {
     bars: usize,
     /// Buy-and-hold comparison bars, if the benchmark symbol was found.
     benchmark: Option<Vec<Bar>>,
+    /// Risk limits for this data: strict about traded prices when a raw file supplied them.
+    limits: RiskLimits,
 }
 
 fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
@@ -212,7 +215,7 @@ fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
         VecEventSource::new(loaded.events),
         strategy,
         SimulatedBroker::new(fill_model(data)),
-        RiskManager::new(limits(data)),
+        RiskManager::new(loaded.limits),
         data.cash,
     )
     .run()?;
@@ -229,8 +232,10 @@ fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
         let refs: Vec<&Bar> = bench.iter().collect();
         let curve = buy_and_hold(&refs, data.cash);
         let m = metrics::compute(&curve, &[]);
+        warn_on_span(&report.equity_curve, &curve);
         println!();
-        print_metrics(&format!("{} buy & hold ", data.benchmark.to_ascii_uppercase()), &m);
+        println!("benchmark: {} buy & hold, 100% invested", data.benchmark.to_ascii_uppercase());
+        print_metrics("  ", &m);
         println!("excess CAGR       {:>7.2}%", (report.metrics.cagr - m.cagr) * 100.0);
         if let Some(c) = correlation(&report.equity_curve, &curve) {
             println!("daily correlation {c:>7.2}");
@@ -244,6 +249,24 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
     for p in grid {
         make_strategy(p, weight)?;
     }
+    // A candidate that can't warm up never trades, scores Sharpe 0, and so beats every losing candidate.
+    let needed_sessions = grid
+        .iter()
+        .map(|p| match p {
+            Params::Sma { slow, .. } => *slow,
+            Params::Spike { .. } => 0,
+        })
+        .max()
+        .unwrap_or(0)
+        + RiskLimits::default().liquidity_lookback;
+    let warmup_sessions = warmup.num_days() * 252 / 365;
+    if (warmup_sessions as usize) < needed_sessions {
+        bail!(
+            "--warmup-days {} gives about {warmup_sessions} sessions, but the grid needs {needed_sessions} \
+             (slowest window plus the liquidity lookback); raise --warmup-days",
+            warmup.num_days()
+        );
+    }
     let loaded = load(data)?;
     let cfg = WalkForwardConfig {
         train,
@@ -251,7 +274,7 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
         warmup,
         initial_cash: data.cash,
         fill: fill_model(data),
-        limits: limits(data),
+        limits: loaded.limits.clone(),
     };
     let report = walk_forward(&loaded.events, &cfg, grid, |p| make_strategy(p, weight).expect("validated above"))?;
     if report.folds.is_empty() {
@@ -260,13 +283,19 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
 
     println!("{:<12} {:<12} {:<22} {:>9} {:>9} {:>9} {:>7}", "test from", "test to", "chosen", "train ret", "test ret", "test DD", "fills");
     for f in &report.folds {
+        // A window with no bars returns 0% only because nothing happened; say so instead.
+        let test_ret = if f.test.start_equity.is_zero() {
+            "no data".to_string()
+        } else {
+            format!("{:.2}%", f.test.total_return * 100.0)
+        };
         println!(
-            "{:<12} {:<12} {:<22} {:>8.2}% {:>8.2}% {:>8.2}% {:>7}",
+            "{:<12} {:<12} {:<22} {:>8.2}% {:>9} {:>8.2}% {:>7}",
             f.test_start.date_naive(),
             f.test_end.date_naive(),
             f.chosen.to_string(),
             f.train.total_return * 100.0,
-            f.test.total_return * 100.0,
+            test_ret,
             f.test.max_drawdown * 100.0,
             f.test.num_fills
         );
@@ -274,14 +303,29 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
     println!();
     println!("out-of-sample return {:>7.2}%", report.out_of_sample_return * 100.0);
     println!("out-of-sample CAGR   {:>7.2}%", report.out_of_sample_cagr * 100.0);
+    println!("(each test window starts flat from {} and ends with positions open, unliquidated)", data.cash);
 
     if let Some(bench) = &loaded.benchmark {
         let (from, to) = (report.folds[0].test_start, report.folds[report.folds.len() - 1].test_end);
         let refs: Vec<&Bar> = bench.iter().filter(|b| b.end >= from && b.end < to).collect();
         let m = metrics::compute(&buy_and_hold(&refs, data.cash), &[]);
-        println!("{} buy & hold CAGR   {:>7.2}% (same test span)", data.benchmark.to_ascii_uppercase(), m.cagr * 100.0);
+        println!(
+            "{} buy & hold CAGR   {:>7.2}% (same test span, 100% invested)",
+            data.benchmark.to_ascii_uppercase(),
+            m.cagr * 100.0
+        );
     }
     Ok(())
+}
+
+/// Excess CAGR only means something if both curves cover the same period.
+fn warn_on_span(strategy: &[(Timestamp, Decimal)], benchmark: &[(Timestamp, Decimal)]) {
+    let span = |c: &[(Timestamp, Decimal)]| c.first().zip(c.last()).map(|(a, b)| (a.0.date_naive(), b.0.date_naive()));
+    if let (Some((s0, s1)), Some((b0, b1))) = (span(strategy), span(benchmark))
+        && ((s0 - b0).num_days().abs() > 3 || (s1 - b1).num_days().abs() > 3)
+    {
+        eprintln!("warning: strategy covers {s0}..{s1} but the benchmark covers {b0}..{b1}; excess CAGR compares different periods");
+    }
 }
 
 fn print_metrics(prefix: &str, m: &Metrics) {
@@ -297,10 +341,6 @@ fn fill_model(data: &DataArgs) -> FillModel {
     FillModel { slippage_bps: data.slippage_bps, ..FillModel::default() }
 }
 
-fn limits(data: &DataArgs) -> RiskLimits {
-    RiskLimits { min_price: data.min_price, ..RiskLimits::default() }
-}
-
 /// `bars_daily_all.parquet` -> `bars_daily_raw.parquet` in the same directory.
 fn raw_sibling(adjusted: &Path) -> Option<PathBuf> {
     let name = adjusted.file_name()?.to_str()?;
@@ -309,11 +349,11 @@ fn raw_sibling(adjusted: &Path) -> Option<PathBuf> {
 
 fn load(data: &DataArgs) -> Result<Loaded> {
     let benchmark_symbol = (!data.benchmark.eq_ignore_ascii_case("none")).then(|| data.benchmark.to_ascii_uppercase());
-    let (bars, benchmark) = match (&data.bars, &data.parquet) {
+    let (bars, benchmark, traded_prices) = match (&data.bars, &data.parquet) {
         (Some(path), _) => {
             let bars = load_daily_bars(path)?;
             let bench = benchmark_symbol.as_ref().map(|s| bars.iter().filter(|b| b.symbol.as_str() == s).cloned().collect());
-            (bars, bench)
+            (bars, bench, false)
         }
         (None, Some(path)) => load_parquet(data, path, benchmark_symbol.as_deref())?,
         (None, None) => {
@@ -324,7 +364,7 @@ fn load(data: &DataArgs) -> Result<Loaded> {
                 seed: data.seed,
             });
             let bench = benchmark_symbol.as_ref().map(|s| bars.iter().filter(|b| b.symbol.as_str() == s).cloned().collect());
-            (bars, bench)
+            (bars, bench, false)
         }
     };
     let benchmark = match (benchmark, &benchmark_symbol) {
@@ -350,7 +390,8 @@ fn load(data: &DataArgs) -> Result<Loaded> {
         warn_on_coverage(first_bar, rows.iter().map(|r| r.observed_at).min());
         events.extend(st_signals::to_events(&rows));
     }
-    Ok(Loaded { events, bars: n_bars, benchmark })
+    let limits = RiskLimits { min_price: data.min_price, require_traded_price: traded_prices, ..RiskLimits::default() };
+    Ok(Loaded { events, bars: n_bars, benchmark, limits })
 }
 
 fn warn_on_coverage(first_bar: Option<Timestamp>, first_attention: Option<Timestamp>) {
@@ -367,12 +408,21 @@ fn warn_on_coverage(first_bar: Option<Timestamp>, first_attention: Option<Timest
     }
 }
 
-/// Adjusted bars for the replay, each carrying its as-traded close from the raw file when available, plus
-/// the benchmark's bars (read separately, so `--symbols` needn't include it).
-fn load_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result<(Vec<Bar>, Option<Vec<Bar>>)> {
+/// Adjusted bars for the replay, each carrying its as-traded close from the raw file when available, the
+/// benchmark's bars (read separately, so `--symbols` needn't include it), and whether traded prices are in
+/// use.
+fn load_parquet(
+    data: &DataArgs,
+    path: &Path,
+    benchmark: Option<&str>,
+) -> Result<(Vec<Bar>, Option<Vec<Bar>>, bool)> {
     let symbols = (!data.symbols.is_empty()).then(|| data.symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect());
     let filter = BarFilter { symbols, start: data.start, end: data.end };
-    let raw_path = data.raw.clone().or_else(|| raw_sibling(path)).filter(|p| p.exists());
+    let raw_path = match &data.raw {
+        Some(raw) if !raw.exists() => bail!("--raw {} does not exist", raw.display()),
+        Some(raw) => Some(raw.clone()),
+        None => raw_sibling(path).filter(|p| p.exists()),
+    };
     let traded: HashMap<(String, NaiveDate), Decimal> = match &raw_path {
         Some(raw) => read_bars(raw, &filter)?
             .into_iter()
@@ -402,6 +452,9 @@ fn load_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result
     if bars.len() < raw.len() {
         eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
     }
+    if raw_path.is_some() {
+        report_traded_coverage(&bars);
+    }
     if let Some(wanted) = &filter.symbols {
         let found: HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
         let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
@@ -416,5 +469,28 @@ fn load_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result
         }
         None => None,
     };
-    Ok((bars, bench))
+    Ok((bars, bench, raw_path.is_some()))
+}
+
+/// With traded prices in use, bars lacking one fail closed in the risk check; say how many and which.
+fn report_traded_coverage(bars: &[Bar]) {
+    let missing: Vec<&Bar> = bars.iter().filter(|b| b.traded_close.is_none()).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut by_symbol: HashMap<&str, usize> = HashMap::new();
+    for b in &missing {
+        *by_symbol.entry(b.symbol.as_str()).or_default() += 1;
+    }
+    let mut worst: Vec<(&str, usize)> = by_symbol.into_iter().collect();
+    worst.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let names: Vec<String> = worst.iter().take(10).map(|(s, n)| format!("{s} ({n})")).collect();
+    eprintln!(
+        "warning: {} of {} bars ({:.1}%) have no as-traded price; entries on those days are rejected rather \
+         than judged on adjusted prices. Most affected: {}",
+        missing.len(),
+        bars.len(),
+        100.0 * missing.len() as f64 / bars.len().max(1) as f64,
+        names.join(", ")
+    );
 }
