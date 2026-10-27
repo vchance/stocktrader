@@ -82,6 +82,9 @@ pub async fn sync(client: &mut AlpacaClient, cfg: &SyncConfig) -> Result<SyncRep
         *excluded.entry(a.exchange.as_str()).or_default() += 1;
     }
     tracing::info!(?excluded, "assets outside the traded exchanges");
+    let not_tickers =
+        assets.iter().filter(|a| EXCHANGES.contains(&a.exchange.as_str()) && !crate::universe::is_ticker(&a.symbol)).count();
+    tracing::info!(not_tickers, "listed identifiers that aren't tickers (CUSIP-style, renamed delistings) skipped");
     let symbols = universe(&assets);
     if symbols.is_empty() {
         bail!("asset lists contained no listed US equities");
@@ -298,12 +301,12 @@ mod tests {
 
     #[tokio::test]
     async fn snapshots_assets_and_isolates_rejected_symbols() {
-        let server = server(&["AAA", "BAD1", "CCC"], &["DDD"]).await;
+        let server = server(&["AAA", "BADA", "CCC"], &["DDD"]).await;
         let dir = tempfile::tempdir().unwrap();
 
         let report = sync(&mut client(&server), &config(dir.path())).await.unwrap();
         assert_eq!(report.symbols, 4);
-        assert_eq!(report.skipped, vec![(Adjustment::All, "BAD1".into()), (Adjustment::Raw, "BAD1".into())]);
+        assert_eq!(report.skipped, vec![(Adjustment::All, "BADA".into()), (Adjustment::Raw, "BADA".into())]);
         assert!(report.files.iter().all(|(_, s)| s.rows == 3 && s.symbols == 3));
         assert!(dir.path().join("assets/2026-10-27-inactive.json").exists());
         assert!(dir.path().join("manifest.json").exists());
@@ -319,7 +322,7 @@ mod tests {
         let good = server(&["AAA", "BBB"], &[]).await;
         sync(&mut client(&good), &config(dir.path())).await.unwrap();
 
-        let bad = server(&["AAA", "BAD1", "BAD2", "BAD3"], &[]).await;
+        let bad = server(&["AAA", "BADA", "BADB", "BADC"], &[]).await;
         let cfg = SyncConfig { max_rejected: 2, ..config(dir.path()) };
         let err = sync(&mut client(&bad), &cfg).await.unwrap_err();
         assert!(format!("{err:#}").contains("more than 2 symbols rejected"));
@@ -332,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_to_shrink_unless_forced() {
         let dir = tempfile::tempdir().unwrap();
-        let symbols: Vec<String> = (0..20).map(|i| format!("S{i:02}")).collect();
+        let symbols: Vec<String> = (0..20u8).map(|i| format!("S{}", char::from(b'A' + i))).collect();
         let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
         sync(&mut client(&server(&refs, &[]).await), &config(dir.path())).await.unwrap();
 
