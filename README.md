@@ -10,6 +10,37 @@ cargo run -p st-cli -- backtest                    # synthetic data, no API keys
 cargo run -p st-cli -- backtest --bars bars.csv    # symbol,date,open,high,low,close,volume
 ```
 
+## Data collector
+
+`collector` archives news and social data that **cannot be backfilled later**, verbatim, to
+`data/raw/<source>/<YYYY-MM-DD>.jsonl` (one JSON object per HTTP response: `fetched_at`, `source`, `url`,
+`status`, `body`). Parsing happens later from the archive, so improved parsers can be re-run over all history.
+
+```
+cp .env.example .env                                  # add whichever keys you have
+cargo run --release -p st-collector -- sources        # which sources are enabled
+cargo run --release -p st-collector -- once           # fetch everything once
+cargo run --release -p st-collector -- run            # poll until Ctrl-C
+```
+
+| Source | Key | Every | Why it must be collected now |
+|---|---|---|---|
+| `apewisdom` | none | 15 min | Ticker mention counts; only the current snapshot is served |
+| `reddit` | `REDDIT_CLIENT_ID/SECRET` | 2 min | New posts and comments; listings only reach back ~1000 items |
+| `finnhub_news` | `FINNHUB_API_KEY` | 10 min | Free tier serves recent news only |
+| `alpaca_news` | `APCA_API_KEY_ID/SECRET_KEY` | 5 min | Benzinga news with our own arrival timestamps (history is also backfillable) |
+
+SEC filings are deliberately not polled: EDGAR keeps a permanent archive with acceptance timestamps, so they
+are a backfill job.
+
+- **No silent gaps:** Reddit pages back to the newest item already archived; Alpaca resumes from a saved
+  time window (up to 7 days of catch-up). Cursors live in `data/raw/.state/` and only advance after the
+  records are synced to disk. A request that fails doesn't discard the rest of the poll.
+- **Backoff** after failures is capped per source: none for Reddit, 2x Finnhub, 4x ApeWisdom, 16x Alpaca.
+- **Readers** must dedupe (polls overlap on purpose) and skip unparseable lines (a crash can tear at most
+  the last line of a file). File dates are UTC fetch dates, not exchange dates.
+- Stop with Ctrl-C or SIGTERM. Check Reddit's and each provider's current API terms before relying on this.
+
 ## Decisions so far
 
 | Topic | Decision |
@@ -60,7 +91,7 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 
 ## Roadmap
 1. Alpaca historical-bars client and a local store (Parquet / DuckDB); universe builder with liquidity filter.
-2. **Start archiving news and social feeds now.** They cannot be backfilled later, and the archive becomes the backtest dataset.
+2. ~~Start archiving news and social feeds~~ (`collector`). Next: run it somewhere always-on, compress old files.
 3. EDGAR fundamentals ingestion with point-in-time filing dates.
 4. Text pipeline: ticker extraction, dedupe, sentiment scoring (FinBERT via ONNX, or an LLM), mention velocity.
 5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`. Before that: extract a mode-agnostic
