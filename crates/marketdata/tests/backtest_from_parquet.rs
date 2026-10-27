@@ -37,7 +37,7 @@ fn parquet_bars_drive_a_backtest() {
     for chunk in daily.chunks(333) {
         writer.write(chunk).unwrap();
     }
-    writer.finish().unwrap();
+    writer.finish().unwrap().commit().unwrap();
 
     let bars: Vec<_> = read_bars(&path, &BarFilter::default()).unwrap().iter().filter_map(to_core_bar).collect();
     assert_eq!(bars, synthetic, "Parquet round trip must reproduce the engine's bars exactly");

@@ -61,6 +61,10 @@ struct BacktestArgs {
     weight: Decimal,
     #[arg(long, default_value = "5")]
     slippage_bps: Decimal,
+    /// Risk filter: skip entries below this price. On split-adjusted data this sees adjusted, not traded,
+    /// prices; set 0 to disable.
+    #[arg(long, default_value = "5")]
+    min_price: Decimal,
 }
 
 fn main() -> Result<()> {
@@ -80,10 +84,24 @@ fn backtest(args: BacktestArgs) -> Result<()> {
                 start: args.start,
                 end: args.end,
             };
+            if args.min_price > Decimal::ZERO && !path.to_string_lossy().contains("_raw") {
+                eprintln!(
+                    "warning: --min-price {} is applied to adjusted prices, which understate pre-split prices; \
+                     the universe will be biased (use --min-price 0, or the raw file)",
+                    args.min_price
+                );
+            }
             let raw = read_bars(path, &filter)?;
             let bars: Vec<_> = raw.iter().filter_map(to_core_bar).collect();
             if bars.len() < raw.len() {
-                eprintln!("skipped {} bars with non-finite values", raw.len() - bars.len());
+                eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
+            }
+            if let Some(wanted) = &filter.symbols {
+                let found: std::collections::HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
+                let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
+                if !missing.is_empty() {
+                    eprintln!("no bars for: {}", missing.join(", "));
+                }
             }
             bars
         }
@@ -101,7 +119,7 @@ fn backtest(args: BacktestArgs) -> Result<()> {
         source,
         SmaCrossover::new(args.fast, args.slow, args.weight).map_err(anyhow::Error::msg)?,
         SimulatedBroker::new(FillModel { slippage_bps: args.slippage_bps, ..FillModel::default() }),
-        RiskManager::new(RiskLimits::default()),
+        RiskManager::new(RiskLimits { min_price: args.min_price, ..RiskLimits::default() }),
         args.cash,
     )
     .run()?;

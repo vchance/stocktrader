@@ -30,6 +30,12 @@ enum Command {
         feed: String,
         #[arg(long, default_value_t = 100)]
         batch_size: usize,
+        /// Abort a pass once more symbols than this have been rejected individually.
+        #[arg(long, default_value_t = 50)]
+        max_rejected: usize,
+        /// Replace the previous files even if the new ones are much smaller (e.g. after moving --start).
+        #[arg(long)]
+        force: bool,
     },
     /// Print rows, symbols and date range of a bars file.
     Info { file: PathBuf },
@@ -44,7 +50,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Sync { start, feed, batch_size } => {
+        Command::Sync { start, feed, batch_size, max_rejected, force } => {
             let env = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
             let key_id = env("APCA_API_KEY_ID").context("APCA_API_KEY_ID is not set")?;
             let secret = env("APCA_API_SECRET_KEY").context("APCA_API_SECRET_KEY is not set")?;
@@ -68,14 +74,17 @@ async fn main() -> Result<()> {
                 today,
                 feed,
                 batch_size,
+                max_rejected,
+                force,
             };
             let report = sync(&mut client, &cfg).await?;
-            println!("symbols   {}", report.symbols);
-            for (adjustment, rows) in &report.rows {
-                println!("{adjustment:<9} {rows} rows");
+            println!("universe  {} symbols", report.symbols);
+            for (adjustment, s) in &report.files {
+                let last = s.last.map_or("-".to_string(), |d| d.to_string());
+                println!("{adjustment:<9} {} rows, {} symbols, through {last}", s.rows, s.symbols);
             }
-            if !report.skipped.is_empty() {
-                println!("skipped   {} ({})", report.skipped.len(), report.skipped.join(", "));
+            for (adjustment, symbol) in &report.skipped {
+                println!("skipped   {symbol} ({adjustment})");
             }
         }
         Command::Info { file } => {

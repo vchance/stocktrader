@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Date32Type, Float64Type, UInt64Type};
 use arrow_array::{Array, ArrayRef, Date32Array, Float64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use chrono::{Days, NaiveDate};
@@ -69,14 +67,24 @@ fn to_batch(bars: &[DailyBar]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(schema(), columns)?)
 }
 
-/// Streams bars into a Parquet file. Rows go to `<path>.tmp` and are renamed into place by
-/// [`BarWriter::finish`], so readers never see a partial file and a failed download leaves the previous
-/// file untouched.
+/// Streams bars into `<path>.tmp`. [`BarWriter::finish`] closes it and returns a [`StagedFile`]; nothing
+/// replaces `path` until [`StagedFile::commit`], so callers can sanity-check (and commit several files
+/// together) first. A dropped writer leaves the previous file untouched.
 pub struct BarWriter {
     writer: ArrowWriter<File>,
     tmp: PathBuf,
     path: PathBuf,
     rows: usize,
+    symbols: HashSet<String>,
+    last: Option<NaiveDate>,
+}
+
+/// Row count, distinct symbols and latest date of a bars file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stats {
+    pub rows: usize,
+    pub symbols: usize,
+    pub last: Option<NaiveDate>,
 }
 
 impl BarWriter {
@@ -88,7 +96,7 @@ impl BarWriter {
         let file = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
         let writer = ArrowWriter::try_new(file, schema(), Some(props))?;
-        Ok(Self { writer, tmp, path: path.to_path_buf(), rows: 0 })
+        Ok(Self { writer, tmp, path: path.to_path_buf(), rows: 0, symbols: HashSet::new(), last: None })
     }
 
     pub fn write(&mut self, bars: &[DailyBar]) -> Result<()> {
@@ -97,16 +105,55 @@ impl BarWriter {
         }
         self.writer.write(&to_batch(bars)?)?;
         self.rows += bars.len();
+        for bar in bars {
+            if !self.symbols.contains(&bar.symbol) {
+                self.symbols.insert(bar.symbol.clone());
+            }
+            self.last = self.last.max(Some(bar.date));
+        }
         Ok(())
     }
 
-    /// Returns the number of rows written.
-    pub fn finish(self) -> Result<usize> {
+    /// Closes and syncs the temporary file without replacing anything yet.
+    pub fn finish(self) -> Result<StagedFile> {
         let file = self.writer.into_inner()?;
         file.sync_all()?;
-        fs::rename(&self.tmp, &self.path)?;
-        Ok(self.rows)
+        let stats = Stats { rows: self.rows, symbols: self.symbols.len(), last: self.last };
+        Ok(StagedFile { tmp: self.tmp, path: self.path, stats })
     }
+}
+
+/// A complete file waiting to replace its target.
+#[derive(Debug)]
+pub struct StagedFile {
+    tmp: PathBuf,
+    path: PathBuf,
+    pub stats: Stats,
+}
+
+impl StagedFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn commit(self) -> Result<()> {
+        fs::rename(&self.tmp, &self.path).with_context(|| format!("replacing {}", self.path.display()))
+    }
+
+    /// Deletes the temporary file.
+    pub fn discard(self) -> Result<()> {
+        Ok(fs::remove_file(&self.tmp)?)
+    }
+}
+
+/// Looks up a column and checks its type, so a foreign Parquet file is an error rather than a panic.
+fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
+    batch
+        .column_by_name(name)
+        .with_context(|| format!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<T>()
+        .with_context(|| format!("column {name} has an unexpected type"))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,16 +178,15 @@ pub fn read_bars(path: &Path, filter: &BarFilter) -> Result<Vec<DailyBar>> {
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch?;
-        let col = |name: &str| batch.column_by_name(name).with_context(|| format!("missing column {name}"));
-        let symbol = col("symbol")?.as_string::<i32>();
-        let date = col("date")?.as_primitive::<Date32Type>();
-        let open = col("open")?.as_primitive::<Float64Type>();
-        let high = col("high")?.as_primitive::<Float64Type>();
-        let low = col("low")?.as_primitive::<Float64Type>();
-        let close = col("close")?.as_primitive::<Float64Type>();
-        let volume = col("volume")?.as_primitive::<Float64Type>();
-        let trade_count = col("trade_count")?.as_primitive::<UInt64Type>();
-        let vwap = col("vwap")?.as_primitive::<Float64Type>();
+        let symbol = column::<StringArray>(&batch, "symbol")?;
+        let date = column::<Date32Array>(&batch, "date")?;
+        let open = column::<Float64Array>(&batch, "open")?;
+        let high = column::<Float64Array>(&batch, "high")?;
+        let low = column::<Float64Array>(&batch, "low")?;
+        let close = column::<Float64Array>(&batch, "close")?;
+        let volume = column::<Float64Array>(&batch, "volume")?;
+        let trade_count = column::<UInt64Array>(&batch, "trade_count")?;
+        let vwap = column::<Float64Array>(&batch, "vwap")?;
         for i in 0..batch.num_rows() {
             let day = epoch() + Days::new(u64::try_from(date.value(i)).context("date before 1970")?);
             if !filter.keeps(symbol.value(i), day) {
@@ -179,8 +225,8 @@ pub fn summarize(path: &Path) -> Result<Summary> {
     for batch in reader {
         let batch = batch?;
         rows += batch.num_rows();
-        let symbol = batch.column_by_name("symbol").context("missing column symbol")?.as_string::<i32>();
-        let date = batch.column_by_name("date").context("missing column date")?.as_primitive::<Date32Type>();
+        let symbol = column::<StringArray>(&batch, "symbol")?;
+        let date = column::<Date32Array>(&batch, "date")?;
         for i in 0..batch.num_rows() {
             if !symbols.contains(symbol.value(i)) {
                 symbols.insert(symbol.value(i).to_string());
@@ -194,19 +240,17 @@ pub fn summarize(path: &Path) -> Result<Summary> {
     Ok(Summary { rows, symbols: symbols.len(), first: first.and_then(to_date), last: last.and_then(to_date) })
 }
 
-/// Converts to the engine's bar type, with prices rounded to 4 decimal places. `None` if any value is not
-/// a finite number.
+/// Converts to the engine's bar type, with prices rounded to 6 decimal places (split-adjusted history can
+/// be tiny). `None` for bars the engine must not see: non-finite values, non-positive prices, `low > high`
+/// or negative volume.
 pub fn to_core_bar(bar: &DailyBar) -> Option<Bar> {
-    let price = |x: f64| Decimal::from_f64(x).map(|d| d.round_dp(4));
-    Some(st_data::daily_bar(
-        Symbol::new(&bar.symbol),
-        bar.date,
-        price(bar.open)?,
-        price(bar.high)?,
-        price(bar.low)?,
-        price(bar.close)?,
-        Decimal::from_f64(bar.volume)?.round(),
-    ))
+    let price = |x: f64| Decimal::from_f64(x).map(|d| d.round_dp(6)).filter(|d| *d > Decimal::ZERO);
+    let (open, high, low, close) = (price(bar.open)?, price(bar.high)?, price(bar.low)?, price(bar.close)?);
+    let volume = Decimal::from_f64(bar.volume)?.round();
+    if low > high || volume < Decimal::ZERO {
+        return None;
+    }
+    Some(st_data::daily_bar(Symbol::new(&bar.symbol), bar.date, open, high, low, close, volume))
 }
 
 #[cfg(test)]
@@ -238,8 +282,10 @@ mod tests {
         let mut writer = BarWriter::create(&path).unwrap();
         writer.write(&all[..2]).unwrap();
         writer.write(&all[2..]).unwrap();
-        assert!(!path.exists(), "file must not appear before finish");
-        assert_eq!(writer.finish().unwrap(), 4);
+        let staged = writer.finish().unwrap();
+        assert!(!path.exists(), "file must not appear before commit");
+        assert_eq!(staged.stats, Stats { rows: 4, symbols: 2, last: Some(NaiveDate::from_ymd_opt(2026, 10, 2).unwrap()) });
+        staged.commit().unwrap();
 
         assert_eq!(read_bars(&path, &BarFilter::default()).unwrap(), all);
 
@@ -262,21 +308,46 @@ mod tests {
         let path = dir.path().join("bars.parquet");
         let mut first = BarWriter::create(&path).unwrap();
         first.write(&[bar("AAPL", 1, 100.0)]).unwrap();
-        first.finish().unwrap();
+        first.finish().unwrap().commit().unwrap();
 
-        let mut second = BarWriter::create(&path).unwrap();
-        second.write(&[bar("MSFT", 1, 300.0)]).unwrap();
-        drop(second);
+        let mut dropped = BarWriter::create(&path).unwrap();
+        dropped.write(&[bar("MSFT", 1, 300.0)]).unwrap();
+        drop(dropped);
+        let mut discarded = BarWriter::create(&path).unwrap();
+        discarded.write(&[bar("MSFT", 1, 300.0)]).unwrap();
+        discarded.finish().unwrap().discard().unwrap();
 
         assert_eq!(read_bars(&path, &BarFilter::default()).unwrap(), vec![bar("AAPL", 1, 100.0)]);
     }
 
     #[test]
-    fn converts_to_core_bar() {
-        let core = to_core_bar(&bar("aapl", 2, 101.123456)).unwrap();
+    fn foreign_parquet_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("symbol", DataType::Float64, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Float64Array::from(vec![1.0])) as ArrayRef]).unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        assert!(read_bars(&path, &BarFilter::default()).is_err());
+        assert!(summarize(&path).is_err());
+    }
+
+    #[test]
+    fn converts_to_core_bar_and_rejects_bad_prices() {
+        let core = to_core_bar(&bar("aapl", 2, 101.1234567)).unwrap();
         assert_eq!(core.symbol.as_str(), "AAPL");
-        assert_eq!(core.close, Decimal::new(1011235, 4));
+        assert_eq!(core.close, Decimal::new(101_123_457, 6));
         assert_eq!(core.volume, Decimal::new(1234, 0));
+
+        let tiny = DailyBar { open: 0.00002, high: 0.00003, low: 0.00001, close: 0.00002, ..bar("X", 1, 1.0) };
+        assert_eq!(to_core_bar(&tiny).unwrap().close, Decimal::new(20, 6));
+
         assert!(to_core_bar(&DailyBar { close: f64::NAN, ..bar("X", 1, 1.0) }).is_none());
+        assert!(to_core_bar(&DailyBar { close: 0.0, ..bar("X", 1, 1.0) }).is_none());
+        assert!(to_core_bar(&DailyBar { low: 5.0, high: 4.0, ..bar("X", 1, 1.0) }).is_none());
+        assert!(to_core_bar(&DailyBar { open: 0.0000001, ..bar("X", 1, 1.0) }).is_none());
     }
 }

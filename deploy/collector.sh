@@ -7,8 +7,11 @@
 #   deploy/collector.sh logs             follow collector logs
 #   deploy/collector.sh stop             stop the collector (data and .env are kept)
 #   deploy/collector.sh sync-marketdata  download the universe and full daily price history now
+#                                        (extra flags go to `marketdata sync`, e.g. --force)
 #   deploy/collector.sh install-timer    run sync-marketdata nightly via a systemd user timer
 set -euo pipefail
+
+SYNC_CONTAINER=stocktrader-marketdata-sync
 
 # Wrapped in main and exited explicitly: `update` rewrites this file mid-run, and bash would otherwise
 # keep reading the new file from its old offset.
@@ -43,13 +46,16 @@ main() {
         sync-marketdata)
             prepare
             docker compose build marketdata
-            docker compose run --rm marketdata
+            # Fixed name: a sync still running (say, orphaned by a timeout) makes this one fail rather than
+            # overlap. Clear only an exited leftover; `docker rm` without -f refuses a running container.
+            docker rm "$SYNC_CONTAINER" >/dev/null 2>&1 || true
+            docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "${@:2}"
             ;;
         install-timer)
             install_timer "$self"
             ;;
         *)
-            sed -n '2,11p' "$self"
+            sed -n '2,12p' "$self"
             return 1
             ;;
     esac
@@ -67,17 +73,26 @@ prepare() {
 }
 
 install_timer() {
-    local self="$1" units="$HOME/.config/systemd/user"
+    local self="$1" units="${2:-$HOME/.config/systemd/user}"
     mkdir -p "$units"
+    # Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the
+    # start limit stops a persistent failure from retrying all day.
     cat > "$units/stocktrader-marketdata.service" <<EOF
 [Unit]
 Description=stocktrader: download universe and daily price history
+StartLimitIntervalSec=12h
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart=$self sync-marketdata
+ExecStart="$self" sync-marketdata
+# On timeout systemd kills the compose client; make sure the container goes with it.
+ExecStopPost=-/usr/bin/docker stop $SYNC_CONTAINER
 TimeoutStartSec=3h
+Restart=on-failure
+RestartSec=20min
 EOF
+    [[ -n "${2:-}" ]] && return 0
     # After each US session (Mon-Fri), once Alpaca has the final daily bars.
     cat > "$units/stocktrader-marketdata.timer" <<EOF
 [Unit]

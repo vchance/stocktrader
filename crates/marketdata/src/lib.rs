@@ -11,5 +11,5 @@ pub mod sync;
 pub mod universe;
 
 pub use alpaca::{Adjustment, AlpacaClient, Asset};
-pub use store::{BarFilter, BarWriter, DailyBar, Summary, read_bars, summarize, to_core_bar};
+pub use store::{BarFilter, BarWriter, DailyBar, StagedFile, Stats, Summary, read_bars, summarize, to_core_bar};
 pub use sync::{SyncConfig, SyncReport, bars_path, sync};

@@ -3,7 +3,7 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use reqwest::header::{HeaderValue, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
@@ -104,6 +104,18 @@ pub struct AlpacaClient {
     last_request: Option<Instant>,
 }
 
+fn new_york_midnight(date: NaiveDate) -> DateTime<Utc> {
+    New_York
+        .from_local_datetime(&date.and_time(NaiveTime::MIN))
+        .earliest()
+        .expect("New York DST transitions are at 2am, so midnight always exists")
+        .with_timezone(&Utc)
+}
+
+fn rfc3339(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
 fn secret(value: &str) -> Result<HeaderValue> {
     let mut header = HeaderValue::from_str(value).context("API key is not a valid header value")?;
     header.set_sensitive(true);
@@ -132,6 +144,10 @@ impl AlpacaClient {
         })
     }
 
+    fn backoff(&self, attempt: u32) -> Duration {
+        self.retry_base * 2u32.saturating_pow(attempt.saturating_sub(1))
+    }
+
     async fn pace(&mut self) {
         if let Some(last) = self.last_request {
             tokio::time::sleep_until(last + self.min_interval).await;
@@ -155,9 +171,11 @@ impl AlpacaClient {
                 .map_err(reqwest::Error::without_url);
 
             let (wait, problem) = match response {
-                Ok(response) if response.status().is_success() => {
-                    return response.text().await.map_err(reqwest::Error::without_url).context("reading body");
-                }
+                // A connection dropped mid-body is as transient as one dropped before the headers.
+                Ok(response) if response.status().is_success() => match response.text().await {
+                    Ok(body) => return Ok(body),
+                    Err(e) => (self.backoff(attempt), format!("reading body: {}", e.without_url())),
+                },
                 Ok(response) => {
                     let status = response.status();
                     let retry_after = response
@@ -170,12 +188,12 @@ impl AlpacaClient {
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         (retry_after.unwrap_or(self.rate_limit_wait), format!("HTTP {status}"))
                     } else if status.is_server_error() {
-                        (self.retry_base * 2u32.saturating_pow(attempt - 1), format!("HTTP {status}: {body}"))
+                        (self.backoff(attempt), format!("HTTP {status}: {body}"))
                     } else {
                         return Err(HttpError { status, detail: format!("{shown}: {body}") }.into());
                     }
                 }
-                Err(e) => (self.retry_base * 2u32.saturating_pow(attempt - 1), e.to_string()),
+                Err(e) => (self.backoff(attempt), e.to_string()),
             };
             if attempt >= self.max_attempts {
                 bail!("giving up on {shown} after {attempt} attempts: {problem}");
@@ -197,7 +215,7 @@ impl AlpacaClient {
         Ok((body, assets))
     }
 
-    /// Daily bars for `symbols` from `start` through `end` (inclusive). Each page is handed to `on_page`
+    /// Daily bars for the sessions `start` through `end` (inclusive). Each page is handed to `on_page`
     /// as soon as it arrives, sorted by symbol then date, so callers can stream to disk.
     pub async fn daily_bars(
         &mut self,
@@ -209,8 +227,10 @@ impl AlpacaClient {
         mut on_page: impl FnMut(Vec<DailyBar>) -> Result<()>,
     ) -> Result<()> {
         let symbols = symbols.join(",");
-        let start = start.to_string();
-        let end = end.to_string();
+        // Daily bars are stamped at midnight New York time, so bound the request by exact instants rather
+        // than bare dates, whose interpretation is the API's choice.
+        let start = rfc3339(new_york_midnight(start));
+        let end = rfc3339(new_york_midnight(end + Days::new(1)) - TimeDelta::seconds(1));
         let mut page_token: Option<String> = None;
         loop {
             let mut params = vec![
@@ -226,7 +246,15 @@ impl AlpacaClient {
                 params.push(("page_token", token));
             }
             let url = Url::parse_with_params(&format!("{}/v2/stocks/bars", self.data_url), &params)?;
-            let page: BarsPage = serde_json::from_str(&self.get(url).await?).context("parsing bars page")?;
+            let mut parse_attempts = 0;
+            let page: BarsPage = loop {
+                parse_attempts += 1;
+                match serde_json::from_str(&self.get(url.clone()).await?) {
+                    Ok(page) => break page,
+                    Err(e) if parse_attempts < 3 => tracing::warn!("malformed bars page, refetching: {e}"),
+                    Err(e) => return Err(anyhow::Error::new(e).context("parsing bars page")),
+                }
+            };
 
             let mut bars: Vec<DailyBar> = page
                 .bars
@@ -284,6 +312,9 @@ mod tests {
             .and(header("APCA-API-KEY-ID", "kid"))
             .and(query_param("symbols", "AAPL,MSFT"))
             .and(query_param("adjustment", "all"))
+            // Sessions Oct 1-2 (EDT, UTC-4): from Oct 1 midnight to just before Oct 3 midnight, New York.
+            .and(query_param("start", "2026-10-01T04:00:00Z"))
+            .and(query_param("end", "2026-10-03T03:59:59Z"))
             .and(query_param_is_missing("page_token"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"bars":{"MSFT":[{"t":"2026-10-01T04:00:00Z","o":1,"h":2,"l":0.5,"c":1.5,"v":10,"n":3,"vw":1.2}],
@@ -340,6 +371,31 @@ mod tests {
         let (_, assets) = client(&server).assets("inactive").await.unwrap();
         assert_eq!(assets[0].symbol, "OLD");
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn refetches_a_malformed_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"bars":{"AAPL":[{"t":"#))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"bars":null,"next_page_token":null}"#))
+            .mount(&server)
+            .await;
+
+        let mut pages = 0;
+        client(&server)
+            .daily_bars(&["AAPL".into()], date(1), date(2), Adjustment::Raw, "sip", |_| {
+                pages += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(pages, 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
