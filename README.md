@@ -43,6 +43,8 @@ cargo run --release -p st-cli -- walk-forward --parquet data/marketdata/bars_dai
 | `bars_daily_raw.parquet` | The same bars as traded (use for price filters such as "above $5") |
 
 The universe is every US equity on NYSE, NASDAQ, ARCA, AMEX or BATS, active or delisted (OTC excluded).
+Alpaca's delisted list also holds identifiers that aren't tickers (CUSIP-style codes for rights and escrows,
+renamed `*_DELISTED` entries); its price API rejects them, so they are left out.
 Each sync rewrites the full history, because adjusted prices change retroactively after every split or
 dividend. Requests are paced under the free plan's 200/minute; a full sync takes roughly 30–60 minutes.
 
