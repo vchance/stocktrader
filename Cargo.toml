@@ -11,10 +11,14 @@ publish = false
 st-core = { path = "crates/core" }
 st-data = { path = "crates/data" }
 st-engine = { path = "crates/engine" }
+st-marketdata = { path = "crates/marketdata" }
 st-risk = { path = "crates/risk" }
 st-strategies = { path = "crates/strategies" }
 
 anyhow = "1"
+arrow-array = "60"
+arrow-schema = "60"
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
