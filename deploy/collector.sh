@@ -45,12 +45,7 @@ main() {
             docker compose stop collector
             ;;
         sync-marketdata)
-            prepare
-            docker compose build marketdata
-            # Fixed name: a sync still running (say, orphaned by a timeout) makes this one fail rather than
-            # overlap. Clear only an exited leftover; `docker rm` without -f refuses a running container.
-            docker rm "$SYNC_CONTAINER" >/dev/null 2>&1 || true
-            docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "${@:2}"
+            sync_marketdata "${@:2}"
             ;;
         install-timer)
             install_timer "$self" "${2:-}"
@@ -73,8 +68,33 @@ prepare() {
     chmod 600 .env
 }
 
+# Exit status when another sync is already running; the systemd unit treats it as success.
+ALREADY_RUNNING=75
+
+sync_marketdata() {
+    prepare
+    if [[ -n "$(docker ps -q --filter "name=^${SYNC_CONTAINER}\$")" ]]; then
+        echo "A market data sync is already running; not starting another." >&2
+        return "$ALREADY_RUNNING"
+    fi
+    docker compose build marketdata
+    # Clear only an exited leftover; `docker rm` without -f refuses a running container.
+    docker rm "$SYNC_CONTAINER" >/dev/null 2>&1 || true
+    docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "$@" &
+    local pid=$! status=0
+    # On SIGTERM (e.g. a systemd timeout) stop the container this run started, not just the compose client.
+    trap 'docker stop "$SYNC_CONTAINER" >/dev/null 2>&1 || true' TERM INT
+    wait "$pid" || status=$?
+    if ((status > 128)); then
+        # Interrupted by the trap: let the client exit now that its container is stopping.
+        wait "$pid" || true
+    fi
+    trap - TERM INT
+    return "$status"
+}
+
 install_timer() {
-    local self="$1" units="${2:-$HOME/.config/systemd/user}"
+    local self="${1//%/%%}" units="${2:-$HOME/.config/systemd/user}"
     mkdir -p "$units"
     # Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the
     # start limit stops a persistent failure from retrying all day.
@@ -87,8 +107,9 @@ StartLimitBurst=3
 [Service]
 Type=oneshot
 ExecStart="$self" sync-marketdata
-# On timeout systemd kills the compose client; make sure the container goes with it.
-ExecStopPost=-/usr/bin/docker stop $SYNC_CONTAINER
+# Another sync already running: nothing to do, and nothing to retry.
+SuccessExitStatus=$ALREADY_RUNNING
+# On timeout the script's SIGTERM trap stops the container it started.
 TimeoutStartSec=3h
 Restart=on-failure
 RestartSec=20min

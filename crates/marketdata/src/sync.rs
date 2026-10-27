@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{Days, NaiveDate};
 use reqwest::StatusCode;
 
@@ -64,7 +64,11 @@ pub async fn sync(client: &mut AlpacaClient, cfg: &SyncConfig) -> Result<SyncRep
     }
     fs::create_dir_all(&cfg.root)?;
     let lock = OpenOptions::new().create(true).truncate(false).write(true).open(cfg.root.join(".sync.lock"))?;
-    lock.try_lock().map_err(|_| anyhow!("another marketdata sync holds {}", cfg.root.display()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => bail!("another marketdata sync holds {}", cfg.root.display()),
+        Err(TryLockError::Error(e)) => return Err(e).context("locking the market data directory"),
+    }
 
     let mut assets = Vec::new();
     for status in ["active", "inactive"] {
@@ -105,6 +109,10 @@ pub async fn sync(client: &mut AlpacaClient, cfg: &SyncConfig) -> Result<SyncRep
     if let Err(e) = outcome {
         for file in staged {
             let _ = file.discard();
+        }
+        // A pass that failed mid-download dropped its writer, leaving a partial temporary file.
+        for adjustment in [Adjustment::All, Adjustment::Raw] {
+            let _ = fs::remove_file(bars_path(&cfg.root, adjustment).with_extension("parquet.tmp"));
         }
         return Err(e);
     }
@@ -315,6 +323,7 @@ mod tests {
         let cfg = SyncConfig { max_rejected: 2, ..config(dir.path()) };
         let err = sync(&mut client(&bad), &cfg).await.unwrap_err();
         assert!(format!("{err:#}").contains("more than 2 symbols rejected"));
+        assert!(!bars_path(dir.path(), Adjustment::All).with_extension("parquet.tmp").exists());
 
         let bars = read_bars(&bars_path(dir.path(), Adjustment::All), &BarFilter::default()).unwrap();
         assert_eq!(bars.len(), 2, "previous file must survive");
