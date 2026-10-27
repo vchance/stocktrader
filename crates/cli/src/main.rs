@@ -20,6 +20,7 @@ use st_strategies::{AttentionSpike, QualityValue, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
 mod paper;
+mod symbols;
 
 #[derive(Parser)]
 #[command(name = "stocktrader", about = "Automated stock trading: backtest, paper and live")]
@@ -62,6 +63,8 @@ enum Command {
     /// Before the open, trade the Alpaca paper account towards the strategy's current targets, sized and
     /// risk-checked exactly as in a backtest. Prints the plan only, unless --submit.
     Paper(Box<paper::PaperArgs>),
+    /// Check how many tradable Alpaca symbols the SEC ticker map (and so fundamentals strategies) covers.
+    Symbols(symbols::SymbolsArgs),
 }
 
 #[derive(Args)]
@@ -213,6 +216,7 @@ fn main() -> Result<()> {
             walk(&data, &grid, weight, windows)
         }
         Command::Paper(args) => paper::run(&args),
+        Command::Symbols(args) => symbols::run(&args),
     }
 }
 

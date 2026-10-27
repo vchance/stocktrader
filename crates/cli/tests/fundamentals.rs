@@ -144,3 +144,32 @@ fn quality_value_trades_on_filed_financials() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("needs --fundamentals"));
 }
+
+#[test]
+fn symbols_reports_how_much_of_the_universe_has_fundamentals() {
+    let dir = tempfile::tempdir().unwrap();
+    let fundamentals = dir.path().join("fundamentals");
+    std::fs::create_dir_all(&fundamentals).unwrap();
+    write_fundamentals(&fundamentals);
+    // Alpaca's universe: SYN000-SYN002 (in the SEC map with income) and an ETF; the older snapshot is ignored.
+    let assets = dir.path().join("marketdata/assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let asset = |s: &str| format!(r#"{{"symbol":"{s}","exchange":"NASDAQ","status":"active","class":"us_equity","tradable":true}}"#);
+    let current: Vec<String> = ["SYN000", "SYN001", "SYN002", "QQQ"].iter().map(|s| asset(s)).collect();
+    std::fs::write(assets.join("2026-01-02-active.json"), format!("[{}]", current.join(","))).unwrap();
+    std::fs::write(assets.join("2026-01-01-active.json"), format!("[{}]", asset("OLD"))).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_stocktrader"))
+        .args(["symbols", "--marketdata-dir"])
+        .arg(dir.path().join("marketdata"))
+        .arg("--fundamentals")
+        .arg(&fundamentals)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}\n{stdout}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("universe          4 active"), "{stdout}");
+    assert!(stdout.contains("in SEC ticker map 3 (75.0%)"), "{stdout}");
+    assert!(stdout.contains("with annual NI    3 (75.0%)"), "{stdout}");
+    assert!(stdout.contains("first 1: QQQ"), "{stdout}");
+}
