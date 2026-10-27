@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+st-core = { path = "crates/core" }
+st-data = { path = "crates/data" }
+st-engine = { path = "crates/engine" }
+st-risk = { path = "crates/risk" }
+st-strategies = { path = "crates/strategies" }
+
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal_macros = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
