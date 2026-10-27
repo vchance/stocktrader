@@ -125,6 +125,8 @@ Guards:
 - Dry run unless `--submit`. Both modes append the plan to `data/live/journal/<date>.jsonl`; submissions
   add one line per order with the broker's answer.
 - Runs only before or during a session; after the close, on weekends and on holidays it does nothing.
+  Submitting while the market is open needs `--allow-open`, since orders would fill at once rather than
+  at the open.
   It refuses market data that doesn't end with the previous session, and an account that isn't `ACTIVE`.
 - A file `data/live/KILL` blocks every order that adds exposure; exits still go out. Its first line is
   shown as the reason. Delete it to resume.

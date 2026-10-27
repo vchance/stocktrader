@@ -46,6 +46,10 @@ pub struct PaperArgs {
     /// Send the orders. Without this the run only prints and journals its plan.
     #[arg(long)]
     submit: bool,
+    /// Allow submitting while the market is open. Orders then fill at once at the current price, though
+    /// they were sized on the previous close, unlike the backtest's fills at the open.
+    #[arg(long)]
+    allow_open: bool,
     /// Alpaca trading endpoint; anything other than the paper endpoint is refused.
     #[arg(long, default_value = PAPER_URL)]
     trading_url: String,
@@ -74,12 +78,17 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
         return Ok(());
     };
     if clock.is_open {
+        if args.submit && !args.allow_open {
+            bail!("the market is open; orders would fill now rather than at the open. Pass --allow-open to submit anyway");
+        }
         eprintln!("warning: the market is open, so market orders fill now rather than at the open");
     }
 
     let params = args.strategy.params(args.attention.is_some())?;
     let mut strategy = make_strategy(&params, args.strategy.weight)?;
-    let loaded = load(&data_args(args, previous - Days::new(args.history_days)))?;
+    let mut data = data_args(args, previous - Days::new(args.history_days));
+    data.attention_until = Some(clock.timestamp.to_utc());
+    let loaded = load(&data)?;
     check_freshness(&loaded.events, previous, &args.symbols)?;
 
     let account = client.account().await?;
@@ -93,7 +102,9 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
     };
 
     let kill_file = args.live_dir.join("KILL");
-    let kill = kill_file.exists().then(|| {
+    // Fails closed: if the kill file's presence can't be determined, nothing is traded.
+    let kill_present = kill_file.try_exists().with_context(|| format!("checking for {}", kill_file.display()))?;
+    let kill = kill_present.then(|| {
         let note = fs::read_to_string(&kill_file).unwrap_or_default();
         let note = note.lines().next().unwrap_or("").trim();
         if note.is_empty() { "KILL file present".to_string() } else { format!("KILL file: {note}") }
@@ -148,7 +159,10 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
     for (planned, outcome) in &results {
         let shown = match outcome {
             Outcome::Accepted { status, .. } => format!("accepted ({status})"),
-            Outcome::Duplicate => "already submitted today".to_string(),
+            Outcome::Duplicate => {
+                "already submitted today (not resent; if that order was cancelled or rejected, check the broker)"
+                    .to_string()
+            }
             Outcome::Failed { error } => {
                 failed += 1;
                 format!("FAILED: {error}")
@@ -178,6 +192,7 @@ fn data_args(args: &PaperArgs, start: NaiveDate) -> DataArgs {
         cash: Decimal::ZERO,
         slippage_bps: Decimal::ZERO,
         min_price: args.min_price,
+        attention_until: None,
     }
 }
 

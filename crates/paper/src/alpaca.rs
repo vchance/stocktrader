@@ -241,7 +241,7 @@ impl TradingClient {
         match self.send(Method::POST, "/v2/orders", &[], Some(order)).await {
             Ok(body) => Ok(Submitted::Accepted(Box::new(serde_json::from_str(&body).context("parsing order")?))),
             Err(e) => match e.downcast_ref::<HttpError>() {
-                Some(h) if h.status == StatusCode::UNPROCESSABLE_ENTITY && h.detail.contains("client_order_id") => {
+                Some(h) if h.status == StatusCode::UNPROCESSABLE_ENTITY && h.detail.contains("client_order_id must be unique") => {
                     Ok(Submitted::Duplicate)
                 }
                 _ => Err(e),
@@ -406,6 +406,19 @@ mod tests {
         let c = client(&server);
         assert!(matches!(c.submit(&order()).await.unwrap(), Submitted::Accepted(o) if o.id == "o9"));
         assert!(matches!(c.submit(&order()).await.unwrap(), Submitted::Duplicate));
+    }
+
+    #[tokio::test]
+    async fn other_client_order_id_errors_are_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_string(r#"{"message":"client_order_id must be no more than 128 characters"}"#),
+            )
+            .mount(&server)
+            .await;
+        assert!(client(&server).submit(&order()).await.is_err());
     }
 
     #[tokio::test]

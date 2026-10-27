@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 use chrono::{Datelike, Days, NaiveDate, Weekday};
 use serde_json::{Value, json};
 use st_marketdata::{BarWriter, DailyBar};
+use st_signals::AttentionRow;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -51,9 +52,13 @@ fn write_bars(dir: &Path, last: NaiveDate) {
 
 /// A paper account holding 30 DOWN, with the clock at `now` and sessions on the 23rd, 26th, 27th and 28th.
 async fn mock_alpaca(now: &str, next_open: &str) -> MockServer {
+    mock_alpaca_at(now, false, next_open).await
+}
+
+async fn mock_alpaca_at(now: &str, is_open: bool, next_open: &str) -> MockServer {
     let server = MockServer::start().await;
     let get = |p: &str, body: Value| Mock::given(method("GET")).and(path(p)).respond_with(ResponseTemplate::new(200).set_body_json(body));
-    get("/v2/clock", json!({"timestamp": now, "is_open": false, "next_open": next_open, "next_close": next_open}))
+    get("/v2/clock", json!({"timestamp": now, "is_open": is_open, "next_open": next_open, "next_close": next_open}))
         .mount(&server)
         .await;
     get("/v2/calendar", json!([{"date": "2026-10-23"}, {"date": "2026-10-26"}, {"date": "2026-10-27"}, {"date": "2026-10-28"}]))
@@ -192,4 +197,50 @@ fn refuses_the_live_endpoint() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("refusing trading URL"));
+}
+
+fn spike(ticker: &str, observed_at: &str) -> AttentionRow {
+    let t = chrono::DateTime::parse_from_rfc3339(observed_at).unwrap().to_utc();
+    AttentionRow {
+        snapshot_at: t,
+        observed_at: t,
+        ticker: ticker.into(),
+        rank: Some(1),
+        mentions: 500,
+        upvotes: Some(100),
+        rank_24h_ago: Some(50),
+        mentions_24h_ago: Some(20),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overnight_attention_is_acted_on_but_not_attention_from_after_now() {
+    let dir = tempfile::tempdir().unwrap();
+    write_bars(dir.path(), date(26));
+    let attention = dir.path().join("apewisdom.parquet");
+    // UP spiked overnight, after the 26th's close and before the 08:45 run; DOWN only "spikes" at 11:00,
+    // later than the run's clock, which a real run could never have seen.
+    st_signals::write_rows(&attention, &[spike("UP", "2026-10-27T06:00:00Z"), spike("DOWN", "2026-10-27T15:00:00Z")]).unwrap();
+    let server = mock_alpaca(BEFORE_OPEN.0, BEFORE_OPEN.1).await;
+
+    let out = stdout(&paper(dir.path(), &server, &["--strategy", "attention-spike", "--attention", attention.to_str().unwrap()]));
+    assert!(out.contains("UP       Buy"), "{out}");
+    assert!(!out.contains("DOWN     Buy"), "{out}");
+    assert!(out.contains("left alone        DOWN"), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submitting_during_the_session_needs_allow_open() {
+    let dir = tempfile::tempdir().unwrap();
+    write_bars(dir.path(), date(26));
+    let server = mock_alpaca_at("2026-10-27T11:00:00-04:00", true, "2026-10-28T09:30:00-04:00").await;
+
+    let out = paper(dir.path(), &server, &["--submit"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--allow-open"));
+    assert!(posted(&server).await.is_empty());
+
+    stdout(&paper(dir.path(), &server, &[]));
+    stdout(&paper(dir.path(), &server, &["--submit", "--allow-open"]));
+    assert_eq!(posted(&server).await.len(), 2);
 }

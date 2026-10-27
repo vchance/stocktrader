@@ -102,6 +102,10 @@ struct DataArgs {
     /// Risk filter: skip entries whose as-traded price is below this; 0 disables.
     #[arg(long, default_value = "5")]
     min_price: Decimal,
+    /// Latest attention to read. Replays stop at the last bar; the paper runner reads up to the present,
+    /// since attention that arrived overnight is part of what it acts on.
+    #[arg(skip)]
+    attention_until: Option<Timestamp>,
 }
 
 #[derive(Args)]
@@ -398,7 +402,8 @@ fn load(data: &DataArgs) -> Result<Loaded> {
     let last_bar = bars.iter().map(|b| b.end).max();
     let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
     if let Some(path) = &data.attention {
-        let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to: last_bar };
+        let to = data.attention_until.or(last_bar);
+        let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to };
         let rows = st_signals::read_rows(path, &filter)?;
         println!("attention events  {}", rows.len());
         warn_on_coverage(first_bar, rows.iter().map(|r| r.observed_at).min());

@@ -441,14 +441,15 @@ paper_trade() {
     read -r -a args <<<"$(env_value PAPER_ARGS)"
     if ((${#args[@]} == 0)); then
         echo "PAPER_ARGS is not set in .env; for example: PAPER_ARGS=--symbols AAPL,MSFT,NVDA --strategy sma" >&2
-        return 1
+        status=1
+    else
+        docker compose build paper >/dev/null || status=$?
     fi
-    docker compose build paper >/dev/null || status=$?
     if ((status == 0)); then
         docker compose run --rm --no-deps -T paper "${args[@]}" "$@" </dev/null || status=$?
     fi
-    if ((status != 0)) && [[ " $* " == *" --submit "* ]]; then
-        notify "stocktrader on $(hostname): paper trading failed" "See: journalctl --user -u stocktrader-paper"
+    if ((status != 0)) && [[ " ${args[*]} $* " == *" --submit "* ]]; then
+        notify "stocktrader on $(hostname): paper trading failed" "See: journalctl --user -u stocktrader-paper" || true
     fi
     return "$status"
 }
