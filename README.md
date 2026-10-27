@@ -95,6 +95,31 @@ to history, a ticker that once belonged to another company gets this company's f
 companies lose their old symbol, and delisted companies have none. Daily ticker snapshots are kept from
 deployment onward so symbols can later be resolved as of each date. Concept coverage also varies by filer.
 
+### Trading on fundamentals
+
+`--fundamentals data/fundamentals` merges filed financials into a `backtest`, `walk-forward` or `paper`
+replay, for the symbols that have bars and from two years before the first bar, so annual reports are
+already known when trading starts. Only the concepts strategies use are read.
+
+```
+cargo run --release -p st-cli -- walk-forward --strategy quality-value --fundamentals data/fundamentals \
+    --parquet data/marketdata/bars_daily_all.parquet --start 2018-01-01
+```
+
+`quality-value` ranks the market on the first session of each month and holds the `--top-n` (20) best at
+equal weight (1/N each; `--weight` doesn't apply). The rank is the sum of two ranks from the latest filings:
+earnings yield (annual net income over shares outstanding times the as-traded price) and return on assets
+(annual net income over total assets). Only stocks at $5 or more with $5M average daily dollar volume over
+20 sessions, positive assets and shares, and reports less than 15 months old are eligible. Walk-forward
+tries 10, 20 and 40 names. Simplifications to know: annual figures only (no trailing-twelve-month
+stitching), a split after the latest share count misstates market cap until the next filing, share counts
+of multi-class issuers may cover one class, and the ticker-mapping limit above applies. It is a first,
+deliberately plain factor strategy to measure against SPY, not a claim of an edge.
+
+Strategies that compare symbols get every bar of a session before deciding: the engine calls
+`Strategy::after_batch` once per timestamp, after all of that timestamp's events, in backtests and in the
+paper planner alike.
+
 ## Social signals
 
 `signals apewisdom` rebuilds `data/signals/apewisdom.parquet` from the raw archive (both `.jsonl` and
@@ -263,7 +288,7 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 | `st-data` | Point-in-time replay (`VecEventSource`), CSV daily bars, synthetic data. Ingestion clients go here |
 | `st-risk` | Pre-trade checks: position cap, gross exposure, daily loss halt, kill switch, price and liquidity filters |
 | `st-engine` | Event-driven backtester, `SimulatedBroker` (fills at next bar open + slippage), metrics |
-| `st-strategies` | Strategies. `SmaCrossover` is a plumbing test only |
+| `st-strategies` | Strategies: `QualityValue` (monthly fundamentals ranking), `AttentionSpike`; `SmaCrossover` is a plumbing test only |
 | `st-paper` | Alpaca paper-account client and the pre-open planner (`stocktrader paper`) |
 | `st-cli` | `stocktrader` binary |
 
@@ -289,8 +314,9 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 1. ~~Alpaca daily bars, universe snapshots, Parquet store~~ (`marketdata`), ~~raw prices for the price
    filter~~, ~~date-major files streamed into backtests~~.
 2. ~~Start archiving news and social feeds~~ (`collector`, running on `jabrony`). Next: compress old files.
-3. ~~EDGAR fundamentals with point-in-time filing dates~~ (`fundamentals`). Next: historical ticker
-   mapping, and feeding facts into strategies.
+3. ~~EDGAR fundamentals with point-in-time filing dates~~ (`fundamentals`), ~~in backtests and a
+   quality-value strategy~~ (`--fundamentals`, `quality-value`). Next: historical ticker mapping, trailing
+   twelve-month figures, and a walk-forward verdict on real data.
 4. ~~Mention velocity from ApeWisdom~~ (`signals`, `attention-spike`). Next: Reddit and news text pipeline
    (ticker extraction, dedupe, sentiment scoring via FinBERT/ONNX or an LLM) once those sources have keys.
 5. ~~Daily paper trading on Alpaca~~ (`stocktrader paper`: reconciles with the broker each run, shared

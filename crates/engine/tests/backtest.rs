@@ -7,6 +7,36 @@ use st_engine::{Backtest, BacktestError, BacktestReport, FillModel, SimulatedBro
 use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, SmaCrossover};
 
+/// Records how many events each `after_batch` call follows, and holds SYN000 from the first batch on.
+struct BatchRecorder {
+    seen: usize,
+    batches: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+}
+
+impl Strategy for BatchRecorder {
+    fn name(&self) -> &str {
+        "batch_recorder"
+    }
+
+    fn on_event(&mut self, _event: &Event, _ctx: &StrategyContext<'_>) -> Vec<Signal> {
+        self.seen += 1;
+        Vec::new()
+    }
+
+    fn after_batch(&mut self, _ctx: &StrategyContext<'_>) -> Vec<Signal> {
+        self.batches.borrow_mut().push(std::mem::take(&mut self.seen));
+        vec![Signal { symbol: Symbol::new("SYN000"), target_weight: dec!(0.05), reason: "test".into() }]
+    }
+}
+
+#[test]
+fn after_batch_runs_once_per_timestamp_after_all_its_events_and_its_signals_trade() {
+    let batches = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let report = run(synthetic_source(4, 30, 3), BatchRecorder { seen: 0, batches: batches.clone() });
+    assert_eq!(*batches.borrow(), vec![4; 30], "one call per session, after its four bars");
+    assert!(report.fills.iter().any(|f| f.symbol.as_str() == "SYN000"));
+}
+
 fn synthetic_source(symbols: usize, days: usize, seed: u64) -> VecEventSource {
     let bars = generate_daily_bars(&SyntheticConfig {
         symbols,

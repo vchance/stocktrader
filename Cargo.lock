@@ -2020,6 +2020,7 @@ dependencies = [
  "st-core",
  "st-data",
  "st-engine",
+ "st-fundamentals",
  "st-marketdata",
  "st-paper",
  "st-risk",
@@ -2200,7 +2201,9 @@ name = "st-strategies"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "rust_decimal",
+ "rust_decimal_macros",
  "st-core",
 ]
 

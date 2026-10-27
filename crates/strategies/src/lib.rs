@@ -5,6 +5,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
+mod quality_value;
+pub use quality_value::QualityValue;
+
 use chrono::TimeDelta;
 use rust_decimal::Decimal;
 use st_core::{Event, EventKind, Signal, Strategy, StrategyContext, Symbol, Timestamp};

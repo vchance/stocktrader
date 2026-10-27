@@ -30,6 +30,12 @@ pub struct StrategyContext<'a> {
 pub trait Strategy {
     fn name(&self) -> &str;
     fn on_event(&mut self, event: &Event, ctx: &StrategyContext<'_>) -> Vec<Signal>;
+
+    /// Called once after every event sharing a timestamp has been passed to [`Strategy::on_event`], so a
+    /// strategy that compares symbols (say, ranking the whole market at the close) acts on a complete set.
+    fn after_batch(&mut self, _ctx: &StrategyContext<'_>) -> Vec<Signal> {
+        Vec::new()
+    }
 }
 
 /// Lets a strategy chosen at runtime (e.g. from a CLI flag) run through the same generic engine.
@@ -40,6 +46,10 @@ impl<S: Strategy + ?Sized> Strategy for Box<S> {
 
     fn on_event(&mut self, event: &Event, ctx: &StrategyContext<'_>) -> Vec<Signal> {
         (**self).on_event(event, ctx)
+    }
+
+    fn after_batch(&mut self, ctx: &StrategyContext<'_>) -> Vec<Signal> {
+        (**self).after_batch(ctx)
     }
 }
 

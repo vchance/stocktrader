@@ -12,6 +12,7 @@ path = "src/main.rs"
 st-core.workspace = true
 st-data.workspace = true
 st-engine.workspace = true
+st-fundamentals.workspace = true
 st-marketdata.workspace = true
 st-paper.workspace = true
 st-risk.workspace = true

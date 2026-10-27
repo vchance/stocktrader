@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{NaiveDate, Utc};
 use chrono_tz::America::New_York;
 use clap::{Parser, Subcommand};
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
         }
         Command::Show { ticker, as_of, concepts } => {
             let ticker = ticker.to_ascii_uppercase();
-            let snapshot = latest_ticker_snapshot(&cli.data_dir)?;
+            let snapshot = st_fundamentals::tickers::latest_snapshot(&cli.data_dir)?;
             let listings = parse_tickers(&std::fs::read(&snapshot)?)?;
             let ciks: HashSet<u32> = listings.iter().filter(|l| l.ticker == ticker).map(|l| l.cik).collect();
             if ciks.is_empty() {
@@ -101,15 +101,4 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn latest_ticker_snapshot(root: &std::path::Path) -> Result<PathBuf> {
-    let dir = root.join("tickers");
-    let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .with_context(|| format!("no ticker snapshots in {}; run `fundamentals sync` first", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .collect();
-    snapshots.sort();
-    snapshots.pop().with_context(|| format!("no ticker snapshots in {}", dir.display()))
 }

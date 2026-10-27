@@ -4,7 +4,7 @@
 
 use chrono::TimeDelta;
 use rust_decimal::Decimal;
-use st_core::{Event, Strategy, Timestamp};
+use st_core::{Event, EventKind, Strategy, Timestamp};
 use st_data::VecEventSource;
 use st_risk::{RiskLimits, RiskManager};
 
@@ -50,6 +50,11 @@ pub struct WalkForwardReport<P> {
 /// on the training window and the one with the best Sharpe ratio (ties: higher return) is then backtested
 /// on the following test window. Each backtest starts from `initial_cash`. A final test window cut to less
 /// than half its length by the end of the data is dropped.
+///
+/// Folds are laid out over the span of the price bars. Each backtest replays its warm-up and window, preceded
+/// by every earlier non-bar event (filings, attention): a fresh strategy must know, say, the latest annual
+/// report, which may have been filed long before the warm-up began. Those events are all public before the
+/// window, so this adds no look-ahead.
 pub fn walk_forward<P: Clone, S: Strategy>(
     events: &[Event],
     cfg: &WalkForwardConfig,
@@ -58,17 +63,22 @@ pub fn walk_forward<P: Clone, S: Strategy>(
 ) -> Result<WalkForwardReport<P>, BacktestError> {
     let mut events = events.to_vec();
     events.sort_by_key(|e| e.available_at);
-    let (Some(first), Some(last)) = (events.first().map(|e| e.available_at), events.last().map(|e| e.available_at))
-    else {
+    let is_bar = |e: &Event| matches!(e.kind, EventKind::Bar(_));
+    let bar_times = || events.iter().filter(|e| is_bar(e)).map(|e| e.available_at);
+    let (Some(first), Some(last)) = (bar_times().min(), bar_times().max()) else {
         return Ok(WalkForwardReport { folds: Vec::new(), out_of_sample_return: 0.0, out_of_sample_cagr: 0.0 });
     };
     assert!(!candidates.is_empty(), "walk_forward needs at least one candidate");
+    let context: Vec<Event> = events.iter().filter(|e| !is_bar(e)).cloned().collect();
 
     let run = |strategy: S, from: Timestamp, trade_from: Timestamp, to: Timestamp| {
         let lo = events.partition_point(|e| e.available_at < from);
         let hi = events.partition_point(|e| e.available_at < to);
+        let earlier = context.partition_point(|e| e.available_at < from);
+        let mut replay = context[..earlier].to_vec();
+        replay.extend_from_slice(&events[lo..hi]);
         Backtest::new(
-            VecEventSource::new(events[lo..hi].to_vec()),
+            VecEventSource::new(replay),
             strategy,
             SimulatedBroker::new(cfg.fill.clone()),
             RiskManager::new(cfg.limits.clone()),

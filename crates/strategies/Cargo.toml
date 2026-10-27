@@ -7,4 +7,6 @@ publish.workspace = true
 [dependencies]
 st-core.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 rust_decimal.workspace = true
+rust_decimal_macros.workspace = true

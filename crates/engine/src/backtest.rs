@@ -139,6 +139,7 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
         for event in batch {
             signals.extend(self.strategy.on_event(event, &ctx));
         }
+        signals.extend(self.strategy.after_batch(&ctx));
         signals
     }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -43,6 +44,18 @@ pub fn parse_tickers(json: &[u8]) -> Result<Vec<Listing>> {
         bail!("ticker map is empty");
     }
     Ok(out)
+}
+
+/// The newest `tickers/<date>.json` snapshot under a fundamentals directory.
+pub fn latest_snapshot(root: &Path) -> Result<PathBuf> {
+    let dir = root.join("tickers");
+    let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .with_context(|| format!("no ticker snapshots in {}; run `fundamentals sync` first", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    snapshots.sort();
+    snapshots.pop().with_context(|| format!("no ticker snapshots in {}", dir.display()))
 }
 
 /// CIK to its first-listed ticker (the SEC lists a company's primary security first).
