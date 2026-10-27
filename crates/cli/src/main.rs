@@ -16,7 +16,7 @@ use st_engine::metrics::{self, buy_and_hold, correlation};
 use st_engine::{Backtest, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
 use st_marketdata::{BarEventSource, BarFilter, ReplayStats, coverage, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
-use st_strategies::{AttentionSpike, SmaCrossover};
+use st_strategies::{AttentionSpike, QualityValue, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
 mod paper;
@@ -89,6 +89,10 @@ struct DataArgs {
     /// Attention table from `signals apewisdom` (data/signals/apewisdom.parquet), merged into the replay.
     #[arg(long)]
     attention: Option<PathBuf>,
+    /// Directory from `fundamentals sync` (data/fundamentals): filed financials merged into the replay, each
+    /// from the day after its filing date.
+    #[arg(long)]
+    fundamentals: Option<PathBuf>,
     /// Buy-and-hold comparison symbol, or `none`.
     #[arg(long, default_value = "SPY")]
     benchmark: String,
@@ -131,6 +135,9 @@ struct StrategyArgs {
     /// Attention spike: days to hold after the latest spike.
     #[arg(long, default_value_t = 5)]
     spike_hold_days: u32,
+    /// Quality-value: names held, each at 1/N of equity (--weight doesn't apply).
+    #[arg(long, default_value_t = 20)]
+    top_n: usize,
     /// Target weight per position when long.
     #[arg(long, default_value = "0.05")]
     weight: Decimal,
@@ -142,6 +149,8 @@ enum StrategyName {
     Sma,
     /// Buy on a jump in social-media mentions (needs --attention).
     AttentionSpike,
+    /// Monthly: hold the stocks ranking best on earnings yield plus return on assets (needs --fundamentals).
+    QualityValue,
 }
 
 /// One point in a strategy's parameter space.
@@ -149,6 +158,7 @@ enum StrategyName {
 enum Params {
     Sma { fast: usize, slow: usize },
     Spike { min_mentions: u32, ratio: f64, hold_days: u32 },
+    QualityValue { top_n: usize },
 }
 
 impl fmt::Display for Params {
@@ -158,6 +168,7 @@ impl fmt::Display for Params {
             Params::Spike { min_mentions, ratio, hold_days } => {
                 write!(f, "spike >={min_mentions} x{ratio} {hold_days}d")
             }
+            Params::QualityValue { top_n } => write!(f, "quality-value top {top_n}"),
         }
     }
 }
@@ -168,6 +179,7 @@ fn make_strategy(params: &Params, weight: Decimal) -> Result<Box<dyn Strategy>> 
         Params::Spike { min_mentions, ratio, hold_days } => {
             Box::new(AttentionSpike::new(min_mentions, ratio, hold_days, weight).map_err(anyhow::Error::msg)?)
         }
+        Params::QualityValue { top_n } => Box::new(QualityValue::new(top_n).map_err(anyhow::Error::msg)?),
     })
 }
 
@@ -191,6 +203,10 @@ fn main() -> Result<()> {
                     }
                     grid
                 }
+                StrategyName::QualityValue => {
+                    require_fundamentals(&data)?;
+                    [10, 20, 40].into_iter().map(|top_n| Params::QualityValue { top_n }).collect()
+                }
             };
             let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), TimeDelta::days(warmup_days));
             walk(&data, &grid, weight, windows)
@@ -206,8 +222,15 @@ fn require_attention(data: &DataArgs) -> Result<()> {
     Ok(())
 }
 
+fn require_fundamentals(data: &DataArgs) -> Result<()> {
+    if data.fundamentals.is_none() {
+        bail!("quality-value needs --fundamentals data/fundamentals");
+    }
+    Ok(())
+}
+
 impl StrategyArgs {
-    fn params(&self, have_attention: bool) -> Result<Params> {
+    fn params(&self, have_attention: bool, have_fundamentals: bool) -> Result<Params> {
         Ok(match self.strategy {
             StrategyName::Sma => Params::Sma { fast: self.fast, slow: self.slow },
             StrategyName::AttentionSpike => {
@@ -215,6 +238,12 @@ impl StrategyArgs {
                     bail!("attention-spike needs --attention data/signals/apewisdom.parquet");
                 }
                 Params::Spike { min_mentions: self.spike_min_mentions, ratio: self.spike_ratio, hold_days: self.spike_hold_days }
+            }
+            StrategyName::QualityValue => {
+                if !have_fundamentals {
+                    bail!("quality-value needs --fundamentals data/fundamentals");
+                }
+                Params::QualityValue { top_n: self.top_n }
             }
         })
     }
@@ -246,7 +275,7 @@ struct ReplayReport {
 }
 
 fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
-    let params = args.params(data.attention.is_some())?;
+    let params = args.params(data.attention.is_some(), data.fundamentals.is_some())?;
     let strategy = make_strategy(&params, args.weight)?;
     let prepared = prepare(data)?;
     let report = Backtest::new(
@@ -294,6 +323,8 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
         .map(|p| match p {
             Params::Sma { slow, .. } => *slow,
             Params::Spike { .. } => 0,
+            // Up to a month until the first rebalance; its liquidity window matches the risk lookback added below.
+            Params::QualityValue { .. } => 23,
         })
         .max()
         .unwrap_or(0)
@@ -397,7 +428,8 @@ fn load(data: &DataArgs) -> Result<Loaded> {
 }
 
 /// The replay for `data`: Parquet bars are streamed from disk (with as-traded closes merged in from the raw
-/// file), CSV and synthetic bars come from memory, and attention events are interleaved by time. Nothing is
+/// file), CSV and synthetic bars come from memory, and attention and fundamental events are interleaved by
+/// time. Nothing is
 /// checked until the source is drained; call [`report_replay`] afterwards.
 fn prepare(data: &DataArgs) -> Result<Prepared> {
     let benchmark_symbol = (!data.benchmark.eq_ignore_ascii_case("none")).then(|| data.benchmark.to_ascii_uppercase());
@@ -434,22 +466,35 @@ fn prepare(data: &DataArgs) -> Result<Prepared> {
         _ => None,
     };
 
-    // Attention only matters for symbols we have prices for, within the replayed period; anything else
-    // would cost memory and stretch the metrics' time span.
+    // Attention and fundamentals only matter for symbols we have prices for, within the replayed period;
+    // anything else would cost memory and stretch the metrics' time span.
     let mut attention = Vec::new();
+    let (first, last) = (span.map(|s| s.0), span.map(|s| s.1));
     if let Some(path) = &data.attention {
-        let (first, last) = (span.map(|s| s.0), span.map(|s| s.1));
-        let filter = st_signals::RowFilter { tickers, from: first, to: data.attention_until.or(last) };
+        let filter = st_signals::RowFilter { tickers: tickers.clone(), from: first, to: data.attention_until.or(last) };
         let rows = st_signals::read_rows(path, &filter)?;
         println!("attention events  {}", rows.len());
         warn_on_coverage(first, rows.iter().map(|r| r.observed_at).min());
         attention = st_signals::to_events(&rows);
+    }
+    if let (Some(dir), Some(symbols), Some(first), Some(to)) = (&data.fundamentals, &tickers, first, data.attention_until.or(last)) {
+        // Annual figures stay current for over a year, so read filings from well before the first bar.
+        let from = first - TimeDelta::days(FUNDAMENTALS_LOOKBACK_DAYS);
+        let events = st_fundamentals::load_events(dir, QualityValue::CONCEPTS, symbols, from, to)?;
+        println!("fundamental events {}", events.len());
+        if events.is_empty() {
+            eprintln!("warning: no fundamentals for these symbols and dates");
+        }
+        attention.extend(events);
     }
     let source: Box<dyn EventSource> = Box::new(MergeSource::new(bars, VecEventSource::new(attention)));
     let limits =
         RiskLimits { min_price: data.min_price, require_traded_price: report.traded_prices, ..RiskLimits::default() };
     Ok(Prepared { source, report, benchmark, limits })
 }
+
+/// Filings read from before the first bar: enough for a fiscal year's report to be found until the next.
+const FUNDAMENTALS_LOOKBACK_DAYS: i64 = 730;
 
 fn warn_on_coverage(first_bar: Option<Timestamp>, first_attention: Option<Timestamp>) {
     match (first_bar, first_attention) {

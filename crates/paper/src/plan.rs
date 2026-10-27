@@ -134,14 +134,19 @@ pub fn plan<S: Strategy>(
         return Plan { equity: portfolio.equity(), ..Plan::default() };
     };
 
+    // Events sharing a timestamp form a batch, as in the backtester: each goes to the strategy, then
+    // `after_batch` once.
     let mut targets: BTreeMap<Symbol, Signal> = BTreeMap::new();
-    for event in &events {
+    for (i, event) in events.iter().enumerate() {
         risk.on_market_event(event);
         if let EventKind::Bar(bar) = &event.kind {
             portfolio.mark(&bar.symbol, bar.close);
         }
         let ctx = StrategyContext { now: event.available_at, portfolio: &portfolio };
-        let signals = strategy.on_event(event, &ctx);
+        let mut signals = strategy.on_event(event, &ctx);
+        if events.get(i + 1).is_none_or(|next| next.available_at != event.available_at) {
+            signals.extend(strategy.after_batch(&ctx));
+        }
         if event.available_at >= as_of {
             for signal in signals {
                 targets.insert(signal.symbol.clone(), signal);
@@ -312,6 +317,38 @@ mod tests {
         let p = plan(events, &mut strategy, &mut risk(), state(Portfolio::new(dec!(10_000)), vec![], dec!(10_000)), today(), None);
         assert_eq!(p.orders.len(), 1);
         assert_eq!((p.orders[0].order.side, p.orders[0].order.qty), (Side::Buy, dec!(25)));
+    }
+
+    /// Targets UP only from `after_batch`, and only once it has seen both of a session's bars.
+    struct PerSession {
+        seen: usize,
+    }
+
+    impl Strategy for PerSession {
+        fn name(&self) -> &str {
+            "per_session"
+        }
+
+        fn on_event(&mut self, _event: &Event, _ctx: &StrategyContext<'_>) -> Vec<Signal> {
+            self.seen += 1;
+            Vec::new()
+        }
+
+        fn after_batch(&mut self, _ctx: &StrategyContext<'_>) -> Vec<Signal> {
+            let complete = std::mem::take(&mut self.seen) == 2;
+            let weight = if complete { dec!(0.10) } else { dec!(0) };
+            vec![Signal { symbol: Symbol::new("UP"), target_weight: weight, reason: format!("complete: {complete}") }]
+        }
+    }
+
+    #[test]
+    fn after_batch_signals_from_the_latest_session_become_targets() {
+        let mut events = bars("UP", 20, 100, 1);
+        events.extend(bars("FLAT", 20, 100, 0));
+        let mut strategy = PerSession { seen: 0 };
+        let p = plan(events, &mut strategy, &mut risk(), state(Portfolio::new(dec!(100_000)), vec![], dec!(100_000)), today(), None);
+        assert_eq!(p.targets, BTreeMap::from([(Symbol::new("UP"), dec!(0.10))]));
+        assert_eq!((p.orders[0].order.symbol.as_str(), p.orders[0].order.side), ("UP", Side::Buy));
     }
 
     #[test]

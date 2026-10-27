@@ -11,7 +11,7 @@ pub mod store;
 pub mod sync;
 pub mod tickers;
 
-pub use events::{available_at, to_events};
+pub use events::{available_at, load_events, market_symbol, to_events};
 pub use facts::{CONCEPTS, FORMS, Fact, parse_company};
 pub use sec::SecClient;
 pub use store::{FactFilter, FactWriter, read_facts};

@@ -31,6 +31,9 @@ pub struct PaperArgs {
     /// Attention table from `signals apewisdom`, for attention strategies.
     #[arg(long)]
     attention: Option<PathBuf>,
+    /// Directory from `fundamentals sync`, for fundamentals strategies.
+    #[arg(long)]
+    fundamentals: Option<PathBuf>,
     /// Journal and kill-switch directory. A file named KILL here blocks new exposure; exits still go out.
     #[arg(long, env = "STOCKTRADER_LIVE_DIR", default_value = "data/live")]
     live_dir: PathBuf,
@@ -84,7 +87,7 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
         eprintln!("warning: the market is open, so market orders fill now rather than at the open");
     }
 
-    let params = args.strategy.params(args.attention.is_some())?;
+    let params = args.strategy.params(args.attention.is_some(), args.fundamentals.is_some())?;
     let mut strategy = make_strategy(&params, args.strategy.weight)?;
     let mut data = data_args(args, previous - Days::new(args.history_days));
     data.attention_until = Some(clock.timestamp.to_utc());
@@ -185,6 +188,7 @@ fn data_args(args: &PaperArgs, start: NaiveDate) -> DataArgs {
         end: None,
         symbols: args.symbols.clone(),
         attention: args.attention.clone(),
+        fundamentals: args.fundamentals.clone(),
         benchmark: "none".into(),
         synthetic_symbols: 0,
         synthetic_days: 0,

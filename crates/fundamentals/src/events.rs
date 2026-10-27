@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
 
 use chrono::{Days, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -7,6 +11,9 @@ use rust_decimal::prelude::FromPrimitive;
 use st_core::{Event, EventKind, FundamentalRecord, Symbol, Timestamp};
 
 use crate::facts::Fact;
+use crate::store::{FactFilter, read_facts};
+use crate::sync::facts_path;
+use crate::tickers::{latest_snapshot, parse_tickers, primary_tickers};
 
 /// When a fact filed on `filed` may be used: midnight New York time at the start of the next day. The
 /// bulk data carries only the filing date, and EDGAR accepts filings until 22:00 ET, so anything earlier
@@ -58,6 +65,24 @@ pub fn to_events(facts: &[Fact], tickers: &HashMap<u32, String>) -> Vec<Event> {
             kind: EventKind::Fundamental(FundamentalRecord { symbol, period_start, period_end, metric, value }),
         })
         .collect()
+}
+
+/// Fundamental events for a backtest or a paper run, read from a `fundamentals sync` directory: only the
+/// given concepts, only companies whose market symbol is in `symbols`, and only events available within
+/// `from..=to`. Companies are matched to symbols with the newest ticker snapshot, with the limits described
+/// on [`to_events`].
+pub fn load_events(root: &Path, concepts: &[&str], symbols: &HashSet<String>, from: Timestamp, to: Timestamp) -> Result<Vec<Event>> {
+    let listings = parse_tickers(&fs::read(latest_snapshot(root)?)?)?;
+    let tickers: HashMap<u32, String> =
+        primary_tickers(&listings).into_iter().filter(|(_, t)| symbols.contains(market_symbol(t).as_str())).collect();
+    let filter = FactFilter {
+        ciks: Some(tickers.keys().copied().collect()),
+        concepts: Some(concepts.iter().map(|c| c.to_string()).collect()),
+        // Filed before the day after `to` (New York): everything that can be available by `to`.
+        as_of: Some(to.with_timezone(&New_York).date_naive() + Days::new(1)),
+    };
+    let facts = read_facts(&facts_path(root), &filter)?;
+    Ok(to_events(&facts, &tickers).into_iter().filter(|e| e.available_at >= from && e.available_at <= to).collect())
 }
 
 #[cfg(test)]
