@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use st_core::Event;
 use st_data::{SyntheticConfig, VecEventSource, generate_daily_bars, load_daily_bars};
 use st_engine::{Backtest, FillModel, SimulatedBroker};
+use st_marketdata::{BarFilter, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
 use st_strategies::SmaCrossover;
 use tracing_subscriber::EnvFilter;
@@ -20,15 +21,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the SMA crossover strategy over historical or synthetic daily bars.
+    /// Run the SMA crossover strategy over Parquet, CSV or synthetic daily bars.
     Backtest(BacktestArgs),
 }
 
 #[derive(Args)]
 struct BacktestArgs {
-    /// CSV of daily bars with header symbol,date,open,high,low,close,volume. Omit to use synthetic data.
-    #[arg(long)]
+    /// CSV of daily bars with header symbol,date,open,high,low,close,volume.
+    #[arg(long, conflicts_with = "parquet")]
     bars: Option<PathBuf>,
+    /// Parquet bars from `marketdata sync`, e.g. data/marketdata/bars_daily_all.parquet. Every matching bar
+    /// is held in memory, so narrow large files with --start/--end/--symbols.
+    #[arg(long)]
+    parquet: Option<PathBuf>,
+    /// First session date to load (Parquet only).
+    #[arg(long, requires = "parquet")]
+    start: Option<NaiveDate>,
+    /// Last session date to load (Parquet only).
+    #[arg(long, requires = "parquet")]
+    end: Option<NaiveDate>,
+    /// Comma-separated symbols to load (Parquet only).
+    #[arg(long, requires = "parquet", value_delimiter = ',')]
+    symbols: Vec<String>,
+    /// Used when neither --bars nor --parquet is given.
     #[arg(long, default_value_t = 50)]
     synthetic_symbols: usize,
     #[arg(long, default_value_t = 750)]
@@ -46,6 +61,10 @@ struct BacktestArgs {
     weight: Decimal,
     #[arg(long, default_value = "5")]
     slippage_bps: Decimal,
+    /// Risk filter: skip entries below this price. On split-adjusted data this sees adjusted, not traded,
+    /// prices; set 0 to disable.
+    #[arg(long, default_value = "5")]
+    min_price: Decimal,
 }
 
 fn main() -> Result<()> {
@@ -56,9 +75,37 @@ fn main() -> Result<()> {
 }
 
 fn backtest(args: BacktestArgs) -> Result<()> {
-    let bars = match &args.bars {
-        Some(path) => load_daily_bars(path)?,
-        None => generate_daily_bars(&SyntheticConfig {
+    let bars = match (&args.bars, &args.parquet) {
+        (Some(path), _) => load_daily_bars(path)?,
+        (None, Some(path)) => {
+            let filter = BarFilter {
+                symbols: (!args.symbols.is_empty())
+                    .then(|| args.symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect()),
+                start: args.start,
+                end: args.end,
+            };
+            if args.min_price > Decimal::ZERO && !path.to_string_lossy().contains("_raw") {
+                eprintln!(
+                    "warning: --min-price {} is applied to adjusted prices, which understate pre-split prices; \
+                     the universe will be biased (use --min-price 0, or the raw file)",
+                    args.min_price
+                );
+            }
+            let raw = read_bars(path, &filter)?;
+            let bars: Vec<_> = raw.iter().filter_map(to_core_bar).collect();
+            if bars.len() < raw.len() {
+                eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
+            }
+            if let Some(wanted) = &filter.symbols {
+                let found: std::collections::HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
+                let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
+                if !missing.is_empty() {
+                    eprintln!("no bars for: {}", missing.join(", "));
+                }
+            }
+            bars
+        }
+        (None, None) => generate_daily_bars(&SyntheticConfig {
             symbols: args.synthetic_symbols,
             days: args.synthetic_days,
             start: NaiveDate::from_ymd_opt(2023, 1, 3).expect("valid date"),
@@ -72,7 +119,7 @@ fn backtest(args: BacktestArgs) -> Result<()> {
         source,
         SmaCrossover::new(args.fast, args.slow, args.weight).map_err(anyhow::Error::msg)?,
         SimulatedBroker::new(FillModel { slippage_bps: args.slippage_bps, ..FillModel::default() }),
-        RiskManager::new(RiskLimits::default()),
+        RiskManager::new(RiskLimits { min_price: args.min_price, ..RiskLimits::default() }),
         args.cash,
     )
     .run()?;

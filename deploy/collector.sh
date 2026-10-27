@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Manage the collector container on a Linux host with Docker. Run from anywhere.
+# Manage stocktrader's data services on a Linux host with Docker. Run from anywhere.
 #
-#   deploy/collector.sh up       build from the current checkout and (re)start
-#   deploy/collector.sh update   git pull --ff-only, then up
-#   deploy/collector.sh status   container state and enabled sources
-#   deploy/collector.sh logs     follow logs
-#   deploy/collector.sh stop     stop (data and .env are kept)
+#   deploy/collector.sh up               build from the current checkout and (re)start the collector
+#   deploy/collector.sh update           git pull --ff-only, then up
+#   deploy/collector.sh status           container state and enabled sources
+#   deploy/collector.sh logs             follow collector logs
+#   deploy/collector.sh stop             stop the collector (data and .env are kept)
+#   deploy/collector.sh sync-marketdata  download the universe and full daily price history now
+#                                        (extra flags go to `marketdata sync`, e.g. --force)
+#   deploy/collector.sh install-timer    run sync-marketdata nightly via a systemd user timer
+#                                        (install-timer DIR only writes the units to DIR, for review)
 set -euo pipefail
+
+SYNC_CONTAINER=stocktrader-marketdata-sync
 
 # Wrapped in main and exited explicitly: `update` rewrites this file mid-run, and bash would otherwise
 # keep reading the new file from its old offset.
@@ -33,13 +39,19 @@ main() {
             docker compose run --rm --no-deps collector sources
             ;;
         logs)
-            docker compose logs -f --tail=100
+            docker compose logs -f --tail=100 collector
             ;;
         stop)
-            docker compose stop
+            docker compose stop collector
+            ;;
+        sync-marketdata)
+            sync_marketdata "${@:2}"
+            ;;
+        install-timer)
+            install_timer "$self" "${2:-}"
             ;;
         *)
-            sed -n '2,8p' "$self"
+            sed -n '2,13p' "$self"
             return 1
             ;;
     esac
@@ -54,6 +66,78 @@ prepare() {
         echo "add API keys to .env, then run: deploy/collector.sh up"
     fi
     chmod 600 .env
+}
+
+# Exit status when another sync is already running; the systemd unit treats it as success.
+ALREADY_RUNNING=75
+
+sync_marketdata() {
+    prepare
+    if [[ -n "$(docker ps -q --filter "name=^${SYNC_CONTAINER}\$")" ]]; then
+        echo "A market data sync is already running; not starting another." >&2
+        return "$ALREADY_RUNNING"
+    fi
+    docker compose build marketdata
+    # Clear only an exited leftover; `docker rm` without -f refuses a running container.
+    docker rm "$SYNC_CONTAINER" >/dev/null 2>&1 || true
+    docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "$@" &
+    local pid=$! status=0
+    # On SIGTERM (e.g. a systemd timeout) stop the container this run started, not just the compose client.
+    trap 'docker stop "$SYNC_CONTAINER" >/dev/null 2>&1 || true' TERM INT
+    wait "$pid" || status=$?
+    if ((status > 128)); then
+        # Interrupted by the trap: let the client exit now that its container is stopping.
+        wait "$pid" || true
+    fi
+    trap - TERM INT
+    return "$status"
+}
+
+install_timer() {
+    local self="${1//%/%%}" units="${2:-$HOME/.config/systemd/user}"
+    mkdir -p "$units"
+    # Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the
+    # start limit stops a persistent failure from retrying all day.
+    cat > "$units/stocktrader-marketdata.service" <<EOF
+[Unit]
+Description=stocktrader: download universe and daily price history
+StartLimitIntervalSec=12h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart="$self" sync-marketdata
+# Another sync already running: nothing to do, and nothing to retry.
+SuccessExitStatus=$ALREADY_RUNNING
+# On timeout the script's SIGTERM trap stops the container it started.
+TimeoutStartSec=3h
+Restart=on-failure
+RestartSec=20min
+EOF
+    # After each US session (Mon-Fri), once Alpaca has the final daily bars.
+    cat > "$units/stocktrader-marketdata.timer" <<EOF
+[Unit]
+Description=stocktrader: nightly market data sync
+
+[Timer]
+OnCalendar=Tue..Sat 03:00 America/New_York
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    if [[ -n "${2:-}" ]]; then
+        echo "Wrote units to $units without installing them."
+        return 0
+    fi
+    systemctl --user daemon-reload
+    systemctl --user enable --now stocktrader-marketdata.timer
+    systemctl --user list-timers stocktrader-marketdata.timer --no-pager
+    if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]]; then
+        echo "Warning: lingering is off, so the timer only runs while $USER is logged in."
+        echo "Enable it with: sudo loginctl enable-linger $USER"
+    fi
 }
 
 main "$@"
