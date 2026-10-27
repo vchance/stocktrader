@@ -47,3 +47,14 @@ services:
     environment:
       STOCKTRADER_MARKETDATA_DIR: /data/marketdata
     mem_limit: 1g
+
+  # One-shot daily job, started by deploy/collector.sh sync-fundamentals (and its systemd timer).
+  fundamentals:
+    <<: *common
+    profiles: [tools]
+    restart: "no"
+    entrypoint: ["fundamentals"]
+    command: ["sync"]
+    environment:
+      STOCKTRADER_FUNDAMENTALS_DIR: /data/fundamentals
+    mem_limit: 1g

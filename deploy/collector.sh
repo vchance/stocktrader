@@ -8,17 +8,21 @@
 #   deploy/collector.sh stop             stop the collector (data and .env are kept)
 #   deploy/collector.sh sync-marketdata  download the universe and full daily price history now
 #                                        (extra flags go to `marketdata sync`, e.g. --force)
+#   deploy/collector.sh sync-fundamentals  rebuild SEC company fundamentals if the SEC published new data
+#                                        (needs SEC_USER_AGENT in .env; extra flags go to `fundamentals sync`)
 #   deploy/collector.sh health           check every source is producing; alert on changes
 #   deploy/collector.sh housekeeping     compress old archive files, then back up
 #   deploy/collector.sh backup           copy data/ to BACKUP_DEST (set in .env)
 #   deploy/collector.sh install-ops      hourly health check + nightly housekeeping (systemd user timers)
 #   deploy/collector.sh install-timer    nightly sync-marketdata (systemd user timer)
-#                                        (install-ops/install-timer DIR only write the units to DIR)
+#   deploy/collector.sh install-fundamentals-timer  daily sync-fundamentals (systemd user timer)
+#                                        (the install-* commands given a DIR only write the units there)
 set -euo pipefail
 
 # Every `docker compose run` reads from /dev/null: run attaches stdin by default and would otherwise swallow
 # input meant for whatever invoked this script.
-SYNC_CONTAINER=stocktrader-marketdata-sync
+# Name of the container a running sync uses; set by run_sync, read by its SIGTERM trap.
+SYNC_CONTAINER=""
 # Exit status when another sync is already running; the systemd unit treats it as success.
 ALREADY_RUNNING=75
 # Re-send an unchanged alert after this long, so a lingering problem isn't forgotten.
@@ -62,7 +66,10 @@ main() {
             docker compose stop collector
             ;;
         sync-marketdata)
-            sync_marketdata "${@:2}"
+            run_sync marketdata "${@:2}"
+            ;;
+        sync-fundamentals)
+            run_sync fundamentals "${@:2}"
             ;;
         health)
             health
@@ -80,8 +87,11 @@ main() {
         install-timer)
             install_timer "$self" "${2:-}"
             ;;
+        install-fundamentals-timer)
+            install_fundamentals_timer "$self" "${2:-}"
+            ;;
         *)
-            sed -n '2,16p' "$self"
+            sed -n '2,20p' "$self"
             return 1
             ;;
     esac
@@ -136,16 +146,22 @@ heartbeat() {
     curl -fsS -m 20 -K <(curl_url_config "$url") -o /dev/null || echo "Heartbeat ping failed" >&2
 }
 
-sync_marketdata() {
+# Runs `<service> sync ARGS...` (marketdata or fundamentals) as a one-shot container named
+# stocktrader-<service>-sync. The fixed name means a sync that is still running (say, orphaned by a timeout)
+# makes this one exit with ALREADY_RUNNING rather than overlap.
+run_sync() {
+    local service="$1"
+    shift
     prepare
+    SYNC_CONTAINER="stocktrader-$service-sync"
     if [[ -n "$(docker ps -q --filter "name=^${SYNC_CONTAINER}\$")" ]]; then
-        echo "A market data sync is already running; not starting another." >&2
+        echo "A $service sync is already running; not starting another." >&2
         return "$ALREADY_RUNNING"
     fi
-    docker compose build marketdata
+    docker compose build "$service"
     # Clear only an exited leftover; `docker rm` without -f refuses a running container.
     docker rm "$SYNC_CONTAINER" >/dev/null 2>&1 || true
-    docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "$@" </dev/null &
+    docker compose run --rm -T --name "$SYNC_CONTAINER" "$service" sync "$@" </dev/null &
     local pid=$! status=0
     # On SIGTERM (e.g. a systemd timeout) stop the container this run started, not just the compose client.
     trap 'docker stop "$SYNC_CONTAINER" >/dev/null 2>&1 || true' TERM INT
@@ -231,8 +247,8 @@ housekeeping() {
 }
 
 # Copies data/ to BACKUP_DEST (any rsync destination: local path, mounted drive, or user@host:path).
-# Market data Parquet files are skipped (they are re-downloadable); everything else, including the raw
-# archive, asset snapshots and cursors, is copied.
+# Market data and fundamentals Parquet files and the SEC zip are skipped (they are re-downloadable);
+# everything else, including the raw archive, asset and ticker snapshots, and cursors, is copied.
 #
 # Deletion is tightly limited: only *.jsonl files can be deleted from the backup (`P! *.jsonl` protects
 # everything else), so the uncompressed copy of a day goes once its .jsonl.gz has replaced it, but a
@@ -263,6 +279,7 @@ backup() {
     fi
     rsync -a --delete-after --max-delete="$max_delete" --filter='P! *.jsonl' \
         --exclude='*.tmp' --exclude='.sync.lock' --exclude='marketdata/*.parquet' \
+        --exclude='fundamentals/*.parquet' --exclude='fundamentals/*.zip' \
         -e 'ssh -o BatchMode=yes' \
         data/ "${dest%/}/" || rc=$?
     # 24: some source files vanished during the transfer (normal for a live archive).
@@ -340,21 +357,22 @@ install_ops() {
     enable_timers stocktrader-health.timer stocktrader-housekeeping.timer
 }
 
-install_timer() {
-    local self units="${2:-$HOME/.config/systemd/user}"
+# Writes the service and timer for a sync job. Args: script units-dir name description subcommand calendar.
+# Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the start
+# limit stops a persistent failure from retrying all day.
+write_sync_units() {
+    local self units="$2" name="$3" description="$4" subcommand="$5" calendar="$6"
     self="$(unit_path "$1")"
     mkdir -p "$units"
-    # Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the
-    # start limit stops a persistent failure from retrying all day.
-    cat >"$units/stocktrader-marketdata.service" <<EOF
+    cat >"$units/$name.service" <<EOF
 [Unit]
-Description=stocktrader: download universe and daily price history
+Description=stocktrader: $description
 StartLimitIntervalSec=12h
 StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart="$self" sync-marketdata
+ExecStart="$self" $subcommand
 # Another sync already running: nothing to do, and nothing to retry.
 SuccessExitStatus=$ALREADY_RUNNING
 # On timeout the script's SIGTERM trap stops the container it started.
@@ -362,24 +380,42 @@ TimeoutStartSec=3h
 Restart=on-failure
 RestartSec=20min
 EOF
-    # After each US session (Mon-Fri), once Alpaca has the final daily bars.
-    cat >"$units/stocktrader-marketdata.timer" <<EOF
+    cat >"$units/$name.timer" <<EOF
 [Unit]
-Description=stocktrader: nightly market data sync
+Description=stocktrader: $description
 
 [Timer]
-OnCalendar=Tue..Sat 03:00 America/New_York
+OnCalendar=$calendar
 RandomizedDelaySec=15m
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+}
+
+install_timer() {
+    local units="${2:-$HOME/.config/systemd/user}"
+    # After each US session (Mon-Fri), once Alpaca has the final daily bars.
+    write_sync_units "$1" "$units" stocktrader-marketdata "download universe and daily price history" \
+        sync-marketdata "Tue..Sat 03:00 America/New_York"
     if [[ -n "${2:-}" ]]; then
         echo "Wrote units to $units without installing them."
         return 0
     fi
     enable_timers stocktrader-marketdata.timer
+}
+
+install_fundamentals_timer() {
+    local units="${2:-$HOME/.config/systemd/user}"
+    # The SEC regenerates its bulk files overnight; an unchanged file costs one conditional request.
+    write_sync_units "$1" "$units" stocktrader-fundamentals "SEC company fundamentals" \
+        sync-fundamentals "*-*-* 06:00 America/New_York"
+    if [[ -n "${2:-}" ]]; then
+        echo "Wrote units to $units without installing them."
+        return 0
+    fi
+    enable_timers stocktrader-fundamentals.timer
 }
 
 main "$@"

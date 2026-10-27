@@ -40,6 +40,25 @@ Known limits:
   which understates pre-split prices and biases the universe; it warns, and `--min-price 0` disables it.
 - Backtests load all selected bars into memory; narrow with `--start/--end/--symbols`.
 
+## Fundamentals
+
+`fundamentals sync` (needs `SEC_USER_AGENT="Your Name you@example.com"`; the SEC blocks anonymous
+clients) writes to `data/fundamentals/`:
+
+| File | Contents |
+|---|---|
+| `facts.parquet` | ~30 core XBRL concepts (revenue, earnings, EPS, assets, debt, cash flow, shares) from every 10-K/10-Q/20-F/40-F, one row per reported value **per filing**, with its `filed` date |
+| `tickers/<date>.json` | The SEC's CIK→ticker map, kept daily (it only reflects current tickers) |
+| `manifest.json` | What the committed file contains |
+
+Restatements and the prior-period comparatives that every filing repeats are all kept, each with the
+date it became public, so `fundamentals show AAPL --as-of 2024-12-31` shows exactly what was known that
+day. In backtests a fact becomes available at midnight New York time after its filing date (the bulk
+data has no time of day, and EDGAR accepts filings until 22:00). The SEC's ~1 GB bulk file is fetched
+with `If-Modified-Since`, so an unchanged night costs one request; results are staged and only replace
+the previous file if non-empty, fresh, and not much smaller. Known limits: tickers are today's mapping,
+so renamed or delisted companies may lack one; concept coverage varies by filer.
+
 ## Data collector
 
 `collector` archives news and social data that **cannot be backfilled later**, verbatim, to
@@ -73,6 +92,8 @@ deploy/collector.sh logs      # follow logs
 deploy/collector.sh update    # git pull + rebuild + restart after a merge
 deploy/collector.sh sync-marketdata   # download universe + price history now (needs Alpaca keys)
 deploy/collector.sh install-timer     # run that nightly (Tue-Sat 03:00 New York) via a systemd user timer
+deploy/collector.sh sync-fundamentals # SEC fundamentals now (needs SEC_USER_AGENT)
+deploy/collector.sh install-fundamentals-timer  # run that daily at 06:00 New York
 ```
 
 Both services use one image (`vchance-stocktrader`). A sync rebuilds it from the current checkout, and
@@ -177,7 +198,8 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 1. ~~Alpaca daily bars, universe snapshots, Parquet store~~ (`marketdata`). Next: use raw prices for the
    risk price filter, and stream bars from Parquet instead of loading them all.
 2. ~~Start archiving news and social feeds~~ (`collector`, running on `jabrony`). Next: compress old files.
-3. EDGAR fundamentals ingestion with point-in-time filing dates.
+3. ~~EDGAR fundamentals with point-in-time filing dates~~ (`fundamentals`). Next: historical ticker
+   mapping, and feeding facts into strategies.
 4. Text pipeline: ticker extraction, dedupe, sentiment scoring (FinBERT via ONNX, or an LLM), mention velocity.
 5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`. Before that: extract a mode-agnostic
    engine step from `Backtest` so paper/live don't duplicate the loop; decouple fills from market events
