@@ -14,6 +14,6 @@ pub mod universe;
 pub use alpaca::{Adjustment, AlpacaClient, Asset};
 pub use replay::{BarEventSource, ReplayStats};
 pub use store::{
-    BarFilter, BarReader, BarWriter, DailyBar, StagedFile, Stats, Summary, date_range, read_bars, summarize, to_core_bar,
+    BarFilter, BarReader, BarWriter, Coverage, DailyBar, StagedFile, Stats, Summary, coverage, date_range, read_bars, summarize, to_core_bar,
 };
 pub use sync::{SyncConfig, SyncReport, bars_path, sync};

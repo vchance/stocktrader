@@ -14,7 +14,7 @@ use st_data::{
 };
 use st_engine::metrics::{self, buy_and_hold, correlation};
 use st_engine::{Backtest, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
-use st_marketdata::{BarEventSource, BarFilter, ReplayStats, date_range, read_bars, to_core_bar};
+use st_marketdata::{BarEventSource, BarFilter, ReplayStats, coverage, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, SmaCrossover};
 use tracing_subscriber::EnvFilter;
@@ -404,8 +404,7 @@ fn prepare(data: &DataArgs) -> Result<Prepared> {
     let (bars, benchmark, report, span, tickers): (Box<dyn EventSource>, _, _, _, _) = match (&data.bars, &data.parquet) {
         (None, Some(path)) => {
             let p = open_parquet(data, path, benchmark_symbol.as_deref())?;
-            let tickers = p.report.wanted.clone();
-            (Box::new(p.source), p.benchmark, p.report, p.span, tickers)
+            (Box::new(p.source), p.benchmark, p.report, p.span, Some(p.symbols))
         }
         (bars_path, _) => {
             let bars = match bars_path {
@@ -472,8 +471,10 @@ struct ParquetReplay {
     report: ReplayReport,
     /// Read separately, so `--symbols` needn't include it.
     benchmark: Option<Vec<Bar>>,
-    /// From the first session's open to the last session's close.
+    /// From the first session's open to the last session's close, among the selected bars.
     span: Option<(Timestamp, Timestamp)>,
+    /// Symbols with at least one selected bar.
+    symbols: HashSet<String>,
 }
 
 fn open_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result<ParquetReplay> {
@@ -494,11 +495,10 @@ fn open_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result
         );
     }
     let (source, stats) = BarEventSource::open(path, raw_path.as_deref(), &filter)?;
-    let span = date_range(path)?.map(|(first, last)| {
-        let first = data.start.map_or(first, |s| s.max(first));
-        let last = data.end.map_or(last, |e| e.min(last));
-        (session_open(first), session_close(last))
-    });
+    // What the replay will cover, found with a cheap two-column pass, so attention can be limited to the
+    // same symbols and sessions before the stream runs.
+    let covered = coverage(path, &filter)?;
+    let span = covered.first.zip(covered.last).map(|(first, last)| (session_open(first), session_close(last)));
     let bench = match benchmark {
         Some(symbol) => {
             let filter = BarFilter { symbols: Some(HashSet::from([symbol.to_string()])), ..filter };
@@ -507,7 +507,7 @@ fn open_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result
         None => None,
     };
     let report = ReplayReport { stats, wanted: symbols, traded_prices: raw_path.is_some() };
-    Ok(ParquetReplay { source, report, benchmark: bench, span })
+    Ok(ParquetReplay { source, report, benchmark: bench, span, symbols: covered.symbols })
 }
 
 /// After a replay: fails on a read error that cut it short, and reports skipped bars, symbols that were

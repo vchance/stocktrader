@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, Date32Array, Float64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use chrono::{Datelike, Days, NaiveDate};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, ProjectionMask};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::basic::Compression;
 use parquet::file::metadata::{KeyValue, ParquetMetaData};
@@ -106,6 +106,7 @@ pub struct BarWriter {
     spill_dir: PathBuf,
     buffered: BTreeMap<i32, Vec<DailyBar>>,
     buffered_rows: usize,
+    spill_rows: usize,
     /// Spill files written so far, per quarter.
     spilled: BTreeMap<i32, usize>,
     tmp: PathBuf,
@@ -141,6 +142,7 @@ impl BarWriter {
             spill_dir,
             buffered: BTreeMap::new(),
             buffered_rows: 0,
+            spill_rows: SPILL_ROWS,
             spilled: BTreeMap::new(),
             tmp: path.with_extension("parquet.tmp"),
             path: path.to_path_buf(),
@@ -160,7 +162,7 @@ impl BarWriter {
         }
         self.rows += bars.len();
         self.buffered_rows += bars.len();
-        if self.buffered_rows >= SPILL_ROWS {
+        if self.buffered_rows >= self.spill_rows {
             self.spill()?;
         }
         Ok(())
@@ -173,7 +175,7 @@ impl BarWriter {
     fn spill(&mut self) -> Result<()> {
         for (q, rows) in std::mem::take(&mut self.buffered) {
             let n = *self.spilled.get(&q).unwrap_or(&0);
-            let mut w = writer(&self.spill_path(q, n), SPILL_ROWS, None)?;
+            let mut w = writer(&self.spill_path(q, n), self.spill_rows.max(1), None)?;
             w.write(&to_batch(&rows)?)?;
             w.close()?;
             self.spilled.insert(q, n + 1);
@@ -281,6 +283,54 @@ fn row_group_dates(meta: &ParquetMetaData) -> Result<Vec<Option<(NaiveDate, Naiv
         .collect()
 }
 
+/// Row groups that may hold rows within the filter's dates.
+fn row_groups_for(meta: &ParquetMetaData, filter: &BarFilter) -> Result<Vec<usize>> {
+    Ok(row_group_dates(meta)?
+        .into_iter()
+        .enumerate()
+        .filter(|(_, range)| {
+            range.is_none_or(|(lo, hi)| filter.start.is_none_or(|s| hi >= s) && filter.end.is_none_or(|e| lo <= e))
+        })
+        .map(|(i, _)| i)
+        .collect())
+}
+
+/// The symbols and dates present among rows matching a filter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Coverage {
+    pub symbols: HashSet<String>,
+    pub first: Option<NaiveDate>,
+    pub last: Option<NaiveDate>,
+}
+
+/// [`Coverage`] of the rows matching `filter`, reading only the symbol and date columns, so it is cheap
+/// next to a full read.
+pub fn coverage(path: &Path, filter: &BarFilter) -> Result<Coverage> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).with_context(|| format!("reading {}", path.display()))?;
+    let groups = row_groups_for(builder.metadata(), filter)?;
+    let mask = ProjectionMask::columns(builder.parquet_schema(), ["symbol", "date"]);
+    let reader = builder.with_row_groups(groups).with_projection(mask).build()?;
+    let mut out = Coverage::default();
+    for batch in reader {
+        let batch = batch?;
+        let symbol = column::<StringArray>(&batch, "symbol")?;
+        let date = column::<Date32Array>(&batch, "date")?;
+        for i in 0..batch.num_rows() {
+            let day = from_days(date.value(i))?;
+            if !filter.keeps(symbol.value(i), day) {
+                continue;
+            }
+            if !out.symbols.contains(symbol.value(i)) {
+                out.symbols.insert(symbol.value(i).to_string());
+            }
+            out.first = Some(out.first.map_or(day, |f| f.min(day)));
+            out.last = Some(out.last.map_or(day, |l| l.max(day)));
+        }
+    }
+    Ok(out)
+}
+
 /// Bars matching a filter, read lazily one record batch at a time in file order. Row groups whose dates
 /// fall outside the filter are never read.
 pub struct BarReader {
@@ -299,14 +349,7 @@ impl BarReader {
             .file_metadata()
             .key_value_metadata()
             .is_some_and(|kv| kv.iter().any(|e| e.key == LAYOUT_KEY && e.value.as_deref() == Some(DATE_MAJOR)));
-        let groups: Vec<usize> = row_group_dates(&meta)?
-            .into_iter()
-            .enumerate()
-            .filter(|(_, range)| {
-                range.is_none_or(|(lo, hi)| filter.start.is_none_or(|s| hi >= s) && filter.end.is_none_or(|e| lo <= e))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let groups = row_groups_for(&meta, filter)?;
         let batches = builder.with_row_groups(groups).build()?;
         Ok(Self { batches, filter: filter.clone(), pending: Vec::new().into_iter(), date_major })
     }
@@ -491,12 +534,19 @@ mod tests {
         let start = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
         let days: Vec<NaiveDate> = (0..1500).map(|i| start + Days::new(i)).collect();
         let mut writer = BarWriter::create(&path).unwrap();
-        // Symbol-major input, as the vendor delivers it: each symbol's full history in turn.
+        // Spill every few hundred rows, so most quarters are spread over several spill files.
+        writer.spill_rows = 700;
+        // Symbol-major input, as the vendor delivers it: each symbol's full history in turn, in pages.
         for symbol in ["ZZZ", "AAA", "MMM"] {
             let rows: Vec<DailyBar> = days.iter().map(|d| DailyBar { date: *d, ..bar(symbol, 1, 10.0) }).collect();
-            writer.write(&rows).unwrap();
+            for page in rows.chunks(250) {
+                writer.write(page).unwrap();
+            }
         }
-        writer.finish().unwrap().commit().unwrap();
+        assert!(writer.spilled.values().any(|n| *n > 1), "the test must exercise spilling");
+        let staged = writer.finish().unwrap();
+        assert_eq!((staged.stats.rows, staged.stats.symbols), (4500, 3));
+        staged.commit().unwrap();
 
         let all = read_bars(&path, &BarFilter::default()).unwrap();
         assert_eq!(all.len(), 4500);
@@ -507,6 +557,10 @@ mod tests {
         let got: Vec<(NaiveDate, String)> = read_bars(&path, &filter).unwrap().into_iter().map(|b| (b.date, b.symbol)).collect();
         assert_eq!(got.len(), 6);
         assert_eq!(got[0], (days[1400], "AAA".to_string()));
+
+        let mmm = BarFilter { symbols: Some(HashSet::from(["MMM".to_string()])), start: Some(days[10]), end: None };
+        let c = coverage(&path, &mmm).unwrap();
+        assert_eq!((c.symbols, c.first, c.last), (HashSet::from(["MMM".to_string()]), Some(days[10]), Some(days[1499])));
     }
 
     #[test]
