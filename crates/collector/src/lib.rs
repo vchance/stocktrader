@@ -8,6 +8,7 @@
 pub mod archive;
 pub mod config;
 pub mod http;
+pub mod maintenance;
 pub mod runner;
 pub mod source;
 pub mod sources;

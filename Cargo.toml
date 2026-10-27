@@ -24,6 +24,7 @@ chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
 dotenvy = "0.15"
+flate2 = "1"
 reqwest = { version = "0.13", features = ["json", "form", "query"] }
 serde_json = "1"
 tempfile = "3"
