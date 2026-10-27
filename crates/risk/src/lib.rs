@@ -48,12 +48,20 @@ pub struct RiskManager {
     kill_reason: Option<String>,
     session_start_equity: Option<Decimal>,
     dollar_volume: HashMap<Symbol, VecDeque<Decimal>>,
+    /// Latest as-traded close per symbol, for price-level filters.
+    traded_close: HashMap<Symbol, Decimal>,
 }
 
 impl RiskManager {
     pub fn new(mut limits: RiskLimits) -> Self {
         limits.liquidity_lookback = limits.liquidity_lookback.max(1);
-        Self { limits, kill_reason: None, session_start_equity: None, dollar_volume: HashMap::new() }
+        Self {
+            limits,
+            kill_reason: None,
+            session_start_equity: None,
+            dollar_volume: HashMap::new(),
+            traded_close: HashMap::new(),
+        }
     }
 
     pub fn limits(&self) -> &RiskLimits {
@@ -81,6 +89,8 @@ impl RiskManager {
 
     pub fn on_market_event(&mut self, event: &Event) {
         if let EventKind::Bar(bar) = &event.kind {
+            self.traded_close.insert(bar.symbol.clone(), bar.traded_close());
+            // Adjusted close times adjusted volume equals traded dollar volume (splits scale both).
             let window = self.dollar_volume.entry(bar.symbol.clone()).or_default();
             window.push_back(bar.close * bar.volume);
             if window.len() > self.limits.liquidity_lookback {
@@ -134,12 +144,14 @@ impl RiskManager {
         {
             return reject(signal, "daily loss limit reached".into());
         }
-        match portfolio.last_price(&signal.symbol) {
-            None => return reject(signal, "no price available".into()),
-            Some(p) if p < self.limits.min_price => {
-                return reject(signal, format!("price {p} below minimum {}", self.limits.min_price));
-            }
-            Some(_) => {}
+        if portfolio.last_price(&signal.symbol).is_none() {
+            return reject(signal, "no price available".into());
+        }
+        // The level filter uses the price the stock actually traded at, not split-adjusted history.
+        if let Some(p) = self.traded_close.get(&signal.symbol).copied()
+            && p < self.limits.min_price
+        {
+            return reject(signal, format!("traded price {p} below minimum {}", self.limits.min_price));
         }
         match self.avg_dollar_volume(&signal.symbol) {
             None => return reject(signal, "insufficient liquidity history".into()),
@@ -185,6 +197,7 @@ mod tests {
             low: close,
             close,
             volume,
+            traded_close: None,
         })
     }
 
@@ -228,6 +241,27 @@ mod tests {
     fn clamps_to_max_position_weight() {
         let (mut risk, portfolio) = warmed_up(&["ABC"], dec!(50), dec!(1_000_000));
         assert_eq!(approved_weight(risk.check(signal("ABC", dec!(0.5)), &portfolio, &[])), dec!(0.10));
+    }
+
+    #[test]
+    fn price_filter_uses_traded_not_adjusted_price() {
+        let with_traded = |adjusted: Decimal, traded: Decimal| {
+            let mut risk = RiskManager::new(RiskLimits::default());
+            let mut portfolio = Portfolio::new(dec!(100_000));
+            for i in 0..20 {
+                let mut event = bar("ABC", adjusted, dec!(10_000_000), i);
+                if let EventKind::Bar(b) = &mut event.kind {
+                    b.traded_close = Some(traded);
+                }
+                risk.on_market_event(&event);
+            }
+            portfolio.mark(&Symbol::new("ABC"), adjusted);
+            risk.check(signal("ABC", dec!(0.05)), &portfolio, &[])
+        };
+        // Traded at $30 before a later 10:1 split: adjusted history shows $3, but it was no penny stock.
+        assert!(matches!(with_traded(dec!(3), dec!(30)), RiskDecision::Approve(_)));
+        // Traded at $3 before a later 1:10 reverse split: adjusted history shows $30.
+        assert!(matches!(with_traded(dec!(30), dec!(3)), RiskDecision::Reject { .. }));
     }
 
     #[test]

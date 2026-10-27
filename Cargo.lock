@@ -2011,6 +2011,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "chrono-tz",
  "clap",
  "rust_decimal",
  "st-core",
@@ -2020,6 +2021,7 @@ dependencies = [
  "st-risk",
  "st-signals",
  "st-strategies",
+ "tempfile",
  "tracing-subscriber",
 ]
 

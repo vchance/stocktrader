@@ -15,6 +15,17 @@ pub struct Bar {
     pub low: Price,
     pub close: Price,
     pub volume: Qty,
+    /// The close as actually traded, when prices above are split/dividend-adjusted. Adjusted history
+    /// understates pre-split prices, so filters on price level (e.g. "above $5") must use this instead.
+    #[serde(default)]
+    pub traded_close: Option<Price>,
+}
+
+impl Bar {
+    /// The close as traded: `traded_close` if known, otherwise `close`.
+    pub fn traded_close(&self) -> Price {
+        self.traded_close.unwrap_or(self.close)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

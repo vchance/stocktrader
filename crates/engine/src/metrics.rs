@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use st_core::{Fill, Timestamp};
+use st_core::{Bar, Fill, Timestamp};
 
 use crate::exchange_date;
 
@@ -18,9 +21,8 @@ pub struct Metrics {
     pub commissions: Decimal,
 }
 
-/// The curve is first resampled to one point (the last) per exchange date, so intraday bars and
-/// non-bar events don't distort the daily statistics.
-pub fn compute(curve: &[(Timestamp, Decimal)], fills: &[Fill]) -> Metrics {
+/// One point (the last) per exchange date.
+fn resample_daily(curve: &[(Timestamp, Decimal)]) -> Vec<(Timestamp, Decimal)> {
     let mut daily: Vec<(Timestamp, Decimal)> = Vec::new();
     for &(t, equity) in curve {
         match daily.last_mut() {
@@ -28,6 +30,52 @@ pub fn compute(curve: &[(Timestamp, Decimal)], fills: &[Fill]) -> Metrics {
             _ => daily.push((t, equity)),
         }
     }
+    daily
+}
+
+/// Daily returns keyed by exchange date.
+pub fn daily_returns(curve: &[(Timestamp, Decimal)]) -> BTreeMap<NaiveDate, f64> {
+    let daily = resample_daily(curve);
+    daily
+        .windows(2)
+        .filter_map(|w| {
+            let (prev, cur) = (w[0].1.to_f64()?, w[1].1.to_f64()?);
+            (prev > 0.0).then(|| (exchange_date(w[1].0), cur / prev - 1.0))
+        })
+        .collect()
+}
+
+/// Buy-and-hold equity for one symbol's bars (any order): `start_equity` invested at the first close,
+/// valued at each later close. Uses the bars' (adjusted) closes, so dividends count as return.
+pub fn buy_and_hold(bars: &[&Bar], start_equity: Decimal) -> Vec<(Timestamp, Decimal)> {
+    let mut bars: Vec<&&Bar> = bars.iter().collect();
+    bars.sort_by_key(|b| b.end);
+    let Some(first) = bars.first().map(|b| b.close).filter(|c| *c > Decimal::ZERO) else {
+        return Vec::new();
+    };
+    bars.iter().map(|b| (b.end, start_equity * b.close / first)).collect()
+}
+
+/// Pearson correlation of daily returns on the dates both curves have. `None` with fewer than 3 shared
+/// days or a flat series.
+pub fn correlation(a: &[(Timestamp, Decimal)], b: &[(Timestamp, Decimal)]) -> Option<f64> {
+    let (ra, rb) = (daily_returns(a), daily_returns(b));
+    let pairs: Vec<(f64, f64)> = ra.iter().filter_map(|(d, x)| rb.get(d).map(|y| (*x, *y))).collect();
+    if pairs.len() < 3 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let (mx, my) = (pairs.iter().map(|p| p.0).sum::<f64>() / n, pairs.iter().map(|p| p.1).sum::<f64>() / n);
+    let cov: f64 = pairs.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let (vx, vy): (f64, f64) =
+        (pairs.iter().map(|(x, _)| (x - mx).powi(2)).sum(), pairs.iter().map(|(_, y)| (y - my).powi(2)).sum());
+    (vx > 0.0 && vy > 0.0).then(|| cov / (vx * vy).sqrt())
+}
+
+/// The curve is first resampled to one point (the last) per exchange date, so intraday bars and
+/// non-bar events don't distort the daily statistics.
+pub fn compute(curve: &[(Timestamp, Decimal)], fills: &[Fill]) -> Metrics {
+    let daily = resample_daily(curve);
     let (Some(&(t0, first)), Some(&(t1, last))) = (daily.first(), daily.last()) else {
         return Metrics::default();
     };

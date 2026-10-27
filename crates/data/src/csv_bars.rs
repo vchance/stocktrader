@@ -50,6 +50,7 @@ pub fn daily_bar(
         low,
         close,
         volume,
+        traded_close: None,
     }
 }
 
