@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::Signed;
 
-use crate::order::Fill;
+use crate::order::{Fill, OrderId, OrderRequest};
 use crate::types::{Price, Qty, Symbol};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -38,6 +38,7 @@ impl Portfolio {
         self.cash
     }
 
+    /// Gross of commissions, which are tracked separately in [`Portfolio::commissions`].
     pub fn realized_pnl(&self) -> Decimal {
         self.realized_pnl
     }
@@ -64,9 +65,36 @@ impl Portfolio {
 
     /// Signed market value of the position (negative for shorts).
     pub fn market_value(&self, symbol: &Symbol) -> Decimal {
-        self.positions.get(symbol).map_or(Decimal::ZERO, |p| {
-            p.qty * self.last_price(symbol).unwrap_or(p.avg_cost)
-        })
+        self.qty(symbol) * self.price_or_cost(symbol)
+    }
+
+    fn price_or_cost(&self, symbol: &Symbol) -> Price {
+        self.last_price(symbol)
+            .or_else(|| self.positions.get(symbol).map(|p| p.avg_cost))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// Position quantity once every order in `open_orders` has filled.
+    pub fn projected_qty(&self, symbol: &Symbol, open_orders: &[(OrderId, OrderRequest)]) -> Qty {
+        let pending: Decimal = open_orders
+            .iter()
+            .filter(|(_, o)| &o.symbol == symbol)
+            .map(|(_, o)| o.side.sign() * o.qty)
+            .sum();
+        self.qty(symbol) + pending
+    }
+
+    /// Signed value of [`Portfolio::projected_qty`] at the last price.
+    pub fn projected_value(&self, symbol: &Symbol, open_orders: &[(OrderId, OrderRequest)]) -> Decimal {
+        self.projected_qty(symbol, open_orders) * self.price_or_cost(symbol)
+    }
+
+    /// Gross exposure once every order in `open_orders` has filled. Risk checks use this so that
+    /// several signals in the same bar cannot each see the same, not-yet-filled portfolio.
+    pub fn projected_gross_exposure(&self, open_orders: &[(OrderId, OrderRequest)]) -> Decimal {
+        let symbols: BTreeSet<&Symbol> =
+            self.positions.keys().chain(open_orders.iter().map(|(_, o)| &o.symbol)).collect();
+        symbols.into_iter().map(|s| self.projected_value(s, open_orders).abs()).sum()
     }
 
     pub fn gross_exposure(&self) -> Decimal {
@@ -86,7 +114,11 @@ impl Portfolio {
         self.market_value(symbol) / equity
     }
 
+    /// Fills with a non-positive quantity are ignored.
     pub fn apply_fill(&mut self, fill: &Fill) {
+        if fill.qty <= Decimal::ZERO {
+            return;
+        }
         let signed = fill.side.sign() * fill.qty;
         self.cash -= signed * fill.price + fill.commission;
         self.commissions += fill.commission;

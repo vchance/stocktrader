@@ -1,12 +1,21 @@
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use st_core::{
-    Clock, EventKind, EventSource, ExecutionAdapter, Fill, OrderRequest, OrderType, Portfolio, Side, Signal,
-    Strategy, StrategyContext, Timestamp,
+    Clock, Event, EventKind, EventSource, ExecutionAdapter, Fill, OrderRequest, OrderType, Portfolio, Side,
+    Signal, Strategy, StrategyContext, Timestamp,
 };
 use st_risk::{RiskDecision, RiskManager};
 
 use crate::clock::SimClock;
+use crate::exchange_date;
 use crate::metrics::{self, Metrics};
+
+/// Skip a resize smaller than this fraction of equity, so equity drift doesn't churn small trades.
+/// Exits to flat always go through.
+const REBALANCE_BAND: Decimal = dec!(0.01);
+/// Headroom kept when sizing buys from cash, since a market order fills at the next open, not the last close.
+const CASH_BUFFER: Decimal = dec!(0.02);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BacktestError {
@@ -23,7 +32,7 @@ pub struct Rejection {
 
 #[derive(Debug)]
 pub struct BacktestReport {
-    /// Equity at the end of each distinct event timestamp.
+    /// Equity after each distinct event timestamp.
     pub equity_curve: Vec<(Timestamp, Decimal)>,
     pub fills: Vec<Fill>,
     pub rejections: Vec<Rejection>,
@@ -31,8 +40,9 @@ pub struct BacktestReport {
     pub metrics: Metrics,
 }
 
-/// Event-driven backtest. For each event, in order: fills from the broker, mark-to-market, risk
-/// bookkeeping, strategy signals, risk checks, then order placement.
+/// Event-driven backtest. Events sharing a timestamp are processed as one batch: first every fill and
+/// mark-to-market, then every strategy callback, then risk checks and order placement. That keeps
+/// equity and weights identical for every symbol in the batch, whatever order the events arrived in.
 pub struct Backtest<E, S, B> {
     source: E,
     strategy: S,
@@ -51,34 +61,46 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
         let mut equity_curve = Vec::new();
         let mut fills = Vec::new();
         let mut rejections = Vec::new();
-        let mut last: Option<Timestamp> = None;
+        let mut session: Option<NaiveDate> = None;
+        let mut next = self.source.next_event();
 
-        while let Some(event) = self.source.next_event() {
-            if let Some(prev) = last {
-                if event.available_at < prev {
-                    return Err(BacktestError::OutOfOrder { prev, next: event.available_at });
-                }
-                if event.available_at > prev {
-                    equity_curve.push((prev, self.portfolio.equity()));
+        while let Some(first) = next.take() {
+            let now = first.available_at;
+            let mut batch = vec![first];
+            loop {
+                next = self.source.next_event();
+                match &next {
+                    Some(e) if e.available_at == now => batch.extend(next.take()),
+                    Some(e) if e.available_at < now => {
+                        return Err(BacktestError::OutOfOrder { prev: now, next: e.available_at });
+                    }
+                    _ => break,
                 }
             }
-            last = Some(event.available_at);
-            self.clock.set(event.available_at);
+            self.clock.set(now);
             let now = self.clock.now();
 
-            for fill in self.broker.on_market_event(&event) {
-                self.portfolio.apply_fill(&fill);
-                fills.push(fill);
+            let day = exchange_date(now);
+            if session != Some(day) {
+                session = Some(day);
+                self.risk.start_session(self.portfolio.equity());
             }
-            if let EventKind::Bar(bar) = &event.kind {
-                self.portfolio.mark(&bar.symbol, bar.close);
-            }
-            self.risk.on_market_event(&event);
 
-            let ctx = StrategyContext { now, portfolio: &self.portfolio };
-            let signals = self.strategy.on_event(&event, &ctx);
+            for event in &batch {
+                for fill in self.broker.on_market_event(event) {
+                    self.portfolio.apply_fill(&fill);
+                    fills.push(fill);
+                }
+                if let EventKind::Bar(bar) = &event.kind {
+                    self.portfolio.mark(&bar.symbol, bar.close);
+                }
+                self.risk.on_market_event(event);
+            }
+
+            let signals = self.collect_signals(&batch, now);
             for signal in signals {
-                match self.risk.check(signal, &self.portfolio, now) {
+                let open = self.broker.open_orders();
+                match self.risk.check(signal, &self.portfolio, &open) {
                     RiskDecision::Approve(signal) => self.place(signal, now),
                     RiskDecision::Reject { signal, reason } => {
                         tracing::debug!(%signal.symbol, %reason, "signal rejected");
@@ -86,29 +108,51 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
                     }
                 }
             }
-        }
-        if let Some(prev) = last {
-            equity_curve.push((prev, self.portfolio.equity()));
+            equity_curve.push((now, self.portfolio.equity()));
         }
 
         let metrics = metrics::compute(&equity_curve, &fills);
         Ok(BacktestReport { equity_curve, fills, rejections, final_portfolio: self.portfolio, metrics })
     }
 
-    /// Converts a target weight into a whole-share market order for the difference from the current position.
-    fn place(&mut self, signal: Signal, now: Timestamp) {
-        // One working order per symbol keeps sizing simple; the next signal re-targets after it fills.
-        if self.broker.open_orders().iter().any(|(_, o)| o.symbol == signal.symbol) {
-            return;
+    fn collect_signals(&mut self, batch: &[Event], now: Timestamp) -> Vec<Signal> {
+        let ctx = StrategyContext { now, portfolio: &self.portfolio };
+        let mut signals = Vec::new();
+        for event in batch {
+            signals.extend(self.strategy.on_event(event, &ctx));
         }
+        signals
+    }
+
+    /// Converts a target weight into a whole-share market order for the difference between the target
+    /// and the projected position (current position plus unfilled orders). Buys are capped by cash not
+    /// already committed to other pending buys.
+    fn place(&mut self, signal: Signal, now: Timestamp) {
         let Some(price) = self.portfolio.last_price(&signal.symbol).filter(|p| *p > Decimal::ZERO) else {
             return;
         };
-        let target_qty = (self.portfolio.equity() * signal.target_weight / price).trunc();
-        let delta = target_qty - self.portfolio.qty(&signal.symbol);
+        let open = self.broker.open_orders();
+        let equity = self.portfolio.equity();
+        let target_qty = (equity * signal.target_weight / price).trunc().max(Decimal::ZERO);
+        let mut delta = target_qty - self.portfolio.projected_qty(&signal.symbol, &open);
+
+        if !target_qty.is_zero() && (delta * price).abs() < equity * REBALANCE_BAND {
+            return;
+        }
+        if delta > Decimal::ZERO {
+            let reserved: Decimal = open
+                .iter()
+                .filter(|(_, o)| o.side == Side::Buy)
+                .map(|(_, o)| o.qty * self.portfolio.last_price(&o.symbol).unwrap_or(price))
+                .sum();
+            let available = self.portfolio.cash() - reserved * (Decimal::ONE + CASH_BUFFER);
+            let affordable = (available / (price * (Decimal::ONE + CASH_BUFFER))).trunc().max(Decimal::ZERO);
+            delta = delta.min(affordable);
+        }
         if delta.is_zero() {
             return;
         }
+
         let side = if delta > Decimal::ZERO { Side::Buy } else { Side::Sell };
         let order = OrderRequest {
             symbol: signal.symbol,

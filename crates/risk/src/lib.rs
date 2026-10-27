@@ -3,11 +3,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::Signed;
 use rust_decimal_macros::dec;
-use st_core::{Event, EventKind, Portfolio, Signal, Symbol, Timestamp};
+use st_core::{Event, EventKind, OrderId, OrderRequest, Portfolio, Signal, Symbol};
 
 #[derive(Clone, Debug)]
 pub struct RiskLimits {
@@ -15,12 +13,13 @@ pub struct RiskLimits {
     pub max_position_weight: Decimal,
     /// Largest sum of absolute position values as a fraction of equity (1.0 = no leverage).
     pub max_gross_exposure: Decimal,
-    /// Halt new exposure for the rest of the day once equity falls this fraction below the day's start.
+    /// Halt new exposure for the rest of the session once equity falls this fraction below the session start.
     pub max_daily_loss: Decimal,
     /// Skip penny stocks, which are the main target of social-media pump-and-dumps.
     pub min_price: Decimal,
     /// Minimum average daily dollar volume over `liquidity_lookback` bars.
     pub min_avg_dollar_volume: Decimal,
+    /// Bars in the liquidity window; values below 1 are treated as 1.
     pub liquidity_lookback: usize,
 }
 
@@ -39,7 +38,7 @@ impl Default for RiskLimits {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RiskDecision {
-    /// Possibly with `target_weight` clamped down to fit the limits.
+    /// Possibly with `target_weight` clamped to fit the limits.
     Approve(Signal),
     Reject { signal: Signal, reason: String },
 }
@@ -47,13 +46,14 @@ pub enum RiskDecision {
 pub struct RiskManager {
     limits: RiskLimits,
     kill_reason: Option<String>,
-    day_start: Option<(NaiveDate, Decimal)>,
+    session_start_equity: Option<Decimal>,
     dollar_volume: HashMap<Symbol, VecDeque<Decimal>>,
 }
 
 impl RiskManager {
-    pub fn new(limits: RiskLimits) -> Self {
-        Self { limits, kill_reason: None, day_start: None, dollar_volume: HashMap::new() }
+    pub fn new(mut limits: RiskLimits) -> Self {
+        limits.liquidity_lookback = limits.liquidity_lookback.max(1);
+        Self { limits, kill_reason: None, session_start_equity: None, dollar_volume: HashMap::new() }
     }
 
     pub fn limits(&self) -> &RiskLimits {
@@ -71,6 +71,12 @@ impl RiskManager {
 
     pub fn is_killed(&self) -> bool {
         self.kill_reason.is_some()
+    }
+
+    /// Called by the runner when a new exchange session begins, before any of that session's data is
+    /// applied, with equity as of the previous close. The daily loss limit is measured from here.
+    pub fn start_session(&mut self, equity: Decimal) {
+        self.session_start_equity = Some(equity);
     }
 
     pub fn on_market_event(&mut self, event: &Event) {
@@ -92,33 +98,41 @@ impl RiskManager {
         Some(window.iter().sum::<Decimal>() / Decimal::from(window.len()))
     }
 
-    pub fn check(&mut self, mut signal: Signal, portfolio: &Portfolio, now: Timestamp) -> RiskDecision {
-        let equity = portfolio.equity();
-        let today = now.date_naive();
-        if self.day_start.is_none_or(|(day, _)| day != today) {
-            self.day_start = Some((today, equity));
+    /// `open_orders` are counted as if already filled, so signals in the same bar cannot each
+    /// claim the same headroom.
+    pub fn check(
+        &mut self,
+        mut signal: Signal,
+        portfolio: &Portfolio,
+        open_orders: &[(OrderId, OrderRequest)],
+    ) -> RiskDecision {
+        if signal.target_weight < Decimal::ZERO {
+            // Long-only for now: a short target means "get out", not "flip".
+            signal.target_weight = Decimal::ZERO;
+            signal.reason.push_str(" (shorting disabled; clamped to flat)");
         }
 
-        let current = portfolio.weight(&signal.symbol);
+        let equity = portfolio.equity();
+        let value = portfolio.projected_value(&signal.symbol, open_orders);
+        let current = if equity > Decimal::ZERO { value / equity } else { Decimal::ZERO };
         let target = signal.target_weight;
-        let reducing =
-            target.abs() <= current.abs() && (target.is_zero() || target.signum() == current.signum());
+        let reducing = target.is_zero() || (current > Decimal::ZERO && target <= current);
         if reducing {
             return RiskDecision::Approve(signal);
         }
 
         let reject = |signal: Signal, reason: String| RiskDecision::Reject { signal, reason };
 
+        if equity <= Decimal::ZERO {
+            return reject(signal, "equity is not positive".into());
+        }
         if let Some(reason) = &self.kill_reason {
             return reject(signal, format!("kill switch engaged: {reason}"));
         }
-        if let Some((_, start)) = self.day_start
+        if let Some(start) = self.session_start_equity
             && equity < start * (Decimal::ONE - self.limits.max_daily_loss)
         {
             return reject(signal, "daily loss limit reached".into());
-        }
-        if target < Decimal::ZERO {
-            return reject(signal, "short selling is disabled".into());
         }
         match portfolio.last_price(&signal.symbol) {
             None => return reject(signal, "no price available".into()),
@@ -135,12 +149,12 @@ impl RiskManager {
             Some(_) => {}
         }
 
-        let mut allowed = target.min(self.limits.max_position_weight);
-        if equity > Decimal::ZERO {
-            let other_gross =
-                (portfolio.gross_exposure() - portfolio.market_value(&signal.symbol).abs()) / equity;
-            allowed = allowed.min(self.limits.max_gross_exposure - other_gross);
+        let capped = target.min(self.limits.max_position_weight);
+        if capped <= current {
+            return reject(signal, "position already at max weight".into());
         }
+        let other_gross = (portfolio.projected_gross_exposure(open_orders) - value.abs()) / equity;
+        let allowed = capped.min(self.limits.max_gross_exposure - other_gross);
         if allowed <= current {
             return reject(signal, "gross exposure limit reached".into());
         }
@@ -152,7 +166,7 @@ impl RiskManager {
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
-    use st_core::{Bar, Fill, OrderId, Side};
+    use st_core::{Bar, Fill, OrderType, Side, Timestamp};
 
     use super::*;
 
@@ -178,49 +192,110 @@ mod tests {
         Signal { symbol: Symbol::new(symbol), target_weight: w, reason: "test".into() }
     }
 
-    fn warmed_up(close: Decimal, volume: Decimal) -> (RiskManager, Portfolio) {
+    fn buy(portfolio: &mut Portfolio, symbol: &str, qty: Decimal, price: Decimal) {
+        portfolio.apply_fill(&Fill {
+            order_id: OrderId(1),
+            symbol: Symbol::new(symbol),
+            side: Side::Buy,
+            qty,
+            price,
+            commission: Decimal::ZERO,
+            at: t0(),
+        });
+    }
+
+    fn warmed_up(symbols: &[&str], close: Decimal, volume: Decimal) -> (RiskManager, Portfolio) {
         let mut risk = RiskManager::new(RiskLimits::default());
         let mut portfolio = Portfolio::new(dec!(100_000));
-        for i in 0..20 {
-            let ev = bar("ABC", close, volume, i);
-            risk.on_market_event(&ev);
+        for s in symbols {
+            for i in 0..20 {
+                risk.on_market_event(&bar(s, close, volume, i));
+            }
+            portfolio.mark(&Symbol::new(*s), close);
         }
-        portfolio.mark(&Symbol::new("ABC"), close);
+        risk.start_session(portfolio.equity());
         (risk, portfolio)
     }
 
-    #[test]
-    fn clamps_to_max_position_weight() {
-        let (mut risk, portfolio) = warmed_up(dec!(50), dec!(1_000_000));
-        match risk.check(signal("ABC", dec!(0.5)), &portfolio, t0()) {
-            RiskDecision::Approve(s) => assert_eq!(s.target_weight, dec!(0.10)),
+    fn approved_weight(decision: RiskDecision) -> Decimal {
+        match decision {
+            RiskDecision::Approve(s) => s.target_weight,
             other => panic!("expected approval, got {other:?}"),
         }
     }
 
     #[test]
-    fn rejects_penny_stocks_and_illiquid_names() {
-        let (mut risk, portfolio) = warmed_up(dec!(2), dec!(100_000_000));
-        assert!(matches!(risk.check(signal("ABC", dec!(0.05)), &portfolio, t0()), RiskDecision::Reject { .. }));
+    fn clamps_to_max_position_weight() {
+        let (mut risk, portfolio) = warmed_up(&["ABC"], dec!(50), dec!(1_000_000));
+        assert_eq!(approved_weight(risk.check(signal("ABC", dec!(0.5)), &portfolio, &[])), dec!(0.10));
+    }
 
-        let (mut risk, portfolio) = warmed_up(dec!(50), dec!(1_000));
-        assert!(matches!(risk.check(signal("ABC", dec!(0.05)), &portfolio, t0()), RiskDecision::Reject { .. }));
+    #[test]
+    fn rejects_penny_stocks_and_illiquid_names() {
+        let (mut risk, portfolio) = warmed_up(&["ABC"], dec!(2), dec!(100_000_000));
+        assert!(matches!(risk.check(signal("ABC", dec!(0.05)), &portfolio, &[]), RiskDecision::Reject { .. }));
+
+        let (mut risk, portfolio) = warmed_up(&["ABC"], dec!(50), dec!(1_000));
+        assert!(matches!(risk.check(signal("ABC", dec!(0.05)), &portfolio, &[]), RiskDecision::Reject { .. }));
     }
 
     #[test]
     fn kill_switch_blocks_new_exposure_but_allows_exits() {
-        let (mut risk, mut portfolio) = warmed_up(dec!(50), dec!(1_000_000));
-        portfolio.apply_fill(&Fill {
-            order_id: OrderId(1),
-            symbol: Symbol::new("ABC"),
-            side: Side::Buy,
-            qty: dec!(100),
-            price: dec!(50),
-            commission: Decimal::ZERO,
-            at: t0(),
-        });
+        let (mut risk, mut portfolio) = warmed_up(&["ABC"], dec!(50), dec!(1_000_000));
+        buy(&mut portfolio, "ABC", dec!(100), dec!(50));
         risk.kill("manual");
-        assert!(matches!(risk.check(signal("ABC", dec!(0.10)), &portfolio, t0()), RiskDecision::Reject { .. }));
-        assert!(matches!(risk.check(signal("ABC", Decimal::ZERO), &portfolio, t0()), RiskDecision::Approve(_)));
+        assert!(matches!(risk.check(signal("ABC", dec!(0.10)), &portfolio, &[]), RiskDecision::Reject { .. }));
+        assert!(matches!(risk.check(signal("ABC", Decimal::ZERO), &portfolio, &[]), RiskDecision::Approve(_)));
+    }
+
+    #[test]
+    fn pending_orders_count_toward_gross_exposure() {
+        let names: Vec<String> = (0..12).map(|i| format!("S{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut risk, portfolio) = warmed_up(&refs, dec!(50), dec!(1_000_000));
+
+        // Ten pending buys of 10% each already use the whole 1.0 gross budget.
+        let open: Vec<(OrderId, OrderRequest)> = refs[..10]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let req = OrderRequest {
+                    symbol: Symbol::new(*s),
+                    side: Side::Buy,
+                    qty: dec!(200),
+                    order_type: OrderType::Market,
+                    reason: "test".into(),
+                };
+                (OrderId(i as u64), req)
+            })
+            .collect();
+        let decision = risk.check(signal("S10", dec!(0.10)), &portfolio, &open);
+        assert!(matches!(decision, RiskDecision::Reject { ref reason, .. } if reason.contains("gross")));
+    }
+
+    #[test]
+    fn daily_loss_limit_measured_from_session_start() {
+        let (mut risk, mut portfolio) = warmed_up(&["ABC", "XYZ"], dec!(50), dec!(1_000_000));
+        buy(&mut portfolio, "ABC", dec!(1_000), dec!(50));
+        risk.start_session(portfolio.equity());
+        portfolio.mark(&Symbol::new("ABC"), dec!(40)); // -10,000 on 100,000 = -10%
+        let decision = risk.check(signal("XYZ", dec!(0.05)), &portfolio, &[]);
+        assert!(matches!(decision, RiskDecision::Reject { ref reason, .. } if reason.contains("daily loss")));
+    }
+
+    #[test]
+    fn short_target_closes_long_instead_of_being_rejected() {
+        let (mut risk, mut portfolio) = warmed_up(&["ABC"], dec!(50), dec!(1_000_000));
+        buy(&mut portfolio, "ABC", dec!(100), dec!(50));
+        assert_eq!(approved_weight(risk.check(signal("ABC", dec!(-0.05)), &portfolio, &[])), Decimal::ZERO);
+    }
+
+    #[test]
+    fn rejects_new_exposure_when_equity_not_positive() {
+        let (mut risk, _) = warmed_up(&["ABC"], dec!(50), dec!(1_000_000));
+        let broke = Portfolio::new(Decimal::ZERO);
+        let mut broke = broke;
+        broke.mark(&Symbol::new("ABC"), dec!(50));
+        assert!(matches!(risk.check(signal("ABC", dec!(0.05)), &broke, &[]), RiskDecision::Reject { .. }));
     }
 }

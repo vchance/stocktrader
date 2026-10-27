@@ -2,6 +2,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use st_core::{Fill, Timestamp};
 
+use crate::exchange_date;
+
 /// Summary statistics. Ratios are `f64`: they are for reporting, not accounting.
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
@@ -10,23 +12,40 @@ pub struct Metrics {
     pub total_return: f64,
     pub cagr: f64,
     pub max_drawdown: f64,
-    /// Annualized assuming one equity point per trading day (sqrt(252)).
+    /// From daily returns, annualized with sqrt(252).
     pub sharpe: f64,
     pub num_fills: usize,
     pub commissions: Decimal,
 }
 
+/// The curve is first resampled to one point (the last) per exchange date, so intraday bars and
+/// non-bar events don't distort the daily statistics.
 pub fn compute(curve: &[(Timestamp, Decimal)], fills: &[Fill]) -> Metrics {
-    let (Some(&(t0, first)), Some(&(t1, last))) = (curve.first(), curve.last()) else {
+    let mut daily: Vec<(Timestamp, Decimal)> = Vec::new();
+    for &(t, equity) in curve {
+        match daily.last_mut() {
+            Some(last) if exchange_date(last.0) == exchange_date(t) => *last = (t, equity),
+            _ => daily.push((t, equity)),
+        }
+    }
+    let (Some(&(t0, first)), Some(&(t1, last))) = (daily.first(), daily.last()) else {
         return Metrics::default();
     };
-    let values: Vec<f64> = curve.iter().map(|(_, e)| e.to_f64().unwrap_or(0.0)).collect();
+    let values: Vec<f64> = daily.iter().map(|(_, e)| e.to_f64().unwrap_or(0.0)).collect();
     let start = values[0];
     let end = values[values.len() - 1];
 
-    let total_return = if start > 0.0 { end / start - 1.0 } else { 0.0 };
+    let total_return = if start > 0.0 { end / start - 1.0 } else { f64::NAN };
     let years = (t1 - t0).num_seconds() as f64 / (365.25 * 86_400.0);
-    let cagr = if years > 0.0 && start > 0.0 && end > 0.0 { (end / start).powf(1.0 / years) - 1.0 } else { total_return };
+    let cagr = if start <= 0.0 {
+        f64::NAN
+    } else if end <= 0.0 {
+        -1.0
+    } else if years > 0.0 {
+        (end / start).powf(1.0 / years) - 1.0
+    } else {
+        total_return
+    };
 
     let mut peak = f64::MIN;
     let mut max_drawdown = 0.0_f64;

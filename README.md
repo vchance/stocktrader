@@ -63,5 +63,8 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 2. **Start archiving news and social feeds now.** They cannot be backfilled later, and the archive becomes the backtest dataset.
 3. EDGAR fundamentals ingestion with point-in-time filing dates.
 4. Text pipeline: ticker extraction, dedupe, sentiment scoring (FinBERT via ONNX, or an LLM), mention velocity.
-5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`; reconcile positions against the broker.
+5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`. Before that: extract a mode-agnostic
+   engine step from `Backtest` so paper/live don't duplicate the loop; decouple fills from market events
+   (async fills, partials, rejects, cancels); reconcile positions and cash against the broker; give strategies
+   fill and open-order feedback; persist kill-switch and session state across restarts; share one sizing function.
 6. Dashboard, alerts, persistent kill switch; benchmark comparison (SPY) and walk-forward evaluation.

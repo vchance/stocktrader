@@ -70,7 +70,7 @@ fn backtest(args: BacktestArgs) -> Result<()> {
 
     let report = Backtest::new(
         source,
-        SmaCrossover::new(args.fast, args.slow, args.weight),
+        SmaCrossover::new(args.fast, args.slow, args.weight).map_err(anyhow::Error::msg)?,
         SimulatedBroker::new(FillModel { slippage_bps: args.slippage_bps, ..FillModel::default() }),
         RiskManager::new(RiskLimits::default()),
         args.cash,

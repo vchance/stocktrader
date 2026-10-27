@@ -1,4 +1,7 @@
 //! Trading strategies. Each one consumes [`Event`]s and emits target-weight [`Signal`]s.
+//!
+//! Strategies are level-triggered: they restate their full target on every relevant event rather than
+//! only on changes, so a target the risk manager rejected or clamped is naturally retried next time.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -13,13 +16,17 @@ pub struct SmaCrossover {
     slow: usize,
     weight: Decimal,
     closes: HashMap<Symbol, VecDeque<Decimal>>,
-    long: HashMap<Symbol, bool>,
 }
 
 impl SmaCrossover {
-    pub fn new(fast: usize, slow: usize, weight: Decimal) -> Self {
-        assert!(fast > 0 && fast < slow, "need 0 < fast < slow");
-        Self { fast, slow, weight, closes: HashMap::new(), long: HashMap::new() }
+    pub fn new(fast: usize, slow: usize, weight: Decimal) -> Result<Self, String> {
+        if fast == 0 || fast >= slow {
+            return Err(format!("need 0 < fast < slow, got fast={fast} slow={slow}"));
+        }
+        if weight <= Decimal::ZERO || weight > Decimal::ONE {
+            return Err(format!("weight must be in (0, 1], got {weight}"));
+        }
+        Ok(Self { fast, slow, weight, closes: HashMap::new() })
     }
 }
 
@@ -43,17 +50,15 @@ impl Strategy for SmaCrossover {
 
         let fast_sma = closes.iter().rev().take(self.fast).copied().sum::<Decimal>() / Decimal::from(self.fast);
         let slow_sma = closes.iter().copied().sum::<Decimal>() / Decimal::from(self.slow);
-        let want_long = fast_sma > slow_sma;
-        let was_long = self.long.insert(bar.symbol.clone(), want_long).unwrap_or(false);
-        if want_long == was_long {
-            return Vec::new();
-        }
-
-        let (target_weight, reason) = if want_long {
-            (self.weight, format!("SMA{} {} crossed above SMA{} {}", self.fast, fast_sma.round_dp(2), self.slow, slow_sma.round_dp(2)))
-        } else {
-            (Decimal::ZERO, format!("SMA{} {} crossed below SMA{} {}", self.fast, fast_sma.round_dp(2), self.slow, slow_sma.round_dp(2)))
-        };
+        let (target_weight, relation) =
+            if fast_sma > slow_sma { (self.weight, "above") } else { (Decimal::ZERO, "at or below") };
+        let reason = format!(
+            "SMA{} {} {relation} SMA{} {}",
+            self.fast,
+            fast_sma.round_dp(2),
+            self.slow,
+            slow_sma.round_dp(2)
+        );
         vec![Signal { symbol: bar.symbol.clone(), target_weight, reason }]
     }
 }
