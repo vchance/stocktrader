@@ -1,0 +1,21 @@
+name = "trend-megacaps"
+notes = """
+Trend following on a handful of very large, liquid stocks: long while the 20-day average is above the
+50-day. A simple baseline to compare other plans against; not expected to beat buying and holding.
+"""
+capital = 100000
+
+[strategy]
+kind = "sma"
+fast = 20
+slow = 50
+weight = 0.15
+
+[universe]
+symbols = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META"]
+
+[risk]
+max_position = 0.15
+
+[backtest]
+start = 2018-01-01

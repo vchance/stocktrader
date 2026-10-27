@@ -21,6 +21,7 @@
 #   deploy/collector.sh install-paper-timer  paper-trade --submit each weekday before the open (systemd user timer)
 #                                        (the install-* commands given a DIR only write the units there)
 #   deploy/collector.sh check-symbols    how much of the Alpaca universe the SEC ticker map and fundamentals cover
+#   deploy/collector.sh plans ARGS       trading plans in plans/: list, backtest NAME, compare (reports in data/reports)
 set -euo pipefail
 
 # Every `docker compose run` reads from /dev/null: run attaches stdin by default and would otherwise swallow
@@ -110,13 +111,18 @@ main() {
         install-paper-timer)
             install_paper_timer "$self" "${2:-}"
             ;;
+        plans)
+            prepare
+            docker compose build paper >/dev/null
+            docker compose run --rm --no-deps -T --entrypoint stocktrader paper plans "${@:2}" </dev/null
+            ;;
         check-symbols)
             prepare
             docker compose build paper >/dev/null
             docker compose run --rm --no-deps -T --entrypoint stocktrader paper symbols "${@:2}" </dev/null
             ;;
         *)
-            sed -n '2,24p' "$self"
+            sed -n '2,25p' "$self"
             return 1
             ;;
     esac

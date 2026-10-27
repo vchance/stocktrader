@@ -88,11 +88,11 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
     }
 
     let params = args.strategy.params(args.attention.is_some(), args.fundamentals.is_some())?;
-    let mut strategy = make_strategy(&params, args.strategy.weight)?;
     let mut data = data_args(args, previous - Days::new(args.history_days));
     data.attention_until = Some(clock.timestamp.to_utc());
     let loaded = load(&data)?;
     check_freshness(&loaded.events, previous, &args.symbols)?;
+    let mut strategy = make_strategy(&params, args.strategy.weight, &loaded.limits)?;
 
     let account = client.account().await?;
     st_paper::check_account(&account)?;

@@ -1,0 +1,28 @@
+# A trading plan. Copy this file to start a new one; the file name must match `name`.
+# `stocktrader plans list` checks every plan; `stocktrader plans backtest <name>` writes reports/<name>.html.
+name = "quality-value-core"
+notes = """
+Long-term core: hold cheap, profitable companies, rebalanced monthly.
+Judge it against SPY over full market cycles, not single years.
+"""
+mode = "backtest"        # "paper" once its backtests justify paper trading
+capital = 100000         # starting cash for backtests
+
+[strategy]
+kind = "quality-value"   # or "sma", "attention-spike"
+top_n = 20               # names held, 1/20 of equity each
+
+[universe]
+symbols = []                  # empty: the whole market in the data
+min_price = 5                 # skip stocks trading below $5
+min_dollar_volume = 5000000   # ... or averaging under $5M a day
+
+[risk]
+max_position = 0.06      # no single stock above 6% of equity
+max_gross_exposure = 1.0 # fully invested at most, no leverage
+max_daily_loss = 0.03    # stop adding exposure after a 3% down day
+
+[backtest]
+start = 2018-01-01
+benchmark = "SPY"
+slippage_bps = 5
