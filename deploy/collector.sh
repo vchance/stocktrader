@@ -10,7 +10,7 @@
 #                                        (extra flags go to `marketdata sync`, e.g. --force)
 #   deploy/collector.sh sync-fundamentals  rebuild SEC company fundamentals if the SEC published new data
 #                                        (needs SEC_USER_AGENT in .env; extra flags go to `fundamentals sync`)
-#   deploy/collector.sh health           check every source is producing; alert on changes
+#   deploy/collector.sh health           check every source and scheduled job is producing; alert on changes
 #   deploy/collector.sh housekeeping     compress old archive files, rebuild derived signals, then back up
 #   deploy/collector.sh backup           copy data/ to BACKUP_DEST (set in .env)
 #   deploy/collector.sh install-ops      hourly health check + nightly housekeeping (systemd user timers)
@@ -20,6 +20,7 @@
 #                                        print them; add --submit to send them (extra flags go to `stocktrader paper`)
 #   deploy/collector.sh install-paper-timer  paper-trade --submit each weekday before the open (systemd user timer)
 #                                        (the install-* commands given a DIR only write the units there)
+#   deploy/collector.sh check-symbols    how much of the Alpaca universe the SEC ticker map and fundamentals cover
 set -euo pipefail
 
 # Every `docker compose run` reads from /dev/null: run attaches stdin by default and would otherwise swallow
@@ -32,6 +33,16 @@ ALREADY_RUNNING=75
 REALERT_SECS=$((24 * 3600))
 # A configured backup older than this counts as a problem.
 BACKUP_MAX_AGE_SECS=$((2 * 24 * 3600))
+# Scheduled jobs whose output is older than this count as STALE (once their timer is installed). Paper runs
+# on weekdays, so a Monday holiday makes Friday to Tuesday the normal longest gap. (Market data freshness is
+# checked by `collector health` from its manifest.)
+FUNDAMENTALS_MAX_AGE_SECS=$((2 * 24 * 3600))
+# facts.parquet is only rewritten when the SEC publishes new data (normally every weekday), so a failing
+# facts download shows here even while the daily ticker snapshot keeps coming.
+FACTS_MAX_AGE_SECS=$((7 * 24 * 3600))
+PAPER_MAX_AGE_SECS=$((5 * 24 * 3600))
+# A newly installed market data timer gets this long for its first sync (Tue-Sat 03:00, up to 3h).
+MARKETDATA_FIRST_SYNC_SECS=$((4 * 24 * 3600))
 # File that must exist at the root of a local BACKUP_DEST.
 BACKUP_MARKER=.stocktrader-backup
 # Default cap on files one backup may delete (normally a few compacted .jsonl per night); more aborts the
@@ -99,8 +110,13 @@ main() {
         install-paper-timer)
             install_paper_timer "$self" "${2:-}"
             ;;
+        check-symbols)
+            prepare
+            docker compose build paper >/dev/null
+            docker compose run --rm --no-deps -T --entrypoint stocktrader paper symbols "${@:2}" </dev/null
+            ;;
         *)
-            sed -n '2,23p' "$self"
+            sed -n '2,24p' "$self"
             return 1
             ;;
     esac
@@ -218,9 +234,51 @@ health() {
     fi
     echo "$backup_line"
     summary+=$'\n'"$backup_line"
+    local job_line jobs=()
+    # `collector health` reports market data once a sync has completed; until then, only this can notice
+    # that a scheduled sync never succeeds.
+    if [[ ! -e data/marketdata/manifest.json ]]; then
+        jobs+=("$(job_status marketdata stocktrader-marketdata.timer data/marketdata/manifest.json "$MARKETDATA_FIRST_SYNC_SECS")")
+    fi
+    jobs+=("$(job_status fundamentals stocktrader-fundamentals.timer 'data/fundamentals/tickers/*.json' "$FUNDAMENTALS_MAX_AGE_SECS")")
+    jobs+=("$(job_status facts stocktrader-fundamentals.timer data/fundamentals/facts.parquet "$FACTS_MAX_AGE_SECS")")
+    jobs+=("$(job_status paper stocktrader-paper.timer 'data/live/journal/*.jsonl' "$PAPER_MAX_AGE_SECS")")
+    for job_line in "${jobs[@]}"; do
+        echo "$job_line"
+        summary+=$'\n'"$job_line"
+        if [[ "$job_line" =~ ^([a-z]+)\ +(STALE|MISSING)\  ]]; then
+            problems+="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"$'\n'
+        fi
+    done
     problems="$(sed '/^[[:space:]]*$/d' <<<"$problems" | sort)"
     alert_on_change "$problems" "$summary"
     [[ -z "$problems" ]]
+}
+
+# One status-table line for a scheduled job: `-` until its timer is installed (and while a newly installed
+# timer is younger than MAX_AGE seconds and nothing is written yet), then MISSING until it has written PATTERN
+# (a glob, matched here), and STALE once the newest match is older than MAX_AGE.
+job_status() {
+    local name="$1" unit="$2" pattern="$3" max_age="$4" newest age state mtime unit_file
+    unit_file="$HOME/.config/systemd/user/$unit"
+    if [[ ! -e "$unit_file" ]]; then
+        printf '%-14s %-8s %s\n' "$name" "-" "not scheduled ($unit not installed)"
+        return 0
+    fi
+    # shellcheck disable=SC2086 # the pattern is a glob
+    newest="$(ls -t $pattern 2>/dev/null | head -n 1)"
+    if [[ -z "$newest" ]] || ! mtime="$(stat -c %Y "$newest" 2>/dev/null)"; then
+        if (($(date +%s) - $(stat -c %Y "$unit_file") <= max_age)); then
+            printf '%-14s %-8s %s\n' "$name" "-" "waiting for the first run ($unit installed recently)"
+        else
+            printf '%-14s %-8s %s\n' "$name" MISSING "nothing written yet ($pattern)"
+        fi
+        return 0
+    fi
+    age=$(($(date +%s) - mtime))
+    state=ok
+    ((age > max_age)) && state=STALE
+    printf '%-14s %-8s %s\n' "$name" "$state" "last output $((age / 3600))h ago (limit $((max_age / 3600))h)"
 }
 
 # Alerts when the set of problems changes (including recovery), and re-alerts an unchanged problem daily.
@@ -445,11 +503,27 @@ paper_trade() {
     else
         docker compose build paper >/dev/null || status=$?
     fi
+    local output="" report copy
     if ((status == 0)); then
-        docker compose run --rm --no-deps -T paper "${args[@]}" "$@" </dev/null || status=$?
+        # Streamed (so a run killed by a timeout still leaves its output in the journal) and copied for the report.
+        copy="$(mktemp)"
+        docker compose run --rm --no-deps -T paper "${args[@]}" "$@" 2>&1 </dev/null | tee "$copy" || status=$?
+        output="$(cat "$copy")"
+        rm -f "$copy"
     fi
-    if ((status != 0)) && [[ " ${args[*]} $* " == *" --submit "* ]]; then
-        notify "stocktrader on $(hostname): paper trading failed" "See: journalctl --user -u stocktrader-paper" || true
+    [[ " ${args[*]} $* " == *" --submit "* ]] || return "$status"
+    # Only the runner's own report lines go into alerts, never raw docker/compose output, which can quote
+    # .env lines.
+    report="$(grep -E '^(session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:|Caused by:|    [0-9]+: )' \
+        <<<"$output" || true)"
+    if ((status != 0)); then
+        local body="See: journalctl --user -u stocktrader-paper"
+        [[ -n "$report" ]] && body="$report"$'\n\n'"$body"
+        notify "stocktrader on $(hostname): paper trading failed" "$body" || true
+    elif ! grep -q 'nothing to do' <<<"$output"; then
+        local sent
+        sent="$(grep '^submitted' <<<"$report" | grep -vc 'already submitted' || true)"
+        notify "stocktrader paper on $(hostname): ${sent} order(s) sent" "$report" || true
     fi
     return "$status"
 }

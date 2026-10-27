@@ -90,6 +90,11 @@ reported period: quarterly, year-to-date and annual figures share a period end a
 The SEC's ~1 GB bulk file is fetched with `If-Modified-Since`, so an unchanged night costs one request;
 results are staged and only replace the previous file if non-empty, fresh, and not much smaller.
 
+`stocktrader symbols` (`deploy/collector.sh check-symbols` on the server) compares the newest Alpaca asset
+list with the SEC ticker map and the facts: how many tradable symbols have a CIK, how many have an annual
+net income (what `quality-value` can rank), symbols that differ only in punctuation, and a sample of the
+unmatched (mostly ETFs and funds, which file no 10-K). Run it after the first syncs.
+
 **Known limit (important for backtests):** tickers come from the SEC's *current* CIK→ticker map. Applied
 to history, a ticker that once belonged to another company gets this company's fundamentals, renamed
 companies lose their old symbol, and delisted companies have none. Daily ticker snapshots are kept from
@@ -172,7 +177,9 @@ Guards:
 
 On a server, put the flags in `.env` as `PAPER_ARGS` (see `.env.example`), check the plan with
 `deploy/collector.sh paper-trade`, then `deploy/collector.sh install-paper-timer` submits each weekday
-at 08:45 New York time, after the nightly market data sync, and alerts if a run fails.
+at 08:45 New York time, after the nightly market data sync. Each submitting run sends a short report to
+`ALERT_WEBHOOK_URL` (equity, orders, rejections, broker answers; nothing on market holidays), and a failed
+run sends its error lines.
 
 ## Data collector
 
@@ -237,7 +244,11 @@ deploy/collector.sh housekeeping   # gzip day files older than yesterday, then `
   (at least 30 minutes) without a record, or if its newest record is in the future. A source that has
   data but lost its keys shows DISABLED (if you retire a source on purpose, move its directory out of
   `data/raw` to stop the daily alert). The market data sync is stale after 3 days; a configured backup
-  after 2 days.
+  after 2 days. Once their timers are installed, scheduled jobs are checked too: a market data sync that
+  has never completed is MISSING, fundamentals are stale after 2 days without a new ticker snapshot and
+  `facts` after 7 days without a new facts file (the SEC normally publishes every weekday), and paper
+  trading after 5 days without a journal entry (a Monday holiday makes Friday to Tuesday normal). A timer
+  installed less than that long ago that hasn't produced anything yet shows as waiting, not MISSING.
 - **Dead-man's switch:** set `HEARTBEAT_URL` (e.g. a healthchecks.io check) and every hourly health run
   pings it, so you hear about it if the host or its timers stop entirely.
 - **Backups** go to `BACKUP_DEST` (any rsync destination; remote ones need key-based ssh). A local
