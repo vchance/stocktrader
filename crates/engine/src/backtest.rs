@@ -34,7 +34,9 @@ pub struct Rejection {
 
 #[derive(Debug)]
 pub struct BacktestReport {
-    /// Equity after each distinct event timestamp.
+    /// Equity after each distinct timestamp that carried price bars. Timestamps with only other events
+    /// (overnight or weekend attention polls, filings) leave equity unchanged and would otherwise add
+    /// zero-return "days" that distort daily statistics.
     pub equity_curve: Vec<(Timestamp, Decimal)>,
     pub fills: Vec<Fill>,
     pub rejections: Vec<Rejection>,
@@ -110,7 +112,9 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
                     }
                 }
             }
-            equity_curve.push((now, self.portfolio.equity()));
+            if batch.iter().any(|e| matches!(e.kind, EventKind::Bar(_))) {
+                equity_curve.push((now, self.portfolio.equity()));
+            }
         }
 
         let metrics = metrics::compute(&equity_curve, &fills);

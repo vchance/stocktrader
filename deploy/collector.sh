@@ -11,7 +11,7 @@
 #   deploy/collector.sh sync-fundamentals  rebuild SEC company fundamentals if the SEC published new data
 #                                        (needs SEC_USER_AGENT in .env; extra flags go to `fundamentals sync`)
 #   deploy/collector.sh health           check every source is producing; alert on changes
-#   deploy/collector.sh housekeeping     compress old archive files, then back up
+#   deploy/collector.sh housekeeping     compress old archive files, rebuild derived signals, then back up
 #   deploy/collector.sh backup           copy data/ to BACKUP_DEST (set in .env)
 #   deploy/collector.sh install-ops      hourly health check + nightly housekeeping (systemd user timers)
 #   deploy/collector.sh install-timer    nightly sync-marketdata (systemd user timer)
@@ -98,8 +98,9 @@ main() {
 }
 
 prepare() {
-    # Created here, not by Docker, so they belong to this user rather than root.
-    mkdir -p data
+    # Created here, not by Docker, so they belong to this user rather than root. data/raw exists from the
+    # start, so a missing archive root inside a container always means a misconfigured path.
+    mkdir -p data/raw
     if [[ ! -e .env ]]; then
         install -m 600 .env.example .env
         echo "Created .env from .env.example. Starting with keyless sources only;"
@@ -239,6 +240,10 @@ housekeeping() {
     prepare
     local failed=""
     docker compose run --rm --no-deps -T collector compact </dev/null || failed+="compaction "
+    # Derived tables are rebuilt from the whole archive; a failure here never touches the archive. Build
+    # first so a host whose image predates the signals binary doesn't fail every night.
+    { docker compose build signals >/dev/null && docker compose run --rm --no-deps -T signals </dev/null; } ||
+        failed+="signals "
     backup || failed+="backup "
     if [[ -n "$failed" ]]; then
         notify "stocktrader on $(hostname): ${failed}failed" "See: journalctl --user -u stocktrader-housekeeping"
@@ -247,7 +252,8 @@ housekeeping() {
 }
 
 # Copies data/ to BACKUP_DEST (any rsync destination: local path, mounted drive, or user@host:path).
-# Market data and fundamentals Parquet files and the SEC zip are skipped (they are re-downloadable);
+# Market data and fundamentals Parquet files and the SEC zip are skipped (they are re-downloadable), as are
+# derived signal tables (rebuilt from the archive);
 # everything else, including the raw archive, asset and ticker snapshots, and cursors, is copied.
 #
 # Deletion is tightly limited: only *.jsonl files can be deleted from the backup (`P! *.jsonl` protects
@@ -279,7 +285,7 @@ backup() {
     fi
     rsync -a --delete-after --max-delete="$max_delete" --filter='P! *.jsonl' \
         --exclude='*.tmp' --exclude='.sync.lock' --exclude='marketdata/*.parquet' \
-        --exclude='fundamentals/*.parquet' --exclude='fundamentals/*.zip' \
+        --exclude='fundamentals/*.parquet' --exclude='fundamentals/*.zip' --exclude='/signals/' \
         -e 'ssh -o BatchMode=yes' \
         data/ "${dest%/}/" || rc=$?
     # 24: some source files vanished during the transfer (normal for a live archive).

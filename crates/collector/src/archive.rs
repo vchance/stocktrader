@@ -92,6 +92,69 @@ impl Archive {
     }
 }
 
+/// Outcome of reading a source back from the archive.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReadStats {
+    pub records: usize,
+    /// Lines that failed to parse (at most one torn line per file is expected).
+    pub skipped: usize,
+}
+
+/// Streams every record of `source` under `root` to `each`, day files in date order (within a day,
+/// `.jsonl` before `.jsonl.gz`), from both plain and compacted files. Nothing is held beyond the current
+/// line. Unparseable lines are skipped and counted; an error from `each` stops the read. Records are not
+/// deduplicated: polls overlap, and a day can briefly exist in both forms after an interrupted compaction.
+pub fn read_source(
+    root: &Path,
+    source: &str,
+    mut each: impl FnMut(RawRecord) -> io::Result<()>,
+) -> io::Result<ReadStats> {
+    let dir = root.join(source);
+    let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.ends_with(".jsonl") || name.ends_with(".jsonl.gz")
+            })
+            .collect(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ReadStats::default()),
+        Err(e) => return Err(e),
+    };
+    // Names start with the date, so lexical order is date order.
+    files.sort();
+    let mut stats = ReadStats::default();
+    for path in files {
+        let file = File::open(&path)?;
+        let mut reader: Box<dyn io::BufRead> = if path.extension().is_some_and(|e| e == "gz") {
+            Box::new(io::BufReader::new(flate2::read::GzDecoder::new(file)))
+        } else {
+            Box::new(io::BufReader::new(file))
+        };
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<RawRecord>(&line) {
+                Ok(record) => {
+                    stats.records += 1;
+                    each(record)?;
+                }
+                Err(_) => stats.skipped += 1,
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// True if the file is non-empty and its last byte is not a newline, i.e. a previous write was torn.
 fn ends_mid_line(file: &mut File) -> io::Result<bool> {
     let len = file.metadata()?.len();
@@ -155,6 +218,34 @@ mod tests {
         archive.append(std::slice::from_ref(&next)).unwrap();
 
         assert_eq!(read_records(&path), vec![first, next]);
+    }
+
+    #[test]
+    fn reads_plain_and_compacted_days_in_order_skipping_torn_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = Archive::new(dir.path());
+        let old = record("apewisdom", 20, "old");
+        let new = record("apewisdom", 27, "new");
+        archive.append(&[old.clone(), new.clone()]).unwrap();
+        crate::maintenance::compact(dir.path(), chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()).unwrap();
+        assert!(dir.path().join("apewisdom/2026-10-20.jsonl.gz").exists());
+        OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("apewisdom/2026-10-27.jsonl"))
+            .unwrap()
+            .write_all(b"{\"torn")
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let stats = read_source(dir.path(), "apewisdom", |r| {
+            seen.push(r);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![old, new]);
+        assert_eq!(stats, ReadStats { records: 2, skipped: 1 });
+        assert_eq!(read_source(dir.path(), "never_collected", |_| Ok(())).unwrap(), ReadStats::default());
+        assert!(read_source(dir.path(), "apewisdom", |_| Err(io::Error::other("stop"))).is_err());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use st_core::{Event, EventKind, EventSource, NewsItem, Signal, Strategy, StrategyContext};
+use st_core::{AttentionObservation, Event, EventKind, EventSource, NewsItem, Signal, Strategy, StrategyContext, Symbol};
 use st_data::{SyntheticConfig, VecEventSource, generate_daily_bars};
 use st_engine::{Backtest, BacktestError, BacktestReport, FillModel, SimulatedBroker};
 use st_risk::{RiskLimits, RiskManager};
-use st_strategies::SmaCrossover;
+use st_strategies::{AttentionSpike, SmaCrossover};
 
 fn synthetic_source(symbols: usize, days: usize, seed: u64) -> VecEventSource {
     let bars = generate_daily_bars(&SyntheticConfig {
@@ -46,6 +46,44 @@ fn synthetic_backtest_trades_and_is_deterministic() {
 fn weights_below_rebalance_band_still_enter_positions() {
     let report = run(synthetic_source(20, 300, 7), SmaCrossover::new(10, 30, dec!(0.005)).unwrap());
     assert!(report.metrics.num_fills > 0);
+}
+
+#[test]
+fn attention_spike_buys_after_the_spike_and_exits_after_the_hold() {
+    let bars = generate_daily_bars(&SyntheticConfig {
+        symbols: 3,
+        days: 60,
+        start: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+        seed: 5,
+    });
+    // A spike for SYN001 observed overnight before the 31st session, plus a non-spike for SYN002.
+    let spike_at = bars.iter().filter(|b| b.symbol.as_str() == "SYN001").nth(30).unwrap().start
+        - chrono::TimeDelta::hours(8);
+    let attention = |symbol: &str, mentions, prev| Event {
+        available_at: spike_at,
+        kind: EventKind::Attention(AttentionObservation {
+            symbol: Symbol::new(symbol),
+            source: "test".into(),
+            window_hours: 24,
+            mentions,
+            mentions_prev: Some(prev),
+            rank: Some(1),
+            rank_prev: Some(40),
+            upvotes: Some(10),
+        }),
+    };
+    let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
+    events.push(attention("SYN001", 200, 20));
+    events.push(attention("SYN002", 30, 25));
+
+    let report = run(VecEventSource::new(events), AttentionSpike::new(50, 3.0, 5, dec!(0.10)).unwrap());
+    let traded: Vec<(&str, st_core::Side)> = report.fills.iter().map(|f| (f.symbol.as_str(), f.side)).collect();
+    assert_eq!(traded, vec![("SYN001", st_core::Side::Buy), ("SYN001", st_core::Side::Sell)]);
+    assert!(report.fills[0].at > spike_at, "fills only after the spike was observed");
+    let held = report.fills[1].at - report.fills[0].at;
+    assert!(held >= chrono::TimeDelta::days(5) && held <= chrono::TimeDelta::days(9), "held {held}");
+    assert_eq!(report.final_portfolio.positions().count(), 0);
+    assert_eq!(report.equity_curve.len(), 60, "attention-only timestamps add no equity points");
 }
 
 /// Asks for 10% in every symbol on every bar: far more than the 100% gross budget.

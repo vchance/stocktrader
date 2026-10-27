@@ -8,12 +8,14 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+st-collector = { path = "crates/collector" }
 st-core = { path = "crates/core" }
 st-data = { path = "crates/data" }
 st-engine = { path = "crates/engine" }
 st-fundamentals = { path = "crates/fundamentals" }
 st-marketdata = { path = "crates/marketdata" }
 st-risk = { path = "crates/risk" }
+st-signals = { path = "crates/signals" }
 st-strategies = { path = "crates/strategies" }
 
 anyhow = "1"

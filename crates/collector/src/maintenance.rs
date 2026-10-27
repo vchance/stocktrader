@@ -19,10 +19,16 @@ fn file_date(path: &Path) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(stem, "%Y-%m-%d").ok()
 }
 
-/// Source directories under the archive root; dot-directories (`.state`) are not sources.
+/// Source directories under the archive root; dot-directories (`.state`) are not sources. A root that
+/// doesn't exist yet (nothing collected) has none.
 fn source_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
-    for entry in fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(dirs),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    for entry in entries {
         let entry = entry?;
         if entry.file_type()?.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
             dirs.push(entry.path());
@@ -328,6 +334,9 @@ mod tests {
 
         let again = compact(dir.path(), day(26)).unwrap();
         assert!(again.compressed.is_empty() && again.recovered.is_empty(), "second run is a no-op");
+
+        let fresh = compact(&dir.path().join("not-created-yet"), day(26)).unwrap();
+        assert!(fresh.compressed.is_empty() && fresh.errors.is_empty(), "no archive yet is not an error");
     }
 
     #[test]

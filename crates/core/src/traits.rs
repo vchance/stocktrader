@@ -25,6 +25,17 @@ pub trait Strategy {
     fn on_event(&mut self, event: &Event, ctx: &StrategyContext<'_>) -> Vec<Signal>;
 }
 
+/// Lets a strategy chosen at runtime (e.g. from a CLI flag) run through the same generic engine.
+impl<S: Strategy + ?Sized> Strategy for Box<S> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn on_event(&mut self, event: &Event, ctx: &StrategyContext<'_>) -> Vec<Signal> {
+        (**self).on_event(event, ctx)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("order rejected: {0}")]
