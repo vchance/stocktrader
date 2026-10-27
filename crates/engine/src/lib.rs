@@ -4,12 +4,14 @@ pub mod backtest;
 pub mod broker;
 pub mod clock;
 pub mod metrics;
+pub mod sizing;
 pub mod walkforward;
 
 pub use backtest::{Backtest, BacktestError, BacktestReport, Rejection};
 pub use broker::{FillModel, SimulatedBroker};
 pub use clock::SimClock;
 pub use metrics::Metrics;
+pub use sizing::size_order;
 pub use walkforward::{Fold, WalkForwardConfig, WalkForwardReport, walk_forward};
 
 use chrono::NaiveDate;

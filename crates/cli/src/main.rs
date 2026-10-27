@@ -16,6 +16,8 @@ use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
+mod paper;
+
 #[derive(Parser)]
 #[command(name = "stocktrader", about = "Automated stock trading: backtest, paper and live")]
 struct Cli {
@@ -54,6 +56,9 @@ enum Command {
         #[arg(long, default_value_t = 330)]
         warmup_days: i64,
     },
+    /// Before the open, trade the Alpaca paper account towards the strategy's current targets, sized and
+    /// risk-checked exactly as in a backtest. Prints the plan only, unless --submit.
+    Paper(Box<paper::PaperArgs>),
 }
 
 #[derive(Args)]
@@ -97,6 +102,10 @@ struct DataArgs {
     /// Risk filter: skip entries whose as-traded price is below this; 0 disables.
     #[arg(long, default_value = "5")]
     min_price: Decimal,
+    /// Latest attention to read. Replays stop at the last bar; the paper runner reads up to the present,
+    /// since attention that arrived overnight is part of what it acts on.
+    #[arg(skip)]
+    attention_until: Option<Timestamp>,
 }
 
 #[derive(Args)]
@@ -182,6 +191,7 @@ fn main() -> Result<()> {
             let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), TimeDelta::days(warmup_days));
             walk(&data, &grid, weight, windows)
         }
+        Command::Paper(args) => paper::run(&args),
     }
 }
 
@@ -190,6 +200,20 @@ fn require_attention(data: &DataArgs) -> Result<()> {
         bail!("attention-spike needs --attention data/signals/apewisdom.parquet");
     }
     Ok(())
+}
+
+impl StrategyArgs {
+    fn params(&self, have_attention: bool) -> Result<Params> {
+        Ok(match self.strategy {
+            StrategyName::Sma => Params::Sma { fast: self.fast, slow: self.slow },
+            StrategyName::AttentionSpike => {
+                if !have_attention {
+                    bail!("attention-spike needs --attention data/signals/apewisdom.parquet");
+                }
+                Params::Spike { min_mentions: self.spike_min_mentions, ratio: self.spike_ratio, hold_days: self.spike_hold_days }
+            }
+        })
+    }
 }
 
 struct Loaded {
@@ -202,13 +226,7 @@ struct Loaded {
 }
 
 fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
-    let params = match args.strategy {
-        StrategyName::Sma => Params::Sma { fast: args.fast, slow: args.slow },
-        StrategyName::AttentionSpike => {
-            require_attention(data)?;
-            Params::Spike { min_mentions: args.spike_min_mentions, ratio: args.spike_ratio, hold_days: args.spike_hold_days }
-        }
-    };
+    let params = args.params(data.attention.is_some())?;
     let strategy = make_strategy(&params, args.weight)?;
     let loaded = load(data)?;
     let report = Backtest::new(
@@ -384,7 +402,8 @@ fn load(data: &DataArgs) -> Result<Loaded> {
     let last_bar = bars.iter().map(|b| b.end).max();
     let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
     if let Some(path) = &data.attention {
-        let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to: last_bar };
+        let to = data.attention_until.or(last_bar);
+        let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to };
         let rows = st_signals::read_rows(path, &filter)?;
         println!("attention events  {}", rows.len());
         warn_on_coverage(first_bar, rows.iter().map(|r| r.observed_at).min());

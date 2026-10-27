@@ -59,6 +59,16 @@ impl Portfolio {
         self.last_prices.get(symbol).copied()
     }
 
+    /// Sets a position outright, e.g. from a broker's report when reconciling; a zero quantity removes it.
+    /// Cash is not touched.
+    pub fn set_position(&mut self, symbol: Symbol, position: Position) {
+        if position.qty.is_zero() {
+            self.positions.remove(&symbol);
+        } else {
+            self.positions.insert(symbol, position);
+        }
+    }
+
     pub fn mark(&mut self, symbol: &Symbol, price: Price) {
         self.last_prices.insert(symbol.clone(), price);
     }

@@ -2013,16 +2013,22 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "dotenvy",
+ "reqwest",
  "rust_decimal",
+ "serde_json",
  "st-core",
  "st-data",
  "st-engine",
  "st-marketdata",
+ "st-paper",
  "st-risk",
  "st-signals",
  "st-strategies",
  "tempfile",
+ "tokio",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -2136,6 +2142,29 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
+name = "st-paper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "reqwest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "st-core",
+ "st-data",
+ "st-engine",
+ "st-risk",
+ "st-strategies",
+ "tempfile",
+ "tokio",
+ "tracing",
  "wiremock",
 ]
 

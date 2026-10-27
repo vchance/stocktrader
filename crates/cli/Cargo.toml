@@ -13,15 +13,21 @@ st-core.workspace = true
 st-data.workspace = true
 st-engine.workspace = true
 st-marketdata.workspace = true
+st-paper.workspace = true
 st-risk.workspace = true
 st-signals.workspace = true
 st-strategies.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+dotenvy.workspace = true
+reqwest.workspace = true
 rust_decimal.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 chrono-tz.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true

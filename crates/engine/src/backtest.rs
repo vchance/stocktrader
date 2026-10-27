@@ -1,23 +1,15 @@
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use st_core::{
-    Clock, Event, EventKind, EventSource, ExecutionAdapter, Fill, OrderRequest, OrderType, Portfolio, Side,
-    Signal, Strategy, StrategyContext, Timestamp,
+    Clock, Event, EventKind, EventSource, ExecutionAdapter, Fill, Portfolio, Signal, Strategy, StrategyContext,
+    Timestamp,
 };
 use st_risk::{RiskDecision, RiskManager};
 
 use crate::clock::SimClock;
 use crate::exchange_date;
 use crate::metrics::{self, Metrics};
-
-/// Skip resizing an existing position by less than this fraction of equity, so equity drift doesn't
-/// churn small trades. Entries and exits to flat always go through.
-const REBALANCE_BAND: Decimal = dec!(0.01);
-/// Buys smaller than this fraction of equity are skipped, so target weights below it never trade.
-const MIN_BUY: Decimal = dec!(0.0025);
-/// Headroom kept when sizing buys from cash, since a market order fills at the next open, not the last close.
-const CASH_BUFFER: Decimal = dec!(0.02);
+use crate::sizing::size_order;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BacktestError {
@@ -150,48 +142,10 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
         signals
     }
 
-    /// Converts a target weight into a whole-share market order for the difference between the target
-    /// and the projected position (current position plus unfilled orders). Buys are capped by cash not
-    /// already committed to other pending buys.
     fn place(&mut self, signal: Signal, now: Timestamp) {
-        let Some(price) = self.portfolio.last_price(&signal.symbol).filter(|p| *p > Decimal::ZERO) else {
-            return;
-        };
         let open = self.broker.open_orders();
-        let equity = self.portfolio.equity();
-        let target_qty = (equity * signal.target_weight / price).trunc().max(Decimal::ZERO);
-        let projected = self.portfolio.projected_qty(&signal.symbol, &open);
-        let mut delta = target_qty - projected;
-
-        let resize = !target_qty.is_zero() && !projected.is_zero();
-        if resize && (delta * price).abs() < equity * REBALANCE_BAND {
+        let Some(order) = size_order(signal, &self.portfolio, &open) else {
             return;
-        }
-        if delta > Decimal::ZERO {
-            let reserved: Decimal = open
-                .iter()
-                .filter(|(_, o)| o.side == Side::Buy)
-                .map(|(_, o)| o.qty * self.portfolio.last_price(&o.symbol).unwrap_or(price))
-                .sum();
-            let available = self.portfolio.cash() - reserved * (Decimal::ONE + CASH_BUFFER);
-            let affordable = (available / (price * (Decimal::ONE + CASH_BUFFER))).trunc().max(Decimal::ZERO);
-            delta = delta.min(affordable);
-            // Cash or gross-exposure headroom can shrink an order to a sliver; skip those.
-            if delta * price < equity * MIN_BUY {
-                return;
-            }
-        }
-        if delta.is_zero() {
-            return;
-        }
-
-        let side = if delta > Decimal::ZERO { Side::Buy } else { Side::Sell };
-        let order = OrderRequest {
-            symbol: signal.symbol,
-            side,
-            qty: delta.abs(),
-            order_type: OrderType::Market,
-            reason: signal.reason,
         };
         if let Err(e) = self.broker.submit(order, now) {
             tracing::warn!(error = %e, "order submission failed");
