@@ -55,8 +55,8 @@ fn main() -> Result<()> {
                 result.map_err(std::io::Error::other)
             })?;
             if read.records == 0 {
+                // Dropping the writer removes its empty temporary file.
                 drop(writer);
-                let _ = std::fs::remove_file(table.with_extension("parquet.tmp"));
                 println!("no {SOURCE} records under {} yet; nothing to build", cli.archive.display());
                 return Ok(());
             }

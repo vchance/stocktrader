@@ -42,11 +42,21 @@ const BATCH_ROWS: usize = 100_000;
 /// Streams rows into `<path>.tmp` in batches, so memory stays flat however large the archive grows, and
 /// renames it into place on [`AttentionWriter::finish`].
 pub struct AttentionWriter {
-    writer: ArrowWriter<File>,
+    /// `None` once finished.
+    writer: Option<ArrowWriter<File>>,
     tmp: PathBuf,
     path: PathBuf,
     buffer: Vec<AttentionRow>,
     rows: usize,
+}
+
+/// A writer dropped without finishing (an error mid-build) removes its partial temporary file.
+impl Drop for AttentionWriter {
+    fn drop(&mut self) {
+        if self.writer.take().is_some() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 impl AttentionWriter {
@@ -57,7 +67,13 @@ impl AttentionWriter {
         let tmp = path.with_extension("parquet.tmp");
         let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
         let writer = ArrowWriter::try_new(File::create(&tmp)?, schema(), Some(props))?;
-        Ok(Self { writer, tmp, path: path.to_path_buf(), buffer: Vec::with_capacity(BATCH_ROWS), rows: 0 })
+        Ok(Self {
+            writer: Some(writer),
+            tmp,
+            path: path.to_path_buf(),
+            buffer: Vec::with_capacity(BATCH_ROWS),
+            rows: 0,
+        })
     }
 
     pub fn push(&mut self, row: AttentionRow) -> Result<()> {
@@ -83,7 +99,8 @@ impl AttentionWriter {
             counts(chunk, |r| r.rank_24h_ago),
             counts(chunk, |r| r.mentions_24h_ago),
         ];
-        self.writer.write(&RecordBatch::try_new(schema(), columns)?)?;
+        let writer = self.writer.as_mut().context("writer already finished")?;
+        writer.write(&RecordBatch::try_new(schema(), columns)?)?;
         self.rows += self.buffer.len();
         self.buffer.clear();
         Ok(())
@@ -93,15 +110,18 @@ impl AttentionWriter {
     /// records were read but no rows came out, the input is broken, not empty.
     pub fn finish(mut self) -> Result<usize> {
         self.flush()?;
-        let file = self.writer.into_inner()?;
         if self.rows == 0 {
-            drop(file);
-            let _ = fs::remove_file(&self.tmp);
+            // Drop removes the temporary file.
             bail!("no rows to write; keeping the previous table");
         }
-        file.sync_all()?;
-        fs::rename(&self.tmp, &self.path).with_context(|| format!("replacing {}", self.path.display()))?;
-        Ok(self.rows)
+        let file = self.writer.take().context("writer already finished")?.into_inner()?;
+        let renamed = file.sync_all().map_err(anyhow::Error::from).and_then(|()| {
+            fs::rename(&self.tmp, &self.path).with_context(|| format!("replacing {}", self.path.display()))
+        });
+        if renamed.is_err() {
+            let _ = fs::remove_file(&self.tmp);
+        }
+        renamed.map(|()| self.rows)
     }
 }
 
@@ -221,6 +241,13 @@ mod tests {
             writer.push(row.clone()).unwrap();
         }
         assert_eq!(writer.finish().unwrap(), BATCH_ROWS * 2 + 7);
+        assert_eq!(read_rows(&path, &RowFilter::default()).unwrap().len(), BATCH_ROWS * 2 + 7);
+
+        // Abandoned mid-build: no partial file left behind, previous table intact.
+        let mut abandoned = AttentionWriter::create(&path).unwrap();
+        abandoned.push(row).unwrap();
+        drop(abandoned);
+        assert!(!path.with_extension("parquet.tmp").exists());
         assert_eq!(read_rows(&path, &RowFilter::default()).unwrap().len(), BATCH_ROWS * 2 + 7);
     }
 }

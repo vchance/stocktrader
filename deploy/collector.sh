@@ -98,8 +98,9 @@ main() {
 }
 
 prepare() {
-    # Created here, not by Docker, so they belong to this user rather than root.
-    mkdir -p data
+    # Created here, not by Docker, so they belong to this user rather than root. data/raw exists from the
+    # start, so a missing archive root inside a container always means a misconfigured path.
+    mkdir -p data/raw
     if [[ ! -e .env ]]; then
         install -m 600 .env.example .env
         echo "Created .env from .env.example. Starting with keyless sources only;"
