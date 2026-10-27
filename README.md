@@ -148,8 +148,8 @@ data overlapping the price history.
 
 A plan is a named, saved description of how to trade, kept as a TOML file in `plans/`: what it's for in your
 own words, the strategy and its parameters, which stocks it may trade, its risk limits and starting capital.
-Keep several and compare them; the ones that hold up get paper-traded (next step: one paper account per
-plan). `plans/quality-value-core.toml` is a commented template.
+Keep several and compare them; the ones that hold up get paper-traded, each in its own Alpaca paper account.
+`plans/quality-value-core.toml` is a commented template.
 
 ```
 stocktrader plans list                               # every plan, and whether each file is valid
@@ -167,6 +167,7 @@ On the server: `deploy/collector.sh plans list` (and so on); reports land in `da
 | `[universe]` | `symbols` (empty = whole market), `min_price` (as traded), `min_dollar_volume` (20-session average) |
 | `[risk]` | `max_position`, `max_gross_exposure`, `max_daily_loss` (fractions of equity; defaults 0.10, 1.0, 0.03) |
 | `[backtest]` | `start`, `end` (TOML dates, e.g. `2018-01-01`), `benchmark` (default SPY, or `none`), `slippage_bps` |
+| `[paper]` | `max_orders` (default 20: a run planning more is refused), `history_days` (default 400 of warm-up) |
 
 Unknown keys are errors, so a typo never silently falls back to a default; inconsistent settings (a fast
 average not below the slow one, `top_n` too small for the position cap) are refused. `compare` uses one
@@ -176,6 +177,25 @@ Indicators warm up inside the window: an `sma` plan with `slow = 50` trades from
 The HTML report is one self-contained file (no external scripts or fonts): summary against the benchmark,
 equity and drawdown charts with hover readouts, monthly returns, rejected signals by reason, recent fills,
 and the plan file itself. Light and dark themes follow the system setting.
+
+### Paper-trading plans
+
+`stocktrader plans paper` (dry run; `--submit` sends) runs the paper runner below for every plan with
+`mode = "paper"`, or for the plans named. Each plan trades its own Alpaca paper account, with keys
+`APCA_API_KEY_ID_<PLAN>` and `APCA_API_SECRET_KEY_<PLAN>` (the name in capitals, dashes as underscores:
+`APCA_API_KEY_ID_QUALITY_VALUE_CORE`). There is no fallback to the shared keys, and two plans with the same
+key are refused, since one account can't tell which plan owns a position. So are two plans whose keys open
+the same account (checked by account ID before anything trades) and a plan using the shared `APCA_API_KEY_ID`.
+Setup problems stop the whole run before any plan trades: an invalid plan file (it might be a paper plan),
+a missing key, or a shared account. Each plan journals to
+`data/live/<plan>/journal/`; a `KILL` file in `data/live/<plan>/` pauses new exposure for that plan, one in
+`data/live/` for all. Once trading starts, a plan that fails doesn't stop the others; the run reports each and fails if any did.
+The health check watches the newest journal across plans, so a single stale plan is caught by its run's
+failure alert rather than by health.
+Whole-market plans are fine: the runner streams its history rather than loading it.
+
+On the server, `deploy/collector.sh paper-trade` does this when `PAPER_ARGS` isn't set in `.env`, and the
+paper timer submits it every weekday before the open.
 
 ## Paper trading
 

@@ -127,32 +127,53 @@ pub fn plan<S: Strategy>(
     date: NaiveDate,
     kill: Option<&str>,
 ) -> Plan {
-    let AccountState { mut portfolio, mut open_orders, session_start_equity } = account;
     events.sort_by_key(|e| e.available_at);
-    let as_of = events.iter().filter(|e| matches!(e.kind, EventKind::Bar(_))).map(|e| e.available_at).max();
-    let Some(as_of) = as_of else {
-        return Plan { equity: portfolio.equity(), ..Plan::default() };
-    };
+    plan_stream(events, strategy, risk, account, date, kill).expect("sorted events are in order")
+}
+
+/// As [`plan`], for events already in `available_at` order (e.g. streamed from disk), so history needn't
+/// fit in memory. Fails if the stream goes back in time.
+pub fn plan_stream<S: Strategy>(
+    events: impl IntoIterator<Item = Event>,
+    strategy: &mut S,
+    risk: &mut RiskManager,
+    account: AccountState,
+    date: NaiveDate,
+    kill: Option<&str>,
+) -> Result<Plan> {
+    let AccountState { mut portfolio, mut open_orders, session_start_equity } = account;
 
     // Events sharing a timestamp form a batch, as in the backtester: each goes to the strategy, then
-    // `after_batch` once.
-    let mut targets: BTreeMap<Symbol, Signal> = BTreeMap::new();
-    for (i, event) in events.iter().enumerate() {
-        risk.on_market_event(event);
+    // `after_batch` once. The latest signal per symbol is kept with its time; only those from the final bar
+    // batch onward count as current, which is known once the stream ends.
+    let mut latest: BTreeMap<Symbol, (Timestamp, Signal)> = BTreeMap::new();
+    let mut as_of: Option<Timestamp> = None;
+    let mut events = events.into_iter().peekable();
+    while let Some(event) = events.next() {
+        if let Some(next) = events.peek()
+            && next.available_at < event.available_at
+        {
+            bail!("events out of order: {} after {}", next.available_at, event.available_at);
+        }
+        risk.on_market_event(&event);
         if let EventKind::Bar(bar) = &event.kind {
             portfolio.mark(&bar.symbol, bar.close);
+            as_of = Some(event.available_at);
         }
         let ctx = StrategyContext { now: event.available_at, portfolio: &portfolio };
-        let mut signals = strategy.on_event(event, &ctx);
-        if events.get(i + 1).is_none_or(|next| next.available_at != event.available_at) {
+        let mut signals = strategy.on_event(&event, &ctx);
+        if events.peek().is_none_or(|next| next.available_at != event.available_at) {
             signals.extend(strategy.after_batch(&ctx));
         }
-        if event.available_at >= as_of {
-            for signal in signals {
-                targets.insert(signal.symbol.clone(), signal);
-            }
+        for signal in signals {
+            latest.insert(signal.symbol.clone(), (event.available_at, signal));
         }
     }
+    let Some(as_of) = as_of else {
+        return Ok(Plan { equity: portfolio.equity(), ..Plan::default() });
+    };
+    let targets: BTreeMap<Symbol, Signal> =
+        latest.into_iter().filter(|(_, (at, _))| *at >= as_of).map(|(s, (_, signal))| (s, signal)).collect();
 
     risk.start_session(session_start_equity);
     if let Some(reason) = kill {
@@ -181,7 +202,7 @@ pub fn plan<S: Strategy>(
             RiskDecision::Reject { signal, reason } => plan.rejections.push(Rejected { signal, reason }),
         }
     }
-    plan
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -352,6 +373,14 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_goes_back_in_time_is_refused() {
+        let mut events = bars("UP", 3, 100, 1);
+        events.swap(0, 2);
+        let err = plan_stream(events, &mut sma(), &mut risk(), state(Portfolio::new(dec!(1_000)), vec![], dec!(1_000)), today(), None);
+        assert!(err.is_err());
+    }
+
+    #[test]
     fn no_bars_means_no_plan() {
         let p = plan(vec![], &mut sma(), &mut risk(), state(Portfolio::new(dec!(1_000)), vec![], dec!(1_000)), today(), None);
         assert_eq!((p.as_of, p.orders.len()), (None, 0));
@@ -360,6 +389,7 @@ mod tests {
     #[test]
     fn broker_state_becomes_a_portfolio_and_pending_orders() {
         let account = Account {
+            id: "a1".into(),
             status: "ACTIVE".into(),
             currency: "USD".into(),
             cash: dec!(1_000),

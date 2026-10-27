@@ -1,8 +1,9 @@
-//! `stocktrader paper`: one pre-open run against the Alpaca paper account.
+//! Pre-open runs against Alpaca paper accounts: `stocktrader paper` for one strategy from flags, and the
+//! shared runner that `stocktrader plans paper` uses for each plan.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,13 +11,14 @@ use chrono::{Days, NaiveDate};
 use clap::Args;
 use rust_decimal::Decimal;
 use serde_json::json;
-use st_core::EventKind;
+use st_core::EventSource;
 use st_engine::exchange_date;
+use st_marketdata::{BarFilter, coverage};
 use st_paper::alpaca::Sessions;
 use st_paper::{AccountState, Journal, Outcome, PAPER_URL, TradingClient};
-use st_risk::RiskManager;
+use st_risk::{RiskLimits, RiskManager};
 
-use crate::{DataArgs, StrategyArgs, load, make_strategy};
+use crate::{DataArgs, Params, StrategyArgs, make_strategy, prepare, report_replay};
 
 #[derive(Args)]
 pub struct PaperArgs {
@@ -58,21 +60,91 @@ pub struct PaperArgs {
     trading_url: String,
 }
 
-pub fn run(args: &PaperArgs) -> Result<()> {
+/// One paper run's settings, from flags (`stocktrader paper`) or a plan file (`stocktrader plans paper`).
+pub(crate) struct Job {
+    /// Shown in output and the journal: the strategy, or the plan's name.
+    pub label: String,
+    pub params: Params,
+    pub weight: Decimal,
+    /// Where bars, attention and fundamentals come from; the run sets the dates.
+    pub data: DataArgs,
+    /// Applied to the risk limits after the data's defaults (a plan's universe filters and risk overrides).
+    pub limits: Box<dyn Fn(RiskLimits) -> RiskLimits>,
+    /// Symbols traded; empty means the whole market in the data.
+    pub symbols: Vec<String>,
+    /// Journal directory (`<dir>/journal/<date>.jsonl`).
+    pub live_dir: PathBuf,
+    /// Any of these existing blocks new exposure.
+    pub kill_files: Vec<PathBuf>,
+    pub history_days: u64,
+    pub max_orders: usize,
+}
+
+/// A trading client for the paper endpoint, with keys from `APCA_API_KEY_ID{suffix}` and
+/// `APCA_API_SECRET_KEY{suffix}`. Also returns the key ID, so callers can refuse two plans sharing an account.
+pub(crate) fn client_from_env(suffix: &str, trading_url: &str) -> Result<(TradingClient, String)> {
     let _ = dotenvy::dotenv();
-    let env = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    let key_id = env("APCA_API_KEY_ID").context("APCA_API_KEY_ID is not set")?;
-    let secret = env("APCA_API_SECRET_KEY").context("APCA_API_SECRET_KEY is not set")?;
+    let env = |key: String| std::env::var(&key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).with_context(|| format!("{key} is not set"));
+    let key_id = env(format!("APCA_API_KEY_ID{suffix}"))?;
+    let secret = env(format!("APCA_API_SECRET_KEY{suffix}"))?;
     let http = reqwest::Client::builder()
         .user_agent(concat!("stocktrader-paper/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()?;
-    let client = TradingClient::new(http, &args.trading_url, &key_id, &secret)?;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(run_with(args, &client))
+    Ok((TradingClient::new(http, trading_url, &key_id, &secret)?, key_id))
 }
 
-async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
+pub fn run(args: &PaperArgs) -> Result<()> {
+    let (client, _) = client_from_env("", &args.trading_url)?;
+    let params = args.strategy.params(args.attention.is_some(), args.fundamentals.is_some())?;
+    let job = Job {
+        label: params.to_string(),
+        params,
+        weight: args.strategy.weight,
+        data: DataArgs {
+            bars: None,
+            parquet: Some(args.marketdata_dir.join("bars_daily_all.parquet")),
+            raw: None,
+            start: None,
+            end: None,
+            symbols: args.symbols.clone(),
+            attention: args.attention.clone(),
+            fundamentals: args.fundamentals.clone(),
+            benchmark: "none".into(),
+            synthetic_symbols: 0,
+            synthetic_days: 0,
+            seed: 0,
+            cash: Decimal::ZERO,
+            slippage_bps: Decimal::ZERO,
+            min_price: args.min_price,
+            attention_until: None,
+        },
+        limits: Box::new(|limits| limits),
+        symbols: args.symbols.clone(),
+        live_dir: args.live_dir.clone(),
+        kill_files: vec![args.live_dir.join("KILL")],
+        history_days: args.history_days,
+        max_orders: args.max_orders,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(run_job(&job, &client, args.submit, args.allow_open))
+}
+
+/// The first existing kill file's reason. Fails closed: if a file's presence can't be determined, the run
+/// stops rather than trade.
+fn kill_reason(files: &[PathBuf]) -> Result<Option<String>> {
+    for file in files {
+        if file.try_exists().with_context(|| format!("checking for {}", file.display()))? {
+            let note = fs::read_to_string(file).unwrap_or_default();
+            let note = note.lines().next().unwrap_or("").trim().to_string();
+            let name = file.display();
+            return Ok(Some(if note.is_empty() { format!("KILL file present ({name})") } else { format!("KILL file: {note}") }));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn run_job(job: &Job, client: &TradingClient, submit: bool, allow_open: bool) -> Result<()> {
     let clock = client.clock().await?;
     let now_date = exchange_date(clock.timestamp.to_utc());
     let calendar = client.calendar(now_date - Days::new(14), now_date).await?;
@@ -81,18 +153,22 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
         return Ok(());
     };
     if clock.is_open {
-        if args.submit && !args.allow_open {
+        if submit && !allow_open {
             bail!("the market is open; orders would fill now rather than at the open. Pass --allow-open to submit anyway");
         }
         eprintln!("warning: the market is open, so market orders fill now rather than at the open");
     }
 
-    let params = args.strategy.params(args.attention.is_some(), args.fundamentals.is_some())?;
-    let mut data = data_args(args, previous - Days::new(args.history_days));
+    let mut data = job.data.clone();
+    data.start = Some(previous - Days::new(job.history_days));
     data.attention_until = Some(clock.timestamp.to_utc());
-    let loaded = load(&data)?;
-    check_freshness(&loaded.events, previous, &args.symbols)?;
-    let mut strategy = make_strategy(&params, args.strategy.weight, &loaded.limits)?;
+    if let Some(parquet) = &data.parquet {
+        check_freshness(parquet, &job.symbols, previous)?;
+    }
+    let mut prepared = prepare(&data)?;
+    prepared.limits = (job.limits)(prepared.limits);
+    let mut strategy = make_strategy(&job.params, job.weight, &prepared.limits)?;
+    let mut risk = RiskManager::new(prepared.limits.clone());
 
     let account = client.account().await?;
     st_paper::check_account(&account)?;
@@ -103,28 +179,22 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
         open_orders: st_paper::open_requests(&open)?,
         session_start_equity: account.last_equity,
     };
+    let kill = kill_reason(&job.kill_files)?;
+    let mut source = prepared.source;
+    let events = std::iter::from_fn(|| source.next_event());
+    let plan = st_paper::plan_stream(events, &mut strategy, &mut risk, state, today, kill.as_deref())?;
+    report_replay(&prepared.report)?;
 
-    let kill_file = args.live_dir.join("KILL");
-    // Fails closed: if the kill file's presence can't be determined, nothing is traded.
-    let kill_present = kill_file.try_exists().with_context(|| format!("checking for {}", kill_file.display()))?;
-    let kill = kill_present.then(|| {
-        let note = fs::read_to_string(&kill_file).unwrap_or_default();
-        let note = note.lines().next().unwrap_or("").trim();
-        if note.is_empty() { "KILL file present".to_string() } else { format!("KILL file: {note}") }
-    });
-    let mut risk = RiskManager::new(loaded.limits);
-    let plan = st_paper::plan(loaded.events, &mut strategy, &mut risk, state, today, kill.as_deref());
-
-    let journal = Journal::open(&args.live_dir, today)?;
-    let mode = if args.submit { "submit" } else { "dry-run" };
+    let journal = Journal::open(&job.live_dir, today)?;
+    let mode = if submit { "submit" } else { "dry-run" };
     journal.record(
         "plan",
-        json!({ "mode": mode, "strategy": params.to_string(), "symbols": args.symbols, "kill": kill,
-                "broker_equity": account.equity, "open_orders": open.len(), "plan": plan }),
+        json!({ "mode": mode, "strategy": job.params.to_string(), "label": job.label, "symbols": job.symbols,
+                "kill": kill, "broker_equity": account.equity, "open_orders": open.len(), "plan": plan }),
     )?;
 
     println!("session           {today} (bars through {previous})");
-    println!("strategy          {params}");
+    println!("strategy          {}", job.params);
     println!("equity            {:.2} (broker reports {:.2})", plan.equity, account.equity);
     println!("open orders       {}", open.len());
     if let Some(reason) = &kill {
@@ -147,10 +217,10 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
     }
     println!("journal           {}", journal.path().display());
 
-    if plan.orders.len() > args.max_orders {
-        bail!("the plan has {} orders, more than --max-orders {}; nothing submitted", plan.orders.len(), args.max_orders);
+    if plan.orders.len() > job.max_orders {
+        bail!("the plan has {} orders, more than the limit of {}; nothing submitted", plan.orders.len(), job.max_orders);
     }
-    if !args.submit {
+    if !submit {
         if !plan.orders.is_empty() {
             println!("dry run: pass --submit to send these orders");
         }
@@ -179,56 +249,25 @@ async fn run_with(args: &PaperArgs, client: &TradingClient) -> Result<()> {
     Ok(())
 }
 
-fn data_args(args: &PaperArgs, start: NaiveDate) -> DataArgs {
-    DataArgs {
-        bars: None,
-        parquet: Some(args.marketdata_dir.join("bars_daily_all.parquet")),
-        raw: None,
-        start: Some(start),
-        end: None,
-        symbols: args.symbols.clone(),
-        attention: args.attention.clone(),
-        fundamentals: args.fundamentals.clone(),
-        benchmark: "none".into(),
-        synthetic_symbols: 0,
-        synthetic_days: 0,
-        seed: 0,
-        cash: Decimal::ZERO,
-        slippage_bps: Decimal::ZERO,
-        min_price: args.min_price,
-        attention_until: None,
-    }
-}
-
-/// Orders are sized on the previous session's close, so that session's bars must be present. Symbols
-/// missing them are reported; the planner leaves those alone.
-fn check_freshness(events: &[st_core::Event], previous: NaiveDate, symbols: &[String]) -> Result<()> {
-    let latest = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::Bar(bar) => Some(exchange_date(bar.end)),
-            _ => None,
-        })
-        .max();
-    match latest {
+/// Orders are sized on the previous session's close, so the data must end with that session. Listed symbols
+/// without a bar for it are reported; the planner leaves those alone. Reads only the symbol and date columns.
+fn check_freshness(parquet: &Path, symbols: &[String], previous: NaiveDate) -> Result<()> {
+    let wanted: Option<HashSet<String>> =
+        (!symbols.is_empty()).then(|| symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect());
+    let recent = BarFilter { symbols: wanted.clone(), start: Some(previous - Days::new(14)), end: None };
+    match coverage(parquet, &recent)?.last {
         Some(d) if d == previous => {}
         Some(d) => bail!("market data ends {d} but the last session was {previous}; run `marketdata sync` first"),
-        None => bail!("no bars found for {}", symbols.join(",")),
+        None if symbols.is_empty() => bail!("no recent bars in {}", parquet.display()),
+        None => bail!("no recent bars for {}", symbols.join(",")),
     }
-    let fresh: BTreeSet<&str> = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::Bar(bar) if exchange_date(bar.end) == previous => Some(bar.symbol.as_str()),
-            _ => None,
-        })
-        .collect();
-    let stale: Vec<String> = symbols
-        .iter()
-        .map(|s| s.trim().to_ascii_uppercase())
-        .filter(|s| !fresh.contains(s.as_str()))
-        .collect();
-    if !stale.is_empty() {
-        eprintln!("warning: no {previous} bar for {}; not trading them today", stale.join(", "));
+    if let Some(wanted) = wanted {
+        let fresh = coverage(parquet, &BarFilter { start: Some(previous), end: Some(previous), ..recent })?.symbols;
+        let mut stale: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !fresh.contains(*s)).collect();
+        stale.sort_unstable();
+        if !stale.is_empty() {
+            eprintln!("warning: no {previous} bar for {}; not trading them today", stale.join(", "));
+        }
     }
     Ok(())
 }

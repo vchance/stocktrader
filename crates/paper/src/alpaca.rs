@@ -17,6 +17,9 @@ pub const PAPER_URL: &str = "https://paper-api.alpaca.markets";
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Account {
+    /// Alpaca's account ID: the same for every key pair of one account.
+    #[serde(default)]
+    pub id: String,
     pub status: String,
     pub currency: String,
     pub cash: Decimal,
