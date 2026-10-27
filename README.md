@@ -184,9 +184,14 @@ and the plan file itself. Light and dark themes follow the system setting.
 `mode = "paper"`, or for the plans named. Each plan trades its own Alpaca paper account, with keys
 `APCA_API_KEY_ID_<PLAN>` and `APCA_API_SECRET_KEY_<PLAN>` (the name in capitals, dashes as underscores:
 `APCA_API_KEY_ID_QUALITY_VALUE_CORE`). There is no fallback to the shared keys, and two plans with the same
-key are refused, since one account can't tell which plan owns a position. Each plan journals to
+key are refused, since one account can't tell which plan owns a position. So are two plans whose keys open
+the same account (checked by account ID before anything trades) and a plan using the shared `APCA_API_KEY_ID`.
+Setup problems stop the whole run before any plan trades: an invalid plan file (it might be a paper plan),
+a missing key, or a shared account. Each plan journals to
 `data/live/<plan>/journal/`; a `KILL` file in `data/live/<plan>/` pauses new exposure for that plan, one in
-`data/live/` for all. A plan that fails doesn't stop the others; the run reports each and fails if any did.
+`data/live/` for all. Once trading starts, a plan that fails doesn't stop the others; the run reports each and fails if any did.
+The health check watches the newest journal across plans, so a single stale plan is caught by its run's
+failure alert rather than by health.
 Whole-market plans are fine: the runner streams its history rather than loading it.
 
 On the server, `deploy/collector.sh paper-trade` does this when `PAPER_ARGS` isn't set in `.env`, and the
