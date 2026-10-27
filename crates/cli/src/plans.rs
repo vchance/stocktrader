@@ -284,10 +284,23 @@ impl Plan {
         }
         let limits = self.limits(RiskLimits::default());
         match &self.strategy {
-            StrategySpec::QualityValue { top_n } => check_top_n(*top_n, limits.max_position_weight)?,
+            StrategySpec::QualityValue { top_n } => {
+                check_top_n(*top_n, limits.max_position_weight)?;
+                if limits.max_gross_exposure < Decimal::ONE {
+                    bail!(
+                        "quality-value invests 1/top_n in each name, so it needs risk.max_gross_exposure of 1, \
+                         got {}",
+                        limits.max_gross_exposure
+                    );
+                }
+            }
             StrategySpec::Sma { weight, .. } | StrategySpec::AttentionSpike { weight, .. } => {
                 if *weight <= Decimal::ZERO || *weight > Decimal::ONE {
                     bail!("strategy.weight must be above 0 and at most 1");
+                }
+                // Above the cap, every entry would be clamped and every later signal rejected.
+                if *weight > limits.max_position_weight {
+                    bail!("strategy.weight {weight} is above risk.max_position {}", limits.max_position_weight);
                 }
             }
         }
@@ -440,6 +453,11 @@ pub fn run(args: &PlansArgs) -> Result<()> {
             // One window for all: the latest start and the earliest end any plan asks for.
             let start = run.start.or_else(|| plans.iter().filter_map(|(p, _)| p.backtest.start).max());
             let end = run.end.or_else(|| plans.iter().filter_map(|(p, _)| p.backtest.end).min());
+            if let (Some(s), Some(e)) = (start, end)
+                && s >= e
+            {
+                bail!("the plans' backtest windows don't overlap ({s} to {e}); pass --start and --end");
+            }
             let mut results = Vec::new();
             for (plan, _) in &plans {
                 eprintln!("running {}", plan.name);
@@ -519,6 +537,9 @@ mod tests {
         assert!(parse(&format!("{base}[backtest]\nstart = \"2020-01-01\"\n")).is_err(), "dates are TOML dates");
         let qv = "name = \"q\"\n[strategy]\nkind = \"quality-value\"\ntop_n = 12\n[risk]\nmax_position = 0.05\n";
         assert!(parse(qv).is_err(), "1/12 is above the 5% position cap");
+        assert!(parse(&format!("{base}weight = 0.2\n[risk]\nmax_position = 0.1\n")).is_err(), "weight above the cap");
+        let half = "name = \"q\"\n[strategy]\nkind = \"quality-value\"\n[risk]\nmax_gross_exposure = 0.5\n";
+        assert!(parse(half).is_err(), "quality-value can't fit 1/N weights under half exposure");
         assert!(parse("name = \"Bad Name\"\n[strategy]\nkind = \"quality-value\"\n").is_err());
     }
 

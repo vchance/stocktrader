@@ -90,7 +90,9 @@ for (const fig of document.querySelectorAll('figure[data-chart]')) {
     const r = svg.getBoundingClientRect(), px = (e.clientX - r.left) / r.width * vb.width;
     if (px < d.l || px > d.r) return hide();
     const t = d.x0 + (px - d.l) / (d.r - d.l) * (d.x1 - d.x0);
-    const first = d.series[0], i0 = nearest(first.x, t), sx = d.l + (first.x[i0] - d.x0) / (d.x1 - d.x0) * (d.r - d.l);
+    const first = d.series.find(s => s.x.length);
+    if (!first) return hide();
+    const i0 = nearest(first.x, t), sx = d.l + (first.x[i0] - d.x0) / (d.x1 - d.x0) * (d.r - d.l);
     cross.setAttribute('x1', sx); cross.setAttribute('x2', sx); cross.style.visibility = 'visible';
     tip.replaceChildren();
     const date = document.createElement('div');
@@ -202,7 +204,9 @@ fn line_chart(series: &[Series], fmt: Fmt, zero_top: bool) -> String {
     let mut lo = all().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let mut hi = all().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
     if zero_top {
+        // Drawdowns: 0 at the top, and at least a 1% range so a curve that never fell isn't centred on 0.
         hi = 0.0;
+        lo = lo.min(-0.01);
     }
     if (hi - lo).abs() < 1e-9 {
         (lo, hi) = (lo - 1.0, hi + 1.0);
@@ -298,7 +302,12 @@ fn monthly_table(curve: &[(Timestamp, Decimal)], start: Decimal) -> String {
     html.push_str("</tr></thead><tbody>");
     let years: Vec<i32> = returns.keys().map(|k| k.0).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let cell = |r: Option<f64>| match r {
-        Some(r) => format!("<td class=\"{}\">{:.1}%</td>", if r >= 0.0 { "pos" } else { "neg" }, r * 100.0),
+        Some(r) => {
+            // Shown to 0.1%, so anything that rounds to 0.0% is neither a gain nor a loss.
+            let shown = (r * 1000.0).round() / 10.0 + 0.0;
+            let class = if shown > 0.0 { "pos" } else if shown < 0.0 { "neg" } else { "" };
+            format!("<td class=\"{class}\">{shown:.1}%</td>")
+        }
         None => "<td></td>".into(),
     };
     for y in years {
@@ -333,7 +342,7 @@ fn metrics_table(rows: &[(String, &Metrics, Option<f64>)]) -> String {
             pct(m.total_return),
             pct(m.cagr),
             excess.map_or("-".into(), |e| format!("{:+.2}%", e * 100.0)),
-            pct(-m.max_drawdown.abs()),
+            pct(-m.max_drawdown.abs() + 0.0),
             m.sharpe,
             m.num_fills
         );
