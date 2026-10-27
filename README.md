@@ -8,7 +8,28 @@ Rust. The same strategy code runs in three modes: **backtest** (historical repla
 cargo test
 cargo run -p st-cli -- backtest                    # synthetic data, no API keys needed
 cargo run -p st-cli -- backtest --bars bars.csv    # symbol,date,open,high,low,close,volume
+cargo run --release -p st-cli -- backtest --parquet data/marketdata/bars_daily_all.parquet \
+    --start 2022-01-01 --symbols AAPL,MSFT,NVDA         # real data from `marketdata sync`
 ```
+
+## Market data
+
+`marketdata sync` (needs Alpaca keys) writes to `data/marketdata/`:
+
+| File | Contents |
+|---|---|
+| `assets/<date>-active.json`, `-inactive.json` | Raw Alpaca asset lists, kept daily: our record of listings and delistings |
+| `bars_daily_all.parquet` | Daily bars since 2016, split- and dividend-adjusted (use for returns) |
+| `bars_daily_raw.parquet` | The same bars as traded (use for price filters such as "above $5") |
+
+The universe is every US equity on NYSE, NASDAQ, ARCA, AMEX or BATS, active or delisted (OTC excluded).
+Each sync rewrites the full history, because adjusted prices change retroactively after every split or
+dividend; files are replaced atomically, so a failed sync leaves the previous ones intact. Requests are
+paced under the free plan's 200/minute; a full sync takes roughly 15–30 minutes. Symbols the API rejects
+are isolated and skipped rather than failing the run. `marketdata info <file>` summarizes a Parquet file.
+
+Known limits: a reused ticker maps to whichever company Alpaca associates with it, and backtests load all
+selected bars into memory (narrow with `--start/--end/--symbols`).
 
 ## Data collector
 
@@ -41,6 +62,8 @@ nano .env && deploy/collector.sh up    # add keys as plain KEY=value lines, then
 deploy/collector.sh status    # container state and which sources are enabled
 deploy/collector.sh logs      # follow logs
 deploy/collector.sh update    # git pull + rebuild + restart after a merge
+deploy/collector.sh sync-marketdata   # download universe + price history now (needs Alpaca keys)
+deploy/collector.sh install-timer     # run that nightly (Tue-Sat 03:00 New York) via a systemd user timer
 ```
 
 The archive lands in `~/stocktrader/data/raw/`, owned by the deploying user. Always go through the script:
@@ -107,7 +130,8 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 | Macro | FRED |
 
 ## Roadmap
-1. Alpaca historical-bars client and a local store (Parquet / DuckDB); universe builder with liquidity filter.
+1. ~~Alpaca daily bars, universe snapshots, Parquet store~~ (`marketdata`). Next: use raw prices for the
+   risk price filter, and stream bars from Parquet instead of loading them all.
 2. ~~Start archiving news and social feeds~~ (`collector`, running on `jabrony`). Next: compress old files.
 3. EDGAR fundamentals ingestion with point-in-time filing dates.
 4. Text pipeline: ticker extraction, dedupe, sentiment scoring (FinBERT via ONNX, or an LLM), mention velocity.
