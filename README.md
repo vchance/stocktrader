@@ -24,12 +24,21 @@ cargo run --release -p st-cli -- backtest --parquet data/marketdata/bars_daily_a
 
 The universe is every US equity on NYSE, NASDAQ, ARCA, AMEX or BATS, active or delisted (OTC excluded).
 Each sync rewrites the full history, because adjusted prices change retroactively after every split or
-dividend; files are replaced atomically, so a failed sync leaves the previous ones intact. Requests are
-paced under the free plan's 200/minute; a full sync takes roughly 15–30 minutes. Symbols the API rejects
-are isolated and skipped rather than failing the run. `marketdata info <file>` summarizes a Parquet file.
+dividend. Requests are paced under the free plan's 200/minute; a full sync takes roughly 30–60 minutes.
 
-Known limits: a reused ticker maps to whichever company Alpaca associates with it, and backtests load all
-selected bars into memory (narrow with `--start/--end/--symbols`).
+Safety: both files are staged and replace the previous pair together, only if both downloads finished,
+the newest bar is recent, and neither file lost more than 10% of its rows or symbols (`--force` overrides
+the size check). `manifest.json` records what the committed pair contains. A lock prevents concurrent
+syncs. Symbols the API rejects are isolated and skipped, up to `--max-rejected` (default 50) per file;
+beyond that the request itself is assumed wrong and the run aborts. `marketdata info <file>` summarizes a
+Parquet file.
+
+Known limits:
+- Delisted coverage is only as complete as Alpaca's inactive list and history, so some survivorship bias
+  remains; a reused ticker maps to whichever company Alpaca associates with it.
+- The backtest's `--min-price` filter (default $5) sees split-adjusted prices when given the adjusted file,
+  which understates pre-split prices and biases the universe; it warns, and `--min-price 0` disables it.
+- Backtests load all selected bars into memory; narrow with `--start/--end/--symbols`.
 
 ## Data collector
 
@@ -65,6 +74,10 @@ deploy/collector.sh update    # git pull + rebuild + restart after a merge
 deploy/collector.sh sync-marketdata   # download universe + price history now (needs Alpaca keys)
 deploy/collector.sh install-timer     # run that nightly (Tue-Sat 03:00 New York) via a systemd user timer
 ```
+
+Both services use one image (`vchance-stocktrader`). A sync rebuilds it from the current checkout, and
+the collector picks that build up on its next `up`/`update`. Timer runs log to the user journal:
+`journalctl --user -u stocktrader-marketdata`.
 
 The archive lands in `~/stocktrader/data/raw/`, owned by the deploying user. Always go through the script:
 plain `docker compose` commands refuse to run without the UID/GID it sets. The container is read-only apart
