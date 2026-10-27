@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use st_fundamentals::sync::facts_path;
 use st_fundamentals::tickers::latest_snapshot;
-use st_fundamentals::{FactFilter, Listing, market_symbol, parse_tickers, read_facts};
+use st_fundamentals::{Fact, FactFilter, Listing, market_symbol, parse_tickers, read_facts};
 use st_marketdata::Asset;
 use st_marketdata::universe::EXCHANGES;
 
@@ -34,6 +34,8 @@ struct Report {
     matched: usize,
     /// Of those, symbols whose company has filed an annual net income, if facts were read.
     with_income: Option<usize>,
+    /// Distinct companies behind `with_income` (share classes of one company count once).
+    companies_with_income: Option<usize>,
     /// Alpaca symbol and the SEC ticker it probably is, where they differ only in punctuation.
     format_mismatches: Vec<(String, String)>,
     /// Universe symbols with no SEC ticker, sorted. Mostly ETFs, funds and foreign listings, which file no
@@ -64,12 +66,14 @@ fn compare(assets: &[Asset], listings: &[Listing], income_ciks: Option<&HashSet<
     }
     let mut report = Report { universe: universe.len(), ..Report::default() };
     let mut with_income = 0;
+    let mut companies = HashSet::new();
     for symbol in universe {
         match by_symbol.get(symbol) {
             Some(cik) => {
                 report.matched += 1;
                 if income_ciks.is_some_and(|c| c.contains(cik)) {
                     with_income += 1;
+                    companies.insert(*cik);
                 }
             }
             None => match by_letters.get(&letters(symbol)) {
@@ -79,6 +83,7 @@ fn compare(assets: &[Asset], listings: &[Listing], income_ciks: Option<&HashSet<
         }
     }
     report.with_income = income_ciks.map(|_| with_income);
+    report.companies_with_income = income_ciks.map(|_| companies.len());
     report
 }
 
@@ -102,12 +107,19 @@ fn income_ciks(root: &Path) -> Result<Option<HashSet<u32>>> {
         return Ok(None);
     }
     let filter = FactFilter { concepts: Some(HashSet::from(["NetIncomeLoss".to_string()])), ..FactFilter::default() };
-    let ciks = read_facts(&path, &filter)?
-        .into_iter()
-        .filter(|f| f.unit == "USD" && f.start.is_some_and(|s| (350..=380).contains(&(f.end - s).num_days())))
+    Ok(Some(annual_income_ciks(&read_facts(&path, &filter)?)))
+}
+
+fn annual_income_ciks(facts: &[Fact]) -> HashSet<u32> {
+    facts
+        .iter()
+        .filter(|f| {
+            f.concept == "NetIncomeLoss"
+                && f.unit == "USD"
+                && f.start.is_some_and(|s| (350..=380).contains(&(f.end - s).num_days()))
+        })
         .map(|f| f.cik)
-        .collect();
-    Ok(Some(ciks))
+        .collect()
 }
 
 fn percent(part: usize, whole: usize) -> String {
@@ -128,7 +140,12 @@ pub fn run(args: &SymbolsArgs) -> Result<()> {
     println!("universe          {} active tradable US equities on {}", r.universe, EXCHANGES.join("/"));
     println!("in SEC ticker map {} ({})", r.matched, percent(r.matched, r.universe));
     match r.with_income {
-        Some(n) => println!("with annual NI    {} ({}): what quality-value can rank", n, percent(n, r.universe)),
+        Some(n) => println!(
+            "with annual NI    {} ({}), {} companies: the most quality-value could rank (it also needs assets and shares)",
+            n,
+            percent(n, r.universe),
+            r.companies_with_income.unwrap_or(0)
+        ),
         None => println!("with annual NI    - (no facts.parquet yet; run `fundamentals sync`)"),
     }
     println!("format mismatches {}", r.format_mismatches.len());
@@ -183,10 +200,45 @@ mod tests {
                 universe: 4,
                 matched: 2,
                 with_income: Some(1),
+                companies_with_income: Some(1),
                 format_mismatches: vec![("ABCW".into(), "ABC.W".into())],
                 unmatched: vec!["SPY".into()],
             }
         );
         assert_eq!(compare(&assets, &listings, None).with_income, None);
+
+        // Two share classes of one company: two symbols, one company.
+        let classes = vec![asset("GOOGL", "NASDAQ", true), asset("GOOG", "NASDAQ", true)];
+        let r = compare(&classes, &[listing(7, "GOOGL"), listing(7, "GOOG")], Some(&HashSet::from([7])));
+        assert_eq!((r.with_income, r.companies_with_income), (Some(2), Some(1)));
+    }
+
+    #[test]
+    fn only_fiscal_year_usd_net_income_counts() {
+        use chrono::NaiveDate;
+        let d = |m, day| NaiveDate::from_ymd_opt(2024, m, day).unwrap();
+        let fact = |cik, concept: &str, unit: &str, start| Fact {
+            cik,
+            taxonomy: "us-gaap".into(),
+            concept: concept.into(),
+            unit: unit.into(),
+            start,
+            end: d(12, 31),
+            value: 1.0,
+            fiscal_year: None,
+            fiscal_period: None,
+            form: "10-K".into(),
+            filed: d(12, 31),
+            accession: String::new(),
+            frame: None,
+        };
+        let facts = vec![
+            fact(1, "NetIncomeLoss", "USD", Some(d(1, 1))),
+            fact(2, "NetIncomeLoss", "USD", Some(d(10, 1))),
+            fact(3, "NetIncomeLoss", "EUR", Some(d(1, 1))),
+            fact(4, "NetIncomeLoss", "USD", None),
+            fact(5, "Assets", "USD", Some(d(1, 1))),
+        ];
+        assert_eq!(annual_income_ciks(&facts), HashSet::from([1]));
     }
 }

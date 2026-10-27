@@ -245,8 +245,10 @@ deploy/collector.sh housekeeping   # gzip day files older than yesterday, then `
   data but lost its keys shows DISABLED (if you retire a source on purpose, move its directory out of
   `data/raw` to stop the daily alert). The market data sync is stale after 3 days; a configured backup
   after 2 days. Once their timers are installed, scheduled jobs are checked too: a market data sync that
-  has never completed is MISSING, fundamentals are stale after 2 days without a new ticker snapshot, and
-  paper trading after 5 days without a journal entry (a Monday holiday makes Friday to Tuesday normal).
+  has never completed is MISSING, fundamentals are stale after 2 days without a new ticker snapshot and
+  `facts` after 7 days without a new facts file (the SEC normally publishes every weekday), and paper
+  trading after 5 days without a journal entry (a Monday holiday makes Friday to Tuesday normal). A timer
+  installed less than that long ago that hasn't produced anything yet shows as waiting, not MISSING.
 - **Dead-man's switch:** set `HEARTBEAT_URL` (e.g. a healthchecks.io check) and every hourly health run
   pings it, so you hear about it if the host or its timers stop entirely.
 - **Backups** go to `BACKUP_DEST` (any rsync destination; remote ones need key-based ssh). A local

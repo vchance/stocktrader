@@ -19,8 +19,8 @@
 #   deploy/collector.sh paper-trade      plan today's Alpaca paper-account orders with PAPER_ARGS from .env and
 #                                        print them; add --submit to send them (extra flags go to `stocktrader paper`)
 #   deploy/collector.sh install-paper-timer  paper-trade --submit each weekday before the open (systemd user timer)
-#   deploy/collector.sh check-symbols    how much of the Alpaca universe the SEC ticker map and fundamentals cover
 #                                        (the install-* commands given a DIR only write the units there)
+#   deploy/collector.sh check-symbols    how much of the Alpaca universe the SEC ticker map and fundamentals cover
 set -euo pipefail
 
 # Every `docker compose run` reads from /dev/null: run attaches stdin by default and would otherwise swallow
@@ -37,7 +37,12 @@ BACKUP_MAX_AGE_SECS=$((2 * 24 * 3600))
 # on weekdays, so a Monday holiday makes Friday to Tuesday the normal longest gap. (Market data freshness is
 # checked by `collector health` from its manifest.)
 FUNDAMENTALS_MAX_AGE_SECS=$((2 * 24 * 3600))
+# facts.parquet is only rewritten when the SEC publishes new data (normally every weekday), so a failing
+# facts download shows here even while the daily ticker snapshot keeps coming.
+FACTS_MAX_AGE_SECS=$((7 * 24 * 3600))
 PAPER_MAX_AGE_SECS=$((5 * 24 * 3600))
+# A newly installed market data timer gets this long for its first sync (Tue-Sat 03:00, up to 3h).
+MARKETDATA_FIRST_SYNC_SECS=$((4 * 24 * 3600))
 # File that must exist at the root of a local BACKUP_DEST.
 BACKUP_MARKER=.stocktrader-backup
 # Default cap on files one backup may delete (normally a few compacted .jsonl per night); more aborts the
@@ -233,9 +238,10 @@ health() {
     # `collector health` reports market data once a sync has completed; until then, only this can notice
     # that a scheduled sync never succeeds.
     if [[ ! -e data/marketdata/manifest.json ]]; then
-        jobs+=("$(job_status marketdata stocktrader-marketdata.timer data/marketdata/manifest.json 0)")
+        jobs+=("$(job_status marketdata stocktrader-marketdata.timer data/marketdata/manifest.json "$MARKETDATA_FIRST_SYNC_SECS")")
     fi
     jobs+=("$(job_status fundamentals stocktrader-fundamentals.timer 'data/fundamentals/tickers/*.json' "$FUNDAMENTALS_MAX_AGE_SECS")")
+    jobs+=("$(job_status facts stocktrader-fundamentals.timer data/fundamentals/facts.parquet "$FACTS_MAX_AGE_SECS")")
     jobs+=("$(job_status paper stocktrader-paper.timer 'data/live/journal/*.jsonl' "$PAPER_MAX_AGE_SECS")")
     for job_line in "${jobs[@]}"; do
         echo "$job_line"
@@ -249,28 +255,34 @@ health() {
     [[ -z "$problems" ]]
 }
 
-# Alerts when the set of problems changes (including recovery), and re-alerts an unchanged problem daily.
-# The new state is recorded only once the alert is delivered, so a failed send is retried next run.
-# One status-table line for a scheduled job: `-` until its timer is installed, then MISSING until it has
-# written PATTERN (a glob, matched here), STALE once the newest match is older than MAX_AGE seconds.
+# One status-table line for a scheduled job: `-` until its timer is installed (and while a newly installed
+# timer is younger than MAX_AGE seconds and nothing is written yet), then MISSING until it has written PATTERN
+# (a glob, matched here), and STALE once the newest match is older than MAX_AGE.
 job_status() {
-    local name="$1" unit="$2" pattern="$3" max_age="$4" newest age state
-    if [[ ! -e "$HOME/.config/systemd/user/$unit" ]]; then
+    local name="$1" unit="$2" pattern="$3" max_age="$4" newest age state mtime unit_file
+    unit_file="$HOME/.config/systemd/user/$unit"
+    if [[ ! -e "$unit_file" ]]; then
         printf '%-14s %-8s %s\n' "$name" "-" "not scheduled ($unit not installed)"
         return 0
     fi
     # shellcheck disable=SC2086 # the pattern is a glob
     newest="$(ls -t $pattern 2>/dev/null | head -n 1)"
-    if [[ -z "$newest" ]]; then
-        printf '%-14s %-8s %s\n' "$name" MISSING "nothing written yet ($pattern)"
+    if [[ -z "$newest" ]] || ! mtime="$(stat -c %Y "$newest" 2>/dev/null)"; then
+        if (($(date +%s) - $(stat -c %Y "$unit_file") <= max_age)); then
+            printf '%-14s %-8s %s\n' "$name" "-" "waiting for the first run ($unit installed recently)"
+        else
+            printf '%-14s %-8s %s\n' "$name" MISSING "nothing written yet ($pattern)"
+        fi
         return 0
     fi
-    age=$(($(date +%s) - $(stat -c %Y "$newest")))
+    age=$(($(date +%s) - mtime))
     state=ok
     ((age > max_age)) && state=STALE
     printf '%-14s %-8s %s\n' "$name" "$state" "last output $((age / 3600))h ago (limit $((max_age / 3600))h)"
 }
 
+# Alerts when the set of problems changes (including recovery), and re-alerts an unchanged problem daily.
+# The new state is recorded only once the alert is delivered, so a failed send is retried next run.
 alert_on_change() {
     local problems="$1" body="$2" state=data/.health-alert now last_time=0 last="" title
     now="$(date +%s)"
@@ -491,15 +503,18 @@ paper_trade() {
     else
         docker compose build paper >/dev/null || status=$?
     fi
-    local output="" report
+    local output="" report copy
     if ((status == 0)); then
-        output="$(docker compose run --rm --no-deps -T paper "${args[@]}" "$@" 2>&1 </dev/null)" || status=$?
-        printf '%s\n' "$output"
+        # Streamed (so a run killed by a timeout still leaves its output in the journal) and copied for the report.
+        copy="$(mktemp)"
+        docker compose run --rm --no-deps -T paper "${args[@]}" "$@" 2>&1 </dev/null | tee "$copy" || status=$?
+        output="$(cat "$copy")"
+        rm -f "$copy"
     fi
     [[ " ${args[*]} $* " == *" --submit "* ]] || return "$status"
     # Only the runner's own report lines go into alerts, never raw docker/compose output, which can quote
     # .env lines.
-    report="$(grep -E '^(session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:)' \
+    report="$(grep -E '^(session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:|Caused by:|    [0-9]+: )' \
         <<<"$output" || true)"
     if ((status != 0)); then
         local body="See: journalctl --user -u stocktrader-paper"
@@ -507,7 +522,7 @@ paper_trade() {
         notify "stocktrader on $(hostname): paper trading failed" "$body" || true
     elif ! grep -q 'nothing to do' <<<"$output"; then
         local sent
-        sent="$(grep -c '^submitted' <<<"$report" || true)"
+        sent="$(grep '^submitted' <<<"$report" | grep -vc 'already submitted' || true)"
         notify "stocktrader paper on $(hostname): ${sent} order(s) sent" "$report" || true
     fi
     return "$status"
