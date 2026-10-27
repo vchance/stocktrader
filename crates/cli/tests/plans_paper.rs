@@ -198,6 +198,12 @@ async fn two_keys_for_one_account_or_the_shared_keys_are_refused() {
     let out = run(dir.path(), &server, &with_shared, &["--submit"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("uses the shared APCA_API_KEY_ID account"));
+
+    // The same, with the shared key only in .env (the runner works from `dir`).
+    std::fs::write(dir.path().join(".env"), "APCA_API_KEY_ID=kb\nAPCA_API_SECRET_KEY=sb\n").unwrap();
+    let out = run(dir.path(), &server, &KEYS, &["--submit"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uses the shared APCA_API_KEY_ID account"));
     assert!(posted(&server).await.is_empty());
 }
 

@@ -600,7 +600,9 @@ fn paper(dir: &Path, names: &[String], run: &PaperRunArgs) -> Result<()> {
     }
     // Every plan needs its own account: two plans sharing one would trade against each other's positions.
     // Checked by key and then by the account each key opens (one account can have several key pairs), and
-    // against the shared keys used by `stocktrader paper`, all before anything trades.
+    // against the shared keys used by `stocktrader paper`, all before anything trades. `.env` is loaded first
+    // (it never overrides the environment) so a shared key kept only there is seen too.
+    let _ = dotenvy::dotenv();
     let shared_key = std::env::var("APCA_API_KEY_ID").ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let mut clients = Vec::new();
     let mut by_key: HashMap<String, &str> = HashMap::new();
