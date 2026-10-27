@@ -118,6 +118,7 @@ mod tests {
             low: open - dec!(1),
             close: open,
             volume: dec!(1000),
+            traded_close: None,
         })
     }
 

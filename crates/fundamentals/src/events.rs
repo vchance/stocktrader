@@ -30,8 +30,9 @@ pub fn market_symbol(sec_ticker: &str) -> Symbol {
 /// (CIK to SEC ticker). The metric name is `taxonomy:concept:unit`, e.g. `us-gaap:Revenues:USD`.
 ///
 /// Facts that would produce the same event key (symbol, metric, period, availability) with different
-/// values, such as a 10-K and its amendment filed the same day, keep the one from the later accession
-/// number; within one accession (e.g. per-class share counts of a multi-class issuer) the largest value is
+/// values, such as a 10-K and its amendment filed the same day, prefer an amendment form (`/A`), then the
+/// later accession number (accession numbers are only ordered within one filer agent, hence the form
+/// first); within one accession (e.g. per-class share counts of a multi-class issuer) the largest value is
 /// kept. Facts whose value doesn't fit a `Decimal` are dropped.
 ///
 /// `tickers` is a single snapshot of the SEC's *current* mapping. Applied to history it attributes a
@@ -40,19 +41,19 @@ pub fn market_symbol(sec_ticker: &str) -> Symbol {
 /// Use dated snapshots (`tickers/<date>.json`) to resolve symbols as of each fact once enough exist.
 pub fn to_events(facts: &[Fact], tickers: &HashMap<u32, String>) -> Vec<Event> {
     type Key = (Timestamp, Symbol, String, Option<NaiveDate>, NaiveDate);
-    let mut chosen: BTreeMap<Key, (&str, Decimal)> = BTreeMap::new();
+    let mut chosen: BTreeMap<Key, (bool, &str, Decimal)> = BTreeMap::new();
     for f in facts {
         let (Some(ticker), Some(value)) = (tickers.get(&f.cik), Decimal::from_f64(f.value)) else {
             continue;
         };
         let metric = format!("{}:{}:{}", f.taxonomy, f.concept, f.unit);
         let key = (available_at(f.filed), market_symbol(ticker), metric, f.start, f.end);
-        let candidate = (f.accession.as_str(), value);
+        let candidate = (f.form.ends_with("/A"), f.accession.as_str(), value);
         chosen.entry(key).and_modify(|best| *best = (*best).max(candidate)).or_insert(candidate);
     }
     chosen
         .into_iter()
-        .map(|((available_at, symbol, metric, period_start, period_end), (_, value))| Event {
+        .map(|((available_at, symbol, metric, period_start, period_end), (_, _, value))| Event {
             available_at,
             kind: EventKind::Fundamental(FundamentalRecord { symbol, period_start, period_end, metric, value }),
         })
@@ -107,6 +108,25 @@ mod tests {
             let EventKind::Fundamental(r) = &events[0].kind else { panic!("expected a fundamental event") };
             assert_eq!(r.value, Decimal::ONE, "later accession wins regardless of input order");
             assert_eq!(r.symbol.as_str(), "BRK.B");
+        }
+    }
+
+    #[test]
+    fn amendment_wins_even_from_an_earlier_sorting_filer_agent() {
+        let mut original = parse_company(apple().as_bytes()).unwrap().facts.remove(0);
+        original.accession = "0000320193-24-000100".into();
+        // Filed through an agent whose ID sorts before the company's own.
+        let amended = Fact {
+            accession: "0000000001-24-000001".into(),
+            form: "10-K/A".into(),
+            value: 2.0,
+            ..original.clone()
+        };
+        let tickers = HashMap::from([(320193, "AAPL".to_string())]);
+        for facts in [vec![original.clone(), amended.clone()], vec![amended, original]] {
+            let events = to_events(&facts, &tickers);
+            let EventKind::Fundamental(r) = &events[0].kind else { panic!("expected a fundamental event") };
+            assert_eq!(r.value, Decimal::TWO);
         }
     }
 }

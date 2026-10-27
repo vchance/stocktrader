@@ -54,11 +54,28 @@ pub struct Backtest<E, S, B> {
     risk: RiskManager,
     portfolio: Portfolio,
     clock: SimClock,
+    trade_from: Option<Timestamp>,
 }
 
 impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
     pub fn new(source: E, strategy: S, broker: B, risk: RiskManager, initial_cash: Decimal) -> Self {
-        Self { source, strategy, broker, risk, portfolio: Portfolio::new(initial_cash), clock: SimClock::new() }
+        Self {
+            source,
+            strategy,
+            broker,
+            risk,
+            portfolio: Portfolio::new(initial_cash),
+            clock: SimClock::new(),
+            trade_from: None,
+        }
+    }
+
+    /// Warm-up: events before `t` still reach the strategy and risk manager (so moving averages, liquidity
+    /// windows and the like are ready), but their signals are discarded and no equity is recorded. Trading
+    /// and the reported results start at `t`.
+    pub fn trade_from(mut self, t: Timestamp) -> Self {
+        self.trade_from = Some(t);
+        self
     }
 
     pub fn run(mut self) -> Result<BacktestReport, BacktestError> {
@@ -102,6 +119,9 @@ impl<E: EventSource, S: Strategy, B: ExecutionAdapter> Backtest<E, S, B> {
             }
 
             let signals = self.collect_signals(&batch, now);
+            if self.trade_from.is_some_and(|t| now < t) {
+                continue;
+            }
             for signal in signals {
                 let open = self.broker.open_orders();
                 match self.risk.check(signal, &self.portfolio, &open) {

@@ -1,14 +1,17 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, TimeDelta};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
-use st_core::{Event, Strategy};
+use rust_decimal::prelude::FromPrimitive;
+use st_core::{Bar, Event, Strategy, Timestamp};
 use st_data::{SyntheticConfig, VecEventSource, generate_daily_bars, load_daily_bars};
-use st_engine::{Backtest, FillModel, SimulatedBroker};
-use st_marketdata::{BarFilter, read_bars, to_core_bar};
+use st_engine::metrics::{self, buy_and_hold, correlation};
+use st_engine::{Backtest, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
+use st_marketdata::{BarFilter, DailyBar, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, SmaCrossover};
 use tracing_subscriber::EnvFilter;
@@ -22,12 +25,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the SMA crossover strategy over Parquet, CSV or synthetic daily bars.
-    Backtest(BacktestArgs),
+    /// Run one strategy with fixed parameters over Parquet, CSV or synthetic daily bars.
+    Backtest {
+        #[command(flatten)]
+        data: DataArgs,
+        #[command(flatten)]
+        strategy: StrategyArgs,
+    },
+    /// Choose parameters on rolling training windows and report results only on the unseen test window
+    /// after each: the honest estimate of a strategy-plus-tuning process.
+    WalkForward {
+        #[command(flatten)]
+        data: DataArgs,
+        #[arg(long, value_enum, default_value_t = StrategyName::Sma)]
+        strategy: StrategyName,
+        /// Target weight per position when long.
+        #[arg(long, default_value = "0.05")]
+        weight: Decimal,
+        /// Attention spike: minimum mentions (the grid varies ratio and hold).
+        #[arg(long, default_value_t = 50)]
+        spike_min_mentions: u32,
+        #[arg(long, default_value_t = 365)]
+        train_days: i64,
+        #[arg(long, default_value_t = 91)]
+        test_days: i64,
+        /// History replayed before each window without trading, so indicators are warm. The default covers
+        /// the slowest grid window (200 sessions) plus the 20-session liquidity lookback.
+        #[arg(long, default_value_t = 330)]
+        warmup_days: i64,
+    },
 }
 
 #[derive(Args)]
-struct BacktestArgs {
+struct DataArgs {
     /// CSV of daily bars with header symbol,date,open,high,low,close,volume.
     #[arg(long, conflicts_with = "parquet")]
     bars: Option<PathBuf>,
@@ -35,6 +65,9 @@ struct BacktestArgs {
     /// is held in memory, so narrow large files with --start/--end/--symbols.
     #[arg(long)]
     parquet: Option<PathBuf>,
+    /// As-traded bars for the price-level filter. Defaults to bars_daily_raw.parquet beside --parquet.
+    #[arg(long, requires = "parquet")]
+    raw: Option<PathBuf>,
     /// First session date to load (Parquet only).
     #[arg(long, requires = "parquet")]
     start: Option<NaiveDate>,
@@ -44,6 +77,12 @@ struct BacktestArgs {
     /// Comma-separated symbols to load (Parquet only).
     #[arg(long, requires = "parquet", value_delimiter = ',')]
     symbols: Vec<String>,
+    /// Attention table from `signals apewisdom` (data/signals/apewisdom.parquet), merged into the replay.
+    #[arg(long)]
+    attention: Option<PathBuf>,
+    /// Buy-and-hold comparison symbol, or `none`.
+    #[arg(long, default_value = "SPY")]
+    benchmark: String,
     /// Used when neither --bars nor --parquet is given.
     #[arg(long, default_value_t = 50)]
     synthetic_symbols: usize,
@@ -53,6 +92,15 @@ struct BacktestArgs {
     seed: u64,
     #[arg(long, default_value = "100000")]
     cash: Decimal,
+    #[arg(long, default_value = "5")]
+    slippage_bps: Decimal,
+    /// Risk filter: skip entries whose as-traded price is below this; 0 disables.
+    #[arg(long, default_value = "5")]
+    min_price: Decimal,
+}
+
+#[derive(Args)]
+struct StrategyArgs {
     #[arg(long, value_enum, default_value_t = StrategyName::Sma)]
     strategy: StrategyName,
     /// SMA crossover: fast window.
@@ -61,9 +109,6 @@ struct BacktestArgs {
     /// SMA crossover: slow window.
     #[arg(long, default_value_t = 50)]
     slow: usize,
-    /// Attention table from `signals apewisdom` (data/signals/apewisdom.parquet), merged into the replay.
-    #[arg(long)]
-    attention: Option<PathBuf>,
     /// Attention spike: minimum mentions in the last 24h.
     #[arg(long, default_value_t = 50)]
     spike_min_mentions: u32,
@@ -76,12 +121,6 @@ struct BacktestArgs {
     /// Target weight per position when long.
     #[arg(long, default_value = "0.05")]
     weight: Decimal,
-    #[arg(long, default_value = "5")]
-    slippage_bps: Decimal,
-    /// Risk filter: skip entries below this price. On split-adjusted data this sees adjusted, not traded,
-    /// prices; set 0 to disable.
-    #[arg(long, default_value = "5")]
-    min_price: Decimal,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -92,51 +131,251 @@ enum StrategyName {
     AttentionSpike,
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
-    match Cli::parse().command {
-        Command::Backtest(args) => backtest(args),
+/// One point in a strategy's parameter space.
+#[derive(Clone, Debug, PartialEq)]
+enum Params {
+    Sma { fast: usize, slow: usize },
+    Spike { min_mentions: u32, ratio: f64, hold_days: u32 },
+}
+
+impl fmt::Display for Params {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Params::Sma { fast, slow } => write!(f, "sma {fast}/{slow}"),
+            Params::Spike { min_mentions, ratio, hold_days } => {
+                write!(f, "spike >={min_mentions} x{ratio} {hold_days}d")
+            }
+        }
     }
 }
 
-fn backtest(args: BacktestArgs) -> Result<()> {
-    let bars = match (&args.bars, &args.parquet) {
-        (Some(path), _) => load_daily_bars(path)?,
-        (None, Some(path)) => {
-            let filter = BarFilter {
-                symbols: (!args.symbols.is_empty())
-                    .then(|| args.symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect()),
-                start: args.start,
-                end: args.end,
-            };
-            if args.min_price > Decimal::ZERO && !path.to_string_lossy().contains("_raw") {
-                eprintln!(
-                    "warning: --min-price {} is applied to adjusted prices, which understate pre-split prices; \
-                     the universe will be biased (use --min-price 0, or the raw file)",
-                    args.min_price
-                );
-            }
-            let raw = read_bars(path, &filter)?;
-            let bars: Vec<_> = raw.iter().filter_map(to_core_bar).collect();
-            if bars.len() < raw.len() {
-                eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
-            }
-            if let Some(wanted) = &filter.symbols {
-                let found: HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
-                let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
-                if !missing.is_empty() {
-                    eprintln!("no bars for: {}", missing.join(", "));
-                }
-            }
-            bars
+fn make_strategy(params: &Params, weight: Decimal) -> Result<Box<dyn Strategy>> {
+    Ok(match *params {
+        Params::Sma { fast, slow } => Box::new(SmaCrossover::new(fast, slow, weight).map_err(anyhow::Error::msg)?),
+        Params::Spike { min_mentions, ratio, hold_days } => {
+            Box::new(AttentionSpike::new(min_mentions, ratio, hold_days, weight).map_err(anyhow::Error::msg)?)
         }
-        (None, None) => generate_daily_bars(&SyntheticConfig {
-            symbols: args.synthetic_symbols,
-            days: args.synthetic_days,
-            start: NaiveDate::from_ymd_opt(2023, 1, 3).expect("valid date"),
-            seed: args.seed,
-        }),
+    })
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    match Cli::parse().command {
+        Command::Backtest { data, strategy } => backtest(&data, &strategy),
+        Command::WalkForward { data, strategy, weight, spike_min_mentions, train_days, test_days, warmup_days } => {
+            let grid: Vec<Params> = match strategy {
+                StrategyName::Sma => [(5, 20), (10, 30), (10, 50), (20, 50), (20, 100), (50, 200)]
+                    .into_iter()
+                    .map(|(fast, slow)| Params::Sma { fast, slow })
+                    .collect(),
+                StrategyName::AttentionSpike => {
+                    require_attention(&data)?;
+                    let mut grid = Vec::new();
+                    for ratio in [2.0, 3.0, 5.0] {
+                        for hold_days in [3, 5, 10] {
+                            grid.push(Params::Spike { min_mentions: spike_min_mentions, ratio, hold_days });
+                        }
+                    }
+                    grid
+                }
+            };
+            let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), TimeDelta::days(warmup_days));
+            walk(&data, &grid, weight, windows)
+        }
+    }
+}
+
+fn require_attention(data: &DataArgs) -> Result<()> {
+    if data.attention.is_none() {
+        bail!("attention-spike needs --attention data/signals/apewisdom.parquet");
+    }
+    Ok(())
+}
+
+struct Loaded {
+    events: Vec<Event>,
+    bars: usize,
+    /// Buy-and-hold comparison bars, if the benchmark symbol was found.
+    benchmark: Option<Vec<Bar>>,
+    /// Risk limits for this data: strict about traded prices when a raw file supplied them.
+    limits: RiskLimits,
+}
+
+fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
+    let params = match args.strategy {
+        StrategyName::Sma => Params::Sma { fast: args.fast, slow: args.slow },
+        StrategyName::AttentionSpike => {
+            require_attention(data)?;
+            Params::Spike { min_mentions: args.spike_min_mentions, ratio: args.spike_ratio, hold_days: args.spike_hold_days }
+        }
     };
+    let strategy = make_strategy(&params, args.weight)?;
+    let loaded = load(data)?;
+    let report = Backtest::new(
+        VecEventSource::new(loaded.events),
+        strategy,
+        SimulatedBroker::new(fill_model(data)),
+        RiskManager::new(loaded.limits),
+        data.cash,
+    )
+    .run()?;
+
+    println!("strategy          {params}");
+    println!("bars replayed     {}", loaded.bars);
+    print_metrics("", &report.metrics);
+    println!("fills             {}", report.metrics.num_fills);
+    println!("commissions       {:.2}", report.metrics.commissions);
+    println!("rejected signals  {}", report.rejections.len());
+    println!("open positions    {}", report.final_portfolio.positions().count());
+
+    if let Some(bench) = &loaded.benchmark {
+        let refs: Vec<&Bar> = bench.iter().collect();
+        let curve = buy_and_hold(&refs, data.cash);
+        let m = metrics::compute(&curve, &[]);
+        warn_on_span(&report.equity_curve, &curve);
+        println!();
+        println!("benchmark: {} buy & hold, 100% invested", data.benchmark.to_ascii_uppercase());
+        print_metrics("  ", &m);
+        println!("excess CAGR       {:>7.2}%", (report.metrics.cagr - m.cagr) * 100.0);
+        if let Some(c) = correlation(&report.equity_curve, &curve) {
+            println!("daily correlation {c:>7.2}");
+        }
+    }
+    Ok(())
+}
+
+fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup): (TimeDelta, TimeDelta, TimeDelta)) -> Result<()> {
+    // Validate every candidate once, so a bad grid fails before hours of backtests.
+    for p in grid {
+        make_strategy(p, weight)?;
+    }
+    // A candidate that can't warm up never trades, scores Sharpe 0, and so beats every losing candidate.
+    let needed_sessions = grid
+        .iter()
+        .map(|p| match p {
+            Params::Sma { slow, .. } => *slow,
+            Params::Spike { .. } => 0,
+        })
+        .max()
+        .unwrap_or(0)
+        + RiskLimits::default().liquidity_lookback;
+    let warmup_sessions = warmup.num_days() * 252 / 365;
+    if (warmup_sessions as usize) < needed_sessions {
+        bail!(
+            "--warmup-days {} gives about {warmup_sessions} sessions, but the grid needs {needed_sessions} \
+             (slowest window plus the liquidity lookback); raise --warmup-days",
+            warmup.num_days()
+        );
+    }
+    let loaded = load(data)?;
+    let cfg = WalkForwardConfig {
+        train,
+        test,
+        warmup,
+        initial_cash: data.cash,
+        fill: fill_model(data),
+        limits: loaded.limits.clone(),
+    };
+    let report = walk_forward(&loaded.events, &cfg, grid, |p| make_strategy(p, weight).expect("validated above"))?;
+    if report.folds.is_empty() {
+        bail!("not enough data for one fold: need warm-up + training + some test period");
+    }
+
+    println!("{:<12} {:<12} {:<22} {:>9} {:>9} {:>9} {:>7}", "test from", "test to", "chosen", "train ret", "test ret", "test DD", "fills");
+    for f in &report.folds {
+        // A window with no bars returns 0% only because nothing happened; say so instead.
+        let test_ret = if f.test.start_equity.is_zero() {
+            "no data".to_string()
+        } else {
+            format!("{:.2}%", f.test.total_return * 100.0)
+        };
+        println!(
+            "{:<12} {:<12} {:<22} {:>8.2}% {:>9} {:>8.2}% {:>7}",
+            f.test_start.date_naive(),
+            f.test_end.date_naive(),
+            f.chosen.to_string(),
+            f.train.total_return * 100.0,
+            test_ret,
+            f.test.max_drawdown * 100.0,
+            f.test.num_fills
+        );
+    }
+    println!();
+    println!("out-of-sample return {:>7.2}%", report.out_of_sample_return * 100.0);
+    println!("out-of-sample CAGR   {:>7.2}%", report.out_of_sample_cagr * 100.0);
+    println!("(each test window starts flat from {} and ends with positions open, unliquidated)", data.cash);
+
+    if let Some(bench) = &loaded.benchmark {
+        let (from, to) = (report.folds[0].test_start, report.folds[report.folds.len() - 1].test_end);
+        let refs: Vec<&Bar> = bench.iter().filter(|b| b.end >= from && b.end < to).collect();
+        let m = metrics::compute(&buy_and_hold(&refs, data.cash), &[]);
+        println!(
+            "{} buy & hold CAGR   {:>7.2}% (same test span, 100% invested)",
+            data.benchmark.to_ascii_uppercase(),
+            m.cagr * 100.0
+        );
+    }
+    Ok(())
+}
+
+/// Excess CAGR only means something if both curves cover the same period.
+fn warn_on_span(strategy: &[(Timestamp, Decimal)], benchmark: &[(Timestamp, Decimal)]) {
+    let span = |c: &[(Timestamp, Decimal)]| c.first().zip(c.last()).map(|(a, b)| (a.0.date_naive(), b.0.date_naive()));
+    if let (Some((s0, s1)), Some((b0, b1))) = (span(strategy), span(benchmark))
+        && ((s0 - b0).num_days().abs() > 3 || (s1 - b1).num_days().abs() > 3)
+    {
+        eprintln!("warning: strategy covers {s0}..{s1} but the benchmark covers {b0}..{b1}; excess CAGR compares different periods");
+    }
+}
+
+fn print_metrics(prefix: &str, m: &Metrics) {
+    println!("{prefix}start equity      {:.2}", m.start_equity);
+    println!("{prefix}end equity        {:.2}", m.end_equity);
+    println!("{prefix}total return      {:>7.2}%", m.total_return * 100.0);
+    println!("{prefix}CAGR              {:>7.2}%", m.cagr * 100.0);
+    println!("{prefix}max drawdown      {:>7.2}%", m.max_drawdown * 100.0);
+    println!("{prefix}Sharpe            {:>7.2}", m.sharpe);
+}
+
+fn fill_model(data: &DataArgs) -> FillModel {
+    FillModel { slippage_bps: data.slippage_bps, ..FillModel::default() }
+}
+
+/// `bars_daily_all.parquet` -> `bars_daily_raw.parquet` in the same directory.
+fn raw_sibling(adjusted: &Path) -> Option<PathBuf> {
+    let name = adjusted.file_name()?.to_str()?;
+    name.contains("_all").then(|| adjusted.with_file_name(name.replacen("_all", "_raw", 1)))
+}
+
+fn load(data: &DataArgs) -> Result<Loaded> {
+    let benchmark_symbol = (!data.benchmark.eq_ignore_ascii_case("none")).then(|| data.benchmark.to_ascii_uppercase());
+    let (bars, benchmark, traded_prices) = match (&data.bars, &data.parquet) {
+        (Some(path), _) => {
+            let bars = load_daily_bars(path)?;
+            let bench = benchmark_symbol.as_ref().map(|s| bars.iter().filter(|b| b.symbol.as_str() == s).cloned().collect());
+            (bars, bench, false)
+        }
+        (None, Some(path)) => load_parquet(data, path, benchmark_symbol.as_deref())?,
+        (None, None) => {
+            let bars = generate_daily_bars(&SyntheticConfig {
+                symbols: data.synthetic_symbols,
+                days: data.synthetic_days,
+                start: NaiveDate::from_ymd_opt(2023, 1, 3).expect("valid date"),
+                seed: data.seed,
+            });
+            let bench = benchmark_symbol.as_ref().map(|s| bars.iter().filter(|b| b.symbol.as_str() == s).cloned().collect());
+            (bars, bench, false)
+        }
+    };
+    let benchmark = match (benchmark, &benchmark_symbol) {
+        (Some(b), _) if !b.is_empty() => Some(b),
+        (_, Some(symbol)) => {
+            eprintln!("benchmark {symbol}: no bars in this data (pass --benchmark none or a symbol that is present)");
+            None
+        }
+        _ => None,
+    };
+
     let n_bars = bars.len();
     // Attention only matters for symbols we have prices for, within the replayed period; anything else
     // would cost memory and stretch the metrics' time span.
@@ -144,59 +383,114 @@ fn backtest(args: BacktestArgs) -> Result<()> {
     let first_bar = bars.iter().map(|b| b.start).min();
     let last_bar = bars.iter().map(|b| b.end).max();
     let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
-    if let Some(path) = &args.attention {
+    if let Some(path) = &data.attention {
         let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to: last_bar };
         let rows = st_signals::read_rows(path, &filter)?;
         println!("attention events  {}", rows.len());
-        let first_attention = rows.iter().map(|r| r.observed_at).min();
-        match (first_bar, first_attention) {
-            (_, None) => eprintln!("warning: no attention data for these symbols and dates"),
-            (Some(bar), Some(att)) if att - bar > chrono::TimeDelta::days(30) => eprintln!(
-                "warning: attention data starts {} but prices start {}; metrics cover the whole price \
-                 period, so consider --start {}",
-                att.date_naive(),
-                bar.date_naive(),
-                att.date_naive()
-            ),
-            _ => {}
-        }
+        warn_on_coverage(first_bar, rows.iter().map(|r| r.observed_at).min());
         events.extend(st_signals::to_events(&rows));
     }
-    let source = VecEventSource::new(events);
+    let limits = RiskLimits { min_price: data.min_price, require_traded_price: traded_prices, ..RiskLimits::default() };
+    Ok(Loaded { events, bars: n_bars, benchmark, limits })
+}
 
-    let strategy: Box<dyn Strategy> = match args.strategy {
-        StrategyName::Sma => Box::new(SmaCrossover::new(args.fast, args.slow, args.weight).map_err(anyhow::Error::msg)?),
-        StrategyName::AttentionSpike => {
-            if args.attention.is_none() {
-                bail!("--strategy attention-spike needs --attention data/signals/apewisdom.parquet");
+fn warn_on_coverage(first_bar: Option<Timestamp>, first_attention: Option<Timestamp>) {
+    match (first_bar, first_attention) {
+        (_, None) => eprintln!("warning: no attention data for these symbols and dates"),
+        (Some(bar), Some(att)) if att - bar > TimeDelta::days(30) => eprintln!(
+            "warning: attention data starts {} but prices start {}; metrics cover the whole price period, \
+             so consider --start {}",
+            att.date_naive(),
+            bar.date_naive(),
+            att.date_naive()
+        ),
+        _ => {}
+    }
+}
+
+/// Adjusted bars for the replay, each carrying its as-traded close from the raw file when available, the
+/// benchmark's bars (read separately, so `--symbols` needn't include it), and whether traded prices are in
+/// use.
+fn load_parquet(
+    data: &DataArgs,
+    path: &Path,
+    benchmark: Option<&str>,
+) -> Result<(Vec<Bar>, Option<Vec<Bar>>, bool)> {
+    let symbols = (!data.symbols.is_empty()).then(|| data.symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect());
+    let filter = BarFilter { symbols, start: data.start, end: data.end };
+    let raw_path = match &data.raw {
+        Some(raw) if !raw.exists() => bail!("--raw {} does not exist", raw.display()),
+        Some(raw) => Some(raw.clone()),
+        None => raw_sibling(path).filter(|p| p.exists()),
+    };
+    let traded: HashMap<(String, NaiveDate), Decimal> = match &raw_path {
+        Some(raw) => read_bars(raw, &filter)?
+            .into_iter()
+            .filter_map(|b| Some(((b.symbol, b.date), Decimal::from_f64(b.close)?.round_dp(6))))
+            .collect(),
+        None => {
+            if data.min_price > Decimal::ZERO {
+                eprintln!(
+                    "warning: no raw bars found beside {}; --min-price {} will see split-adjusted prices, which \
+                     understate pre-split prices and bias the universe (pass --raw, or --min-price 0)",
+                    path.display(),
+                    data.min_price
+                );
             }
-            Box::new(
-                AttentionSpike::new(args.spike_min_mentions, args.spike_ratio, args.spike_hold_days, args.weight)
-                    .map_err(anyhow::Error::msg)?,
-            )
+            HashMap::new()
         }
     };
+    let to_bar = |b: &DailyBar| {
+        to_core_bar(b).map(|mut bar| {
+            bar.traded_close = traded.get(&(b.symbol.clone(), b.date)).copied();
+            bar
+        })
+    };
 
-    let report = Backtest::new(
-        source,
-        strategy,
-        SimulatedBroker::new(FillModel { slippage_bps: args.slippage_bps, ..FillModel::default() }),
-        RiskManager::new(RiskLimits { min_price: args.min_price, ..RiskLimits::default() }),
-        args.cash,
-    )
-    .run()?;
+    let raw = read_bars(path, &filter)?;
+    let bars: Vec<Bar> = raw.iter().filter_map(to_bar).collect();
+    if bars.len() < raw.len() {
+        eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
+    }
+    if raw_path.is_some() {
+        report_traded_coverage(&bars);
+    }
+    if let Some(wanted) = &filter.symbols {
+        let found: HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
+        let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
+        if !missing.is_empty() {
+            eprintln!("no bars for: {}", missing.join(", "));
+        }
+    }
+    let bench = match benchmark {
+        Some(symbol) => {
+            let filter = BarFilter { symbols: Some(HashSet::from([symbol.to_string()])), ..filter.clone() };
+            Some(read_bars(path, &filter)?.iter().filter_map(to_core_bar).collect())
+        }
+        None => None,
+    };
+    Ok((bars, bench, raw_path.is_some()))
+}
 
-    let m = &report.metrics;
-    println!("bars replayed     {n_bars}");
-    println!("start equity      {:.2}", m.start_equity);
-    println!("end equity        {:.2}", m.end_equity);
-    println!("total return      {:>7.2}%", m.total_return * 100.0);
-    println!("CAGR              {:>7.2}%", m.cagr * 100.0);
-    println!("max drawdown      {:>7.2}%", m.max_drawdown * 100.0);
-    println!("Sharpe            {:>7.2}", m.sharpe);
-    println!("fills             {}", m.num_fills);
-    println!("commissions       {:.2}", m.commissions);
-    println!("rejected signals  {}", report.rejections.len());
-    println!("open positions    {}", report.final_portfolio.positions().count());
-    Ok(())
+/// With traded prices in use, bars lacking one fail closed in the risk check; say how many and which.
+fn report_traded_coverage(bars: &[Bar]) {
+    let missing: Vec<&Bar> = bars.iter().filter(|b| b.traded_close.is_none()).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut by_symbol: HashMap<&str, usize> = HashMap::new();
+    for b in &missing {
+        *by_symbol.entry(b.symbol.as_str()).or_default() += 1;
+    }
+    let mut worst: Vec<(&str, usize)> = by_symbol.into_iter().collect();
+    worst.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let names: Vec<String> = worst.iter().take(10).map(|(s, n)| format!("{s} ({n})")).collect();
+    eprintln!(
+        "warning: {} of {} bars ({:.1}%) have no as-traded price; entries on those days are rejected rather \
+         than judged on adjusted prices. Most affected: {}",
+        missing.len(),
+        bars.len(),
+        100.0 * missing.len() as f64 / bars.len().max(1) as f64,
+        names.join(", ")
+    );
 }

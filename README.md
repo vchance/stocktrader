@@ -10,7 +10,27 @@ cargo run -p st-cli -- backtest                    # synthetic data, no API keys
 cargo run -p st-cli -- backtest --bars bars.csv    # symbol,date,open,high,low,close,volume
 cargo run --release -p st-cli -- backtest --parquet data/marketdata/bars_daily_all.parquet \
     --start 2022-01-01 --symbols AAPL,MSFT,NVDA         # real data from `marketdata sync`
+cargo run --release -p st-cli -- walk-forward --parquet data/marketdata/bars_daily_all.parquet \
+    --start 2018-01-01 --symbols AAPL,MSFT,NVDA         # tune on rolling windows, report only unseen ones
 ```
+
+## Evaluating a strategy honestly
+
+- **Benchmark:** every run is compared with buy-and-hold of `--benchmark` (default SPY, read from the
+  same data even if `--symbols` omits it; `none` to skip): its metrics, the strategy's excess CAGR, and
+  the correlation of daily returns.
+- **Walk-forward:** `walk-forward` picks parameters from a small grid on each training window
+  (`--train-days`, default 365) by Sharpe, then runs the choice on the next `--test-days` (91) only,
+  after replaying `--warmup-days` (330, enough for a 200-day average plus the liquidity window; too little
+  is refused, since a candidate that can't warm up never trades and would win on a Sharpe of 0) of
+  history without trading so indicators are ready. The
+  compounded test windows are the number to believe; the table also shows each choice's in-sample return,
+  and the gap between the two is the overfitting. A final window cut short by the end of the data is
+  dropped.
+- **Price filter on traded prices:** `--min-price` (default $5) is applied to as-traded closes, read
+  automatically from `bars_daily_raw.parquet` beside `--parquet` (or `--raw`). Adjusted history
+  understates pre-split prices, so filtering on it would wrongly drop stocks that later split; the CLI
+  warns if no raw file is found.
 
 ## Market data
 
@@ -36,8 +56,8 @@ Parquet file.
 Known limits:
 - Delisted coverage is only as complete as Alpaca's inactive list and history, so some survivorship bias
   remains; a reused ticker maps to whichever company Alpaca associates with it.
-- The backtest's `--min-price` filter (default $5) sees split-adjusted prices when given the adjusted file,
-  which understates pre-split prices and biases the universe; it warns, and `--min-price 0` disables it.
+- The backtest's `--min-price` filter uses as-traded prices from the raw file (see "Evaluating a strategy
+  honestly"); without one it falls back to adjusted prices and warns.
 - Backtests load all selected bars into memory; narrow with `--start/--end/--symbols`.
 
 ## Fundamentals
@@ -78,7 +98,7 @@ nightly housekeeping rebuilds it, and backups skip it. `signals show TSLA` print
 ```
 cargo run -p st-signals -- apewisdom
 cargo run -p st-cli -- backtest --strategy attention-spike --attention data/signals/apewisdom.parquet \
-    --parquet data/marketdata/bars_daily_all.parquet --min-price 0
+    --parquet data/marketdata/bars_daily_all.parquet
 ```
 
 `attention-spike` buys when mentions are at least `--spike-ratio` (3) times the previous 24h and at least
@@ -233,4 +253,6 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
    engine step from `Backtest` so paper/live don't duplicate the loop; decouple fills from market events
    (async fills, partials, rejects, cancels); reconcile positions and cash against the broker; give strategies
    fill and open-order feedback; persist kill-switch and session state across restarts; share one sizing function.
-6. Dashboard, alerts, persistent kill switch; benchmark comparison (SPY) and walk-forward evaluation.
+6. ~~Benchmark comparison and walk-forward evaluation~~ (`--benchmark`, `walk-forward`). Next: stream bars
+   in date order (re-lay the Parquet store date-major) so full-universe backtests fit in memory;
+   dashboard and persistent kill switch.

@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 st-core.workspace = true
+st-data.workspace = true
 st-risk.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
@@ -15,5 +16,4 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-st-data.workspace = true
 st-strategies.workspace = true
