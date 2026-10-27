@@ -97,13 +97,20 @@ deploy/collector.sh housekeeping   # gzip day files older than yesterday, then `
   [ntfy.sh](https://ntfy.sh) topic works with its phone app). Health alerts fire when the set of problems
   changes, including recovery, and repeat daily while a problem persists. Without a URL, problems are
   only logged (`journalctl --user -u stocktrader-health`).
-- **A source is stale** after four polling intervals (at least 30 minutes) without a record; the market
-  data sync after 4 days; a configured backup after 2 days.
-- **Backups** go to `BACKUP_DEST` (any rsync destination). Everything in `data/` is copied except the
-  re-downloadable market data Parquet files. Nothing is ever deleted from the backup except an
-  uncompressed day file once its compressed copy is there, so a local mistake can't wipe the backup.
+- **A source is stale** when it has gone longer than its slowest backed-off polling gap plus two intervals
+  (at least 30 minutes) without a record, or if its newest record is in the future. A source that has
+  data but lost its keys shows DISABLED. The market data sync is stale after 3 days; a configured backup
+  after 2 days.
+- **Dead-man's switch:** set `HEARTBEAT_URL` (e.g. a healthchecks.io check) and every hourly health run
+  pings it, so you hear about it if the host or its timers stop entirely.
+- **Backups** go to `BACKUP_DEST` (any rsync destination; remote ones need key-based ssh). A local
+  destination must contain a `.stocktrader-backup` file, so an unmounted drive fails loudly. Everything
+  in `data/` is copied except the re-downloadable market data Parquet files. Nothing is ever deleted
+  from the backup except an uncompressed day file once its compressed copy is there (at most 50 per
+  run), so a local mistake can't wipe the backup.
 - **Compaction** gzips day files, verifies each copy byte for byte, and only then removes the original.
-  Archive readers must accept both `.jsonl` and `.jsonl.gz`.
+  It never overwrites an existing `.gz`; a conflicting leftover is reported and left for you. Archive
+  readers must accept both `.jsonl` and `.jsonl.gz`.
 
 SEC filings are deliberately not polled: EDGAR keeps a permanent archive with acceptance timestamps, so they
 are a backfill job.
