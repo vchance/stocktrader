@@ -1,0 +1,19 @@
+# Use deploy/collector.sh, which sets COLLECTOR_UID/GID and creates .env and data/ with the right owner.
+services:
+  collector:
+    build: .
+    image: stocktrader-collector
+    restart: unless-stopped
+    # Run as the host user so archive files in ./data are owned by them, not root.
+    user: "${COLLECTOR_UID:?run via deploy/collector.sh}:${COLLECTOR_GID:?run via deploy/collector.sh}"
+    # Plain KEY=value lines; Docker does not strip quotes the way dotenv does.
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # Long enough for an in-flight archive write to finish after SIGTERM.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
