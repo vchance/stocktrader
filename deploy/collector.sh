@@ -9,6 +9,7 @@
 #   deploy/collector.sh sync-marketdata  download the universe and full daily price history now
 #                                        (extra flags go to `marketdata sync`, e.g. --force)
 #   deploy/collector.sh install-timer    run sync-marketdata nightly via a systemd user timer
+#                                        (install-timer DIR only writes the units to DIR, for review)
 set -euo pipefail
 
 SYNC_CONTAINER=stocktrader-marketdata-sync
@@ -52,10 +53,10 @@ main() {
             docker compose run --rm -T --name "$SYNC_CONTAINER" marketdata sync "${@:2}"
             ;;
         install-timer)
-            install_timer "$self"
+            install_timer "$self" "${2:-}"
             ;;
         *)
-            sed -n '2,12p' "$self"
+            sed -n '2,13p' "$self"
             return 1
             ;;
     esac
@@ -92,7 +93,6 @@ TimeoutStartSec=3h
 Restart=on-failure
 RestartSec=20min
 EOF
-    [[ -n "${2:-}" ]] && return 0
     # After each US session (Mon-Fri), once Alpaca has the final daily bars.
     cat > "$units/stocktrader-marketdata.timer" <<EOF
 [Unit]
@@ -106,6 +106,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+    if [[ -n "${2:-}" ]]; then
+        echo "Wrote units to $units without installing them."
+        return 0
+    fi
     systemctl --user daemon-reload
     systemctl --user enable --now stocktrader-marketdata.timer
     systemctl --user list-timers stocktrader-marketdata.timer --no-pager
