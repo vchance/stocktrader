@@ -93,7 +93,7 @@ fn quality_value_trades_on_filed_financials() {
     write_fundamentals(&fundamentals);
 
     let out = Command::new(env!("CARGO_BIN_EXE_stocktrader"))
-        .args(["backtest", "--benchmark", "none", "--strategy", "quality-value", "--top-n", "2", "--parquet"])
+        .args(["backtest", "--benchmark", "none", "--strategy", "quality-value", "--parquet"])
         .arg(dir.path().join("bars_daily_all.parquet"))
         .arg("--fundamentals")
         .arg(&fundamentals)
@@ -118,6 +118,23 @@ fn quality_value_trades_on_filed_financials() {
     let walk_out = String::from_utf8_lossy(&walk.stdout);
     assert!(walk.status.success(), "{}\n{walk_out}", String::from_utf8_lossy(&walk.stderr));
     assert!(walk_out.contains("quality-value top"), "{walk_out}");
+    // The filings predate every fold's warm-up; folds still trade because each run sees earlier filings.
+    let fold_fills: Vec<usize> = walk_out
+        .lines()
+        .filter(|l| l.starts_with("2024-") || l.starts_with("2025-"))
+        .map(|l| l.split_whitespace().last().unwrap().parse().unwrap())
+        .collect();
+    assert!(!fold_fills.is_empty() && fold_fills.iter().all(|n| *n > 0), "{walk_out}");
+
+    let too_few = Command::new(env!("CARGO_BIN_EXE_stocktrader"))
+        .args(["backtest", "--strategy", "quality-value", "--top-n", "2", "--parquet"])
+        .arg(dir.path().join("bars_daily_all.parquet"))
+        .arg("--fundamentals")
+        .arg(&fundamentals)
+        .output()
+        .unwrap();
+    assert!(!too_few.status.success());
+    assert!(String::from_utf8_lossy(&too_few.stderr).contains("position cap"));
 
     let missing = Command::new(env!("CARGO_BIN_EXE_stocktrader"))
         .args(["backtest", "--strategy", "quality-value", "--parquet"])

@@ -135,7 +135,8 @@ struct StrategyArgs {
     /// Attention spike: days to hold after the latest spike.
     #[arg(long, default_value_t = 5)]
     spike_hold_days: u32,
-    /// Quality-value: names held, each at 1/N of equity (--weight doesn't apply).
+    /// Quality-value: names held, each at 1/N of equity (--weight doesn't apply). At least 10, the number the
+    /// 10% position cap allows to be fully invested.
     #[arg(long, default_value_t = 20)]
     top_n: usize,
     /// Target weight per position when long.
@@ -222,6 +223,15 @@ fn require_attention(data: &DataArgs) -> Result<()> {
     Ok(())
 }
 
+/// Each name gets 1/N; above the risk manager's position cap that would be clamped and leave cash idle.
+fn check_top_n(top_n: usize) -> Result<()> {
+    let cap = RiskLimits::default().max_position_weight;
+    if top_n == 0 || Decimal::ONE / Decimal::from(top_n) > cap {
+        bail!("--top-n {top_n} gives each name more than the {cap} position cap; use at least {}", (Decimal::ONE / cap).ceil());
+    }
+    Ok(())
+}
+
 fn require_fundamentals(data: &DataArgs) -> Result<()> {
     if data.fundamentals.is_none() {
         bail!("quality-value needs --fundamentals data/fundamentals");
@@ -243,6 +253,7 @@ impl StrategyArgs {
                 if !have_fundamentals {
                     bail!("quality-value needs --fundamentals data/fundamentals");
                 }
+                check_top_n(self.top_n)?;
                 Params::QualityValue { top_n: self.top_n }
             }
         })
@@ -323,8 +334,8 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
         .map(|p| match p {
             Params::Sma { slow, .. } => *slow,
             Params::Spike { .. } => 0,
-            // Up to a month until the first rebalance; its liquidity window matches the risk lookback added below.
-            Params::QualityValue { .. } => 23,
+            // It first ranks once its liquidity window, the risk lookback added below, is full.
+            Params::QualityValue { .. } => 0,
         })
         .max()
         .unwrap_or(0)
@@ -429,8 +440,7 @@ fn load(data: &DataArgs) -> Result<Loaded> {
 
 /// The replay for `data`: Parquet bars are streamed from disk (with as-traded closes merged in from the raw
 /// file), CSV and synthetic bars come from memory, and attention and fundamental events are interleaved by
-/// time. Nothing is
-/// checked until the source is drained; call [`report_replay`] afterwards.
+/// time. Nothing is checked until the source is drained; call [`report_replay`] afterwards.
 fn prepare(data: &DataArgs) -> Result<Prepared> {
     let benchmark_symbol = (!data.benchmark.eq_ignore_ascii_case("none")).then(|| data.benchmark.to_ascii_uppercase());
     let (bars, benchmark, report, span, tickers): (Box<dyn EventSource>, _, _, _, _) = match (&data.bars, &data.parquet) {

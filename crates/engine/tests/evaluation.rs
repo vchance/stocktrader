@@ -91,3 +91,49 @@ fn walk_forward_tests_only_on_unseen_windows() {
     let again = walk_forward(&events, &cfg, &candidates, make).unwrap();
     assert_eq!(again.out_of_sample_return, report.out_of_sample_return, "deterministic");
 }
+
+/// Holds SYN000 only once it has seen the (one, early) news item, so it trades in a fold only if that
+/// item reaches the fold's fresh strategy.
+struct NeedsEarlyNews {
+    informed: bool,
+}
+
+impl st_core::Strategy for NeedsEarlyNews {
+    fn name(&self) -> &str {
+        "needs_early_news"
+    }
+
+    fn on_event(&mut self, event: &Event, _ctx: &st_core::StrategyContext<'_>) -> Vec<st_core::Signal> {
+        match &event.kind {
+            st_core::EventKind::News(_) => self.informed = true,
+            st_core::EventKind::Bar(b) if self.informed && b.symbol.as_str() == "SYN000" => {
+                return vec![st_core::Signal { symbol: b.symbol.clone(), target_weight: dec!(0.05), reason: "news".into() }];
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+}
+
+#[test]
+fn walk_forward_folds_follow_the_bars_and_see_earlier_non_bar_events() {
+    let bars = bars(3, 400);
+    let first_bar = bars.iter().map(|b| b.end).min().unwrap();
+    let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
+    // Published a year before the first bar, long before any fold's warm-up.
+    events.push(Event {
+        available_at: first_bar - TimeDelta::days(365),
+        kind: st_core::EventKind::News(st_core::NewsItem { symbols: vec![], source: "t".into(), headline: "h".into(), url: None }),
+    });
+    let cfg = WalkForwardConfig {
+        train: TimeDelta::days(120),
+        test: TimeDelta::days(60),
+        warmup: TimeDelta::days(40),
+        initial_cash: dec!(100_000),
+        fill: FillModel::default(),
+        limits: RiskLimits { liquidity_lookback: 1, ..limits() },
+    };
+    let report = walk_forward(&events, &cfg, &[()], |_| NeedsEarlyNews { informed: false }).unwrap();
+    assert_eq!(report.folds[0].test_start, first_bar + cfg.warmup + cfg.train, "folds start from the first bar");
+    assert!(report.folds.iter().all(|f| f.test.num_fills > 0), "every fold's strategy saw the early news");
+}

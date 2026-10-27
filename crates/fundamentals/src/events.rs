@@ -13,7 +13,7 @@ use st_core::{Event, EventKind, FundamentalRecord, Symbol, Timestamp};
 use crate::facts::Fact;
 use crate::store::{FactFilter, read_facts};
 use crate::sync::facts_path;
-use crate::tickers::{latest_snapshot, parse_tickers, primary_tickers};
+use crate::tickers::{latest_snapshot, parse_tickers};
 
 /// When a fact filed on `filed` may be used: midnight New York time at the start of the next day. The
 /// bulk data carries only the filing date, and EDGAR accepts filings until 22:00 ET, so anything earlier
@@ -70,11 +70,16 @@ pub fn to_events(facts: &[Fact], tickers: &HashMap<u32, String>) -> Vec<Event> {
 /// Fundamental events for a backtest or a paper run, read from a `fundamentals sync` directory: only the
 /// given concepts, only companies whose market symbol is in `symbols`, and only events available within
 /// `from..=to`. Companies are matched to symbols with the newest ticker snapshot, with the limits described
-/// on [`to_events`].
+/// on [`to_events`]; a company with several listed classes is attributed to the first one in `symbols`.
 pub fn load_events(root: &Path, concepts: &[&str], symbols: &HashSet<String>, from: Timestamp, to: Timestamp) -> Result<Vec<Event>> {
     let listings = parse_tickers(&fs::read(latest_snapshot(root)?)?)?;
-    let tickers: HashMap<u32, String> =
-        primary_tickers(&listings).into_iter().filter(|(_, t)| symbols.contains(market_symbol(t).as_str())).collect();
+    // Per company, the first-listed of its tickers that is in the universe (e.g. GOOG when only it has bars).
+    let mut tickers: HashMap<u32, String> = HashMap::new();
+    for l in &listings {
+        if symbols.contains(market_symbol(&l.ticker).as_str()) {
+            tickers.entry(l.cik).or_insert_with(|| l.ticker.clone());
+        }
+    }
     let filter = FactFilter {
         ciks: Some(tickers.keys().copied().collect()),
         concepts: Some(concepts.iter().map(|c| c.to_string()).collect()),

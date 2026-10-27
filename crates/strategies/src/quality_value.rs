@@ -35,6 +35,8 @@ fn update(slot: &mut Option<(NaiveDate, Decimal)>, period_end: NaiveDate, value:
 }
 
 /// Holds the `top_n` best-ranked stocks at equal weight, re-ranked on the first session of each month.
+/// Weights of `1 / top_n` above the risk manager's position cap are clamped by it, leaving cash idle, so
+/// callers should keep `top_n` at or above `1 / max_position_weight`.
 ///
 /// Each eligible stock is ranked on two measures from its latest filings, and the ranks are added:
 /// - earnings yield: latest annual net income / market cap (shares outstanding x as-traded price);
@@ -123,7 +125,8 @@ impl QualityValue {
         out
     }
 
-    fn rebalance(&mut self, today: NaiveDate) {
+    /// Re-ranks; `false` if nothing was eligible.
+    fn rebalance(&mut self, today: NaiveDate) -> bool {
         let candidates = self.candidates(today);
         // Rank 0 is the lowest value; ties broken by symbol so results don't depend on hash order.
         let ranks = |key: fn(&(Symbol, Decimal, Decimal)) -> Decimal| -> HashMap<Symbol, usize> {
@@ -153,6 +156,7 @@ impl QualityValue {
             }
         }
         self.targets = targets;
+        !candidates.is_empty()
     }
 }
 
@@ -183,16 +187,16 @@ impl Strategy for QualityValue {
         Vec::new()
     }
 
-    /// Re-ranks on the first session of a month, and after every session restates the current targets.
+    /// Re-ranks on the first session of a month (retrying each session until something is eligible, so the
+    /// first holdings don't wait for the next month), and after every session restates the current targets.
     fn after_batch(&mut self, ctx: &StrategyContext<'_>) -> Vec<Signal> {
         if !std::mem::take(&mut self.saw_bars) {
             return Vec::new();
         }
         let today = new_york_date(ctx.now);
         let month = (today.year(), today.month());
-        if self.rebalanced != Some(month) {
+        if self.rebalanced != Some(month) && self.rebalance(today) {
             self.rebalanced = Some(month);
-            self.rebalance(today);
         }
         self.targets
             .iter()
@@ -290,16 +294,19 @@ mod tests {
             events.extend(financials(symbol, income, assets, dec!(100e6), day(0)));
             events.extend(bars(symbol, 1, dec!(10)));
         }
+        // The first holdings come as soon as 20 sessions of liquidity history exist, mid-January.
         let mut s = QualityValue::new(2).unwrap();
-        // Liquidity history isn't full at the January rebalance, so nothing is held until February.
-        assert_eq!(run(&mut s, events.clone()), BTreeMap::new());
+        assert_eq!(run(&mut s, events.clone()), BTreeMap::from([("CHEAP".into(), dec!(0.5)), ("MID".into(), dec!(0.5))]));
+        assert_eq!(s.rebalanced, Some((2025, 1)));
 
+        // February re-ranks; POOR's income rises enough to overtake MID.
+        events.extend(financials("POOR", dec!(150e6), dec!(2e9), dec!(100e6), day(28)));
         events.extend(bars("CHEAP", 30, dec!(10)));
         events.extend(bars("MID", 30, dec!(10)));
         events.extend(bars("POOR", 30, dec!(10)));
         let mut s = QualityValue::new(2).unwrap();
         let targets = run(&mut s, events);
-        assert_eq!(targets, BTreeMap::from([("CHEAP".into(), dec!(0.5)), ("MID".into(), dec!(0.5))]));
+        assert_eq!(targets, BTreeMap::from([("CHEAP".into(), dec!(0.5)), ("MID".into(), dec!(0)), ("POOR".into(), dec!(0.5))]));
     }
 
     #[test]
@@ -311,8 +318,8 @@ mod tests {
                 events.extend(bars(symbol, from, dec!(10)));
             }
         }
-        // A leads in February. C, filed mid-February with far higher income, displaces it in March, and A is
-        // restated at 0 so it gets sold.
+        // A leads from January (C has no liquidity history until February, and February's rebalance runs
+        // before it has enough). C, with far higher income, displaces A in March, and A is restated at 0.
         events.extend(financials("C", dec!(900e6), dec!(1e9), dec!(100e6), day(40)));
         events.extend(bars("C", 26, dec!(10)));
         events.extend(bars("C", 51, dec!(10)));
