@@ -106,6 +106,39 @@ cargo run -p st-cli -- backtest --strategy attention-spike --attention data/sign
 pipeline end to end; it is not a validated strategy. Real backtests need weeks of collected attention
 data overlapping the price history.
 
+## Paper trading
+
+`stocktrader paper` runs once per session, before the open, against an Alpaca **paper** account (the
+client refuses any other endpoint). It replays the last `--history-days` (400) of bars, plus attention
+if `--attention` is given, through the strategy and risk manager, takes each symbol's latest target, and
+reconciles it with the account's real cash, positions and open orders using the same risk checks and order
+sizing as the backtester. Orders are whole-share market orders for the day, so they fill at the open, as
+simulated fills do. Nothing is kept between runs except the journal: every run starts from what the broker
+reports.
+
+```
+cargo run --release -p st-cli -- paper --symbols AAPL,MSFT,NVDA --strategy sma            # print the plan
+cargo run --release -p st-cli -- paper --symbols AAPL,MSFT,NVDA --strategy sma --submit   # send it
+```
+
+Guards:
+- Dry run unless `--submit`. Both modes append the plan to `data/live/journal/<date>.jsonl`; submissions
+  add one line per order with the broker's answer.
+- Runs only before or during a session; after the close, on weekends and on holidays it does nothing.
+  It refuses market data that doesn't end with the previous session, and an account that isn't `ACTIVE`.
+- A file `data/live/KILL` blocks every order that adds exposure; exits still go out. Its first line is
+  shown as the reason. Delete it to resume.
+- Order ids are `st-<date>-<symbol>-<side>`, and open orders count as pending, so running twice on the same
+  day sends nothing new; the broker rejects a repeated id outright.
+- `--max-orders` (20) refuses a run that would place more orders than that, and the daily loss limit
+  compares equity with the broker's previous close.
+- Positions in symbols outside `--symbols`, or without a bar for the previous session, are reported and
+  left alone.
+
+On a server, put the flags in `.env` as `PAPER_ARGS` (see `.env.example`), check the plan with
+`deploy/collector.sh paper-trade`, then `deploy/collector.sh install-paper-timer` submits each weekday
+at 08:45 New York time, after the nightly market data sync, and alerts if a run fails.
+
 ## Data collector
 
 `collector` archives news and social data that **cannot be backfilled later**, verbatim, to
@@ -221,6 +254,7 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 | `st-risk` | Pre-trade checks: position cap, gross exposure, daily loss halt, kill switch, price and liquidity filters |
 | `st-engine` | Event-driven backtester, `SimulatedBroker` (fills at next bar open + slippage), metrics |
 | `st-strategies` | Strategies. `SmaCrossover` is a plumbing test only |
+| `st-paper` | Alpaca paper-account client and the pre-open planner (`stocktrader paper`) |
 | `st-cli` | `stocktrader` binary |
 
 ### Rules that keep backtests honest
@@ -249,10 +283,10 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
    mapping, and feeding facts into strategies.
 4. ~~Mention velocity from ApeWisdom~~ (`signals`, `attention-spike`). Next: Reddit and news text pipeline
    (ticker extraction, dedupe, sentiment scoring via FinBERT/ONNX or an LLM) once those sources have keys.
-5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`. Before that: extract a mode-agnostic
-   engine step from `Backtest` so paper/live don't duplicate the loop; decouple fills from market events
-   (async fills, partials, rejects, cancels); reconcile positions and cash against the broker; give strategies
-   fill and open-order feedback; persist kill-switch and session state across restarts; share one sizing function.
+5. ~~Daily paper trading on Alpaca~~ (`stocktrader paper`: reconciles with the broker each run, shared
+   sizing, file kill switch). Next: compare paper fills with the backtest's simulated fills; an intraday
+   runner (async fills, partials, cancels) only if a strategy needs one; live trading behind an explicit
+   opt-in once paper results justify it.
 6. ~~Benchmark comparison and walk-forward evaluation~~ (`--benchmark`, `walk-forward`). Next: stream bars
    in date order (re-lay the Parquet store date-major) so full-universe backtests fit in memory;
    dashboard and persistent kill switch.

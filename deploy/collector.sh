@@ -16,6 +16,9 @@
 #   deploy/collector.sh install-ops      hourly health check + nightly housekeeping (systemd user timers)
 #   deploy/collector.sh install-timer    nightly sync-marketdata (systemd user timer)
 #   deploy/collector.sh install-fundamentals-timer  daily sync-fundamentals (systemd user timer)
+#   deploy/collector.sh paper-trade      plan today's Alpaca paper-account orders with PAPER_ARGS from .env and
+#                                        print them; add --submit to send them (extra flags go to `stocktrader paper`)
+#   deploy/collector.sh install-paper-timer  paper-trade --submit each weekday before the open (systemd user timer)
 #                                        (the install-* commands given a DIR only write the units there)
 set -euo pipefail
 
@@ -90,8 +93,14 @@ main() {
         install-fundamentals-timer)
             install_fundamentals_timer "$self" "${2:-}"
             ;;
+        paper-trade)
+            paper_trade "${@:2}"
+            ;;
+        install-paper-timer)
+            install_paper_timer "$self" "${2:-}"
+            ;;
         *)
-            sed -n '2,20p' "$self"
+            sed -n '2,23p' "$self"
             return 1
             ;;
     esac
@@ -422,6 +431,42 @@ install_fundamentals_timer() {
         return 0
     fi
     enable_timers stocktrader-fundamentals.timer
+}
+
+# Runs `stocktrader paper` with PAPER_ARGS from .env (strategy and symbols) plus ARGS. A failed run that was
+# meant to submit orders raises an alert.
+paper_trade() {
+    prepare
+    local args=() status=0
+    read -r -a args <<<"$(env_value PAPER_ARGS)"
+    if ((${#args[@]} == 0)); then
+        echo "PAPER_ARGS is not set in .env; for example: PAPER_ARGS=--symbols AAPL,MSFT,NVDA --strategy sma" >&2
+        return 1
+    fi
+    docker compose build paper >/dev/null || status=$?
+    if ((status == 0)); then
+        docker compose run --rm --no-deps -T paper "${args[@]}" "$@" </dev/null || status=$?
+    fi
+    if ((status != 0)) && [[ " $* " == *" --submit "* ]]; then
+        notify "stocktrader on $(hostname): paper trading failed" "See: journalctl --user -u stocktrader-paper"
+    fi
+    return "$status"
+}
+
+install_paper_timer() {
+    local self units="${2:-$HOME/.config/systemd/user}"
+    self="$(unit_path "$1")"
+    mkdir -p "$units"
+    # Weekdays before the open, after the nightly market data sync. The run itself skips market holidays and
+    # refuses stale data. Not Persistent: a run caught up after a late boot would trade mid-session.
+    write_timer_units "$units" stocktrader-paper "paper trading before the open" \
+        "\"$self\" paper-trade --submit" 20min "Mon..Fri 08:45 America/New_York" "RandomizedDelaySec=5m"
+    if [[ -n "${2:-}" ]]; then
+        echo "Wrote units to $units without installing them."
+        return 0
+    fi
+    [[ -z "$(env_value PAPER_ARGS)" ]] && echo "Warning: PAPER_ARGS is not set in .env; runs will fail until it is."
+    enable_timers stocktrader-paper.timer
 }
 
 main "$@"

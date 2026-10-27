@@ -70,3 +70,14 @@ services:
       STOCKTRADER_DATA_DIR: /data/raw
       STOCKTRADER_SIGNALS_DIR: /data/signals
     mem_limit: 1g
+
+  # One-shot pre-open paper-trading run, started by deploy/collector.sh paper-trade (and its systemd timer).
+  paper:
+    <<: *common
+    profiles: [tools]
+    restart: "no"
+    entrypoint: ["stocktrader", "paper"]
+    environment:
+      STOCKTRADER_MARKETDATA_DIR: /data/marketdata
+      STOCKTRADER_LIVE_DIR: /data/live
+    mem_limit: 1g
