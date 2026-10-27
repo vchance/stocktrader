@@ -1,0 +1,35 @@
+# Manage with deploy/collector.sh, which sets COLLECTOR_UID/GID and creates .env and data/ with the right owner.
+name: stocktrader-collector
+
+services:
+  collector:
+    build: .
+    image: vchance-stocktrader-collector
+    restart: unless-stopped
+    # Run as the host user so archive files in ./data are owned by them, not root. Required rather than
+    # defaulted so a bare `docker compose up` can't recreate the container as a user who can't write data/.
+    user: "${COLLECTOR_UID:?run deploy/collector.sh}:${COLLECTOR_GID:?run deploy/collector.sh}"
+    # Compose's parser is not dotenv: keep values unquoted, and avoid `$` (interpolated) and ` #` (comment).
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Pinned here (overrides env_file) so nothing in .env can move the archive off the bind mount.
+      STOCKTRADER_DATA_DIR: /data/raw
+    volumes:
+      - ./data:/data
+    # The collector only writes under /data; a misdirected write should fail loudly, not vanish on rebuild.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Shared host: keep a runaway collector from starving other services.
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    # Long enough for an in-flight archive write to finish after SIGTERM.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

@@ -30,6 +30,23 @@ cargo run --release -p st-collector -- run            # poll until Ctrl-C
 | `finnhub_news` | `FINNHUB_API_KEY` | 10 min | Free tier serves recent news only |
 | `alpaca_news` | `APCA_API_KEY_ID/SECRET_KEY` | 5 min | Benzinga news with our own arrival timestamps (history is also backfillable) |
 
+### Running on a server
+
+On a Linux host with Docker (currently `jabrony`), from a checkout of `main`:
+
+```
+git clone https://github.com/vchance/stocktrader.git ~/stocktrader && cd ~/stocktrader
+deploy/collector.sh up        # builds the image, creates .env (mode 600) and data/, starts with restart=unless-stopped
+nano .env && deploy/collector.sh up    # add keys as plain KEY=value lines, then restart to pick them up
+deploy/collector.sh status    # container state and which sources are enabled
+deploy/collector.sh logs      # follow logs
+deploy/collector.sh update    # git pull + rebuild + restart after a merge
+```
+
+The archive lands in `~/stocktrader/data/raw/`, owned by the deploying user. Always go through the script:
+plain `docker compose` commands refuse to run without the UID/GID it sets. The container is read-only apart
+from `data/`, drops all capabilities, and is capped at 512 MB and one CPU.
+
 SEC filings are deliberately not polled: EDGAR keeps a permanent archive with acceptance timestamps, so they
 are a backfill job.
 
@@ -91,7 +108,7 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 
 ## Roadmap
 1. Alpaca historical-bars client and a local store (Parquet / DuckDB); universe builder with liquidity filter.
-2. ~~Start archiving news and social feeds~~ (`collector`). Next: run it somewhere always-on, compress old files.
+2. ~~Start archiving news and social feeds~~ (`collector`, running on `jabrony`). Next: compress old files.
 3. EDGAR fundamentals ingestion with point-in-time filing dates.
 4. Text pipeline: ticker extraction, dedupe, sentiment scoring (FinBERT via ONNX, or an LLM), mention velocity.
 5. Async live runner (`tokio`) with an Alpaca paper `ExecutionAdapter`. Before that: extract a mode-agnostic
