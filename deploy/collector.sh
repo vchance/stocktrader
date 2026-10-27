@@ -25,6 +25,10 @@ ALREADY_RUNNING=75
 REALERT_SECS=$((24 * 3600))
 # A configured backup older than this counts as a problem.
 BACKUP_MAX_AGE_SECS=$((2 * 24 * 3600))
+# File that must exist at the root of a local BACKUP_DEST.
+BACKUP_MARKER=.stocktrader-backup
+# Most files one backup may delete (normally a few compacted .jsonl per night); more aborts the run.
+BACKUP_MAX_DELETE=50
 
 # Wrapped in main and exited explicitly: `update` rewrites this file mid-run, and bash would otherwise
 # keep reading the new file from its old offset.
@@ -93,12 +97,21 @@ prepare() {
     chmod 600 .env
 }
 
-# Value of KEY from .env (last assignment wins), or empty.
+# Value of KEY from .env (last assignment wins), or empty. Surrounding quotes are stripped, as Compose does.
 env_value() {
-    sed -n "s/^$1=//p" .env 2>/dev/null | tail -n 1 | tr -d '\r' | sed 's/[[:space:]]*$//'
+    sed -n "s/^[[:space:]]*$1=//p" .env 2>/dev/null | tail -n 1 | tr -d '\r' |
+        sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
 }
 
-# Posts an alert to ALERT_WEBHOOK_URL (ntfy-style: plain-text body, Title header). Never fails the caller.
+# A curl config line for URL. URLs go through a config on a pipe rather than argv, so other users on the
+# host can't read webhook secrets from `ps`.
+curl_url_config() {
+    local v="${1//\\/\\\\}"
+    printf 'url = "%s"\n' "${v//\"/\\\"}"
+}
+
+# Posts an alert to ALERT_WEBHOOK_URL (ntfy-style: plain-text body, Title header). Returns non-zero only
+# if a configured webhook could not be reached, so callers can retry later.
 notify() {
     local title="$1" body="$2" url
     url="$(env_value ALERT_WEBHOOK_URL)"
@@ -106,8 +119,20 @@ notify() {
         echo "ALERT_WEBHOOK_URL not set in .env; alert not sent: $title" >&2
         return 0
     fi
-    curl -fsS -m 20 -H "Title: $title" --data-binary "$body" "$url" >/dev/null ||
+    if ! curl -fsS -m 20 -K <(curl_url_config "$url") -H "Title: $title" --data-binary @- \
+        <<<"$body" >/dev/null; then
         echo "Failed to deliver alert: $title" >&2
+        return 1
+    fi
+}
+
+# Pings HEARTBEAT_URL (e.g. a healthchecks.io check) so something off this host notices if the host, its
+# timers or this script stop running altogether.
+heartbeat() {
+    local url
+    url="$(env_value HEARTBEAT_URL)"
+    [[ -z "$url" ]] && return 0
+    curl -fsS -m 20 -K <(curl_url_config "$url") -o /dev/null || echo "Heartbeat ping failed" >&2
 }
 
 sync_marketdata() {
@@ -134,52 +159,63 @@ sync_marketdata() {
 
 health() {
     prepare
-    local report status=0 problems=""
+    heartbeat
+    local output status=0 problems="" summary
     if [[ -z "$(docker compose ps -q --status running collector 2>/dev/null)" ]]; then
         problems+="collector NOT-RUNNING"$'\n'
     fi
-    report="$(docker compose run --rm --no-deps -T collector health 2>&1 </dev/null)" || status=$?
+    output="$(docker compose run --rm --no-deps -T collector health 2>&1 </dev/null)" || status=$?
+    echo "$output"
+    # Only the status table goes into alerts, never raw docker/compose output, which can quote .env lines.
+    summary="$(grep -E '^[a-z_]+ +(ok|STALE|MISSING|DISABLED) ' <<<"$output" || true)"
     if ((status != 0)); then
-        # Only names and states, so the alert key doesn't change as ages tick up.
+        # Names and states only, so the alert key doesn't change as ages tick up.
         local found
-        found="$(awk '$2 == "STALE" || $2 == "MISSING" { print $1 " " $2 }' <<<"$report")"
+        found="$(awk '$2 == "STALE" || $2 == "MISSING" || $2 == "DISABLED" { print $1 " " $2 }' <<<"$summary")"
         problems+="${found:-health-check FAILED}"$'\n'
+        [[ -z "$found" ]] && summary+=$'\n'"health check could not run; see: journalctl --user -u stocktrader-health"
     fi
+    local backup_line
     if [[ -n "$(env_value BACKUP_DEST)" ]]; then
         local last=0
-        [[ -f data/.last-backup ]] && last="$(cat data/.last-backup)"
+        [[ -f data/.last-backup ]] && last="$(head -c 32 data/.last-backup | tr -dc '0-9')"
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
         if (($(date +%s) - last > BACKUP_MAX_AGE_SECS)); then
             problems+="backup STALE"$'\n'
-            report+=$'\n'"backup         STALE    last success $( ((last)) && date -d "@$last" -u +%FT%TZ || echo never)"
+            backup_line="backup         STALE    last success $( ((last)) && date -d "@$last" -u +%FT%TZ || echo never)"
         else
-            report+=$'\n'"backup         ok       last success $(date -d "@$last" -u +%FT%TZ)"
+            backup_line="backup         ok       last success $(date -d "@$last" -u +%FT%TZ)"
         fi
     else
-        report+=$'\n'"backup         -        BACKUP_DEST not set in .env"
+        backup_line="backup         -        BACKUP_DEST not set in .env"
     fi
-    echo "$report"
+    echo "$backup_line"
+    summary+=$'\n'"$backup_line"
     problems="$(sed '/^[[:space:]]*$/d' <<<"$problems" | sort)"
-    alert_on_change "$problems" "$report"
+    alert_on_change "$problems" "$summary"
     [[ -z "$problems" ]]
 }
 
 # Alerts when the set of problems changes (including recovery), and re-alerts an unchanged problem daily.
+# The new state is recorded only once the alert is delivered, so a failed send is retried next run.
 alert_on_change() {
-    local problems="$1" report="$2" state=data/.health-alert now last_time=0 last=""
+    local problems="$1" body="$2" state=data/.health-alert now last_time=0 last="" title
     now="$(date +%s)"
     if [[ -f "$state" ]]; then
-        last_time="$(head -n 1 "$state")"
+        last_time="$(head -n 1 "$state" | tr -dc '0-9')"
         last="$(tail -n +2 "$state")"
     fi
+    [[ "$last_time" =~ ^[0-9]+$ ]] || last_time=0
     if [[ "$problems" == "$last" ]] && { [[ -z "$problems" ]] || ((now - last_time < REALERT_SECS)); }; then
         return 0
     fi
-    printf '%s\n%s\n' "$now" "$problems" >"$state.tmp" && mv "$state.tmp" "$state"
     if [[ -z "$problems" ]]; then
-        notify "stocktrader on $(hostname): recovered" "$report"
+        title="stocktrader on $(hostname): recovered"
     else
-        notify "stocktrader on $(hostname): $(tr '\n' ' ' <<<"$problems")" "$report"
+        title="stocktrader on $(hostname): $(tr '\n' ' ' <<<"$problems")"
     fi
+    notify "$title" "$body" || return 0
+    printf '%s\n%s\n' "$now" "$problems" >"$state.tmp" && mv "$state.tmp" "$state"
 }
 
 housekeeping() {
@@ -195,24 +231,45 @@ housekeeping() {
 
 # Copies data/ to BACKUP_DEST (any rsync destination: local path, mounted drive, or user@host:path).
 # Market data Parquet files are skipped (they are re-downloadable); everything else, including the raw
-# archive, asset snapshots and cursors, is copied. --delete only applies to *.jsonl, so the uncompressed
-# copy of a day is removed once its .jsonl.gz exists, but nothing else is ever deleted from the backup,
-# even if it disappears locally.
+# archive, asset snapshots and cursors, is copied.
+#
+# Deletion is tightly limited: only *.jsonl files can be deleted from the backup (`P! *.jsonl` protects
+# everything else), so the uncompressed copy of a day goes once its .jsonl.gz has replaced it, but a
+# compressed day is never removed even if it disappears locally. Deletes happen after all transfers
+# (so the .gz lands before its .jsonl goes) and are capped by --max-delete.
+#
+# Every step checks its own result rather than relying on `set -e`, which bash ignores inside functions
+# called from `||` (as housekeeping does). Success is recorded only after rsync succeeds.
 backup() {
-    local dest
+    local dest rc=0
     dest="$(env_value BACKUP_DEST)"
     if [[ -z "$dest" ]]; then
         echo "BACKUP_DEST not set in .env; skipping backup."
         return 0
     fi
-    if [[ -z "$(find data/raw -type f -name '*.jsonl*' -print -quit 2>/dev/null)" ]]; then
+    if [[ -z "$(find data/raw -type f \( -name '*.jsonl' -o -name '*.jsonl.gz' \) -print -quit 2>/dev/null)" ]]; then
         echo "data/raw has no archive files; refusing to back up an empty archive." >&2
         return 1
     fi
-    rsync -a --partial --delete --filter='P! *.jsonl' \
+    # A local destination must be marked, so an unmounted drive fails instead of filling the root disk.
+    if [[ "$dest" != *:* && ! -e "${dest%/}/$BACKUP_MARKER" ]]; then
+        echo "BACKUP_DEST $dest has no $BACKUP_MARKER file (is the drive mounted?)." >&2
+        echo "If this is the right place, create it once: touch '${dest%/}/$BACKUP_MARKER'" >&2
+        return 1
+    fi
+    rsync -a --delete-after --max-delete="$BACKUP_MAX_DELETE" --filter='P! *.jsonl' \
         --exclude='*.tmp' --exclude='.sync.lock' --exclude='marketdata/*.parquet' \
-        data/ "${dest%/}/"
-    date +%s >data/.last-backup
+        -e 'ssh -o BatchMode=yes' \
+        data/ "${dest%/}/" || rc=$?
+    # 24: some source files vanished during the transfer (normal for a live archive).
+    if ((rc != 0 && rc != 24)); then
+        echo "rsync to $dest failed with exit $rc" >&2
+        return "$rc"
+    fi
+    if ! { date +%s >data/.last-backup.tmp && mv data/.last-backup.tmp data/.last-backup; }; then
+        echo "Backup succeeded but data/.last-backup could not be written" >&2
+        return 1
+    fi
     echo "Backed up data/ to $dest"
 }
 
@@ -251,8 +308,15 @@ enable_timers() {
     fi
 }
 
+# PATH escaped for a systemd unit's ExecStart: `%` starts a specifier and `$` a variable, so both double.
+unit_path() {
+    local p="${1//\%/%%}"
+    printf '%s' "${p//\$/\$\$}"
+}
+
 install_ops() {
-    local self="${1//%/%%}" units="${2:-$HOME/.config/systemd/user}"
+    local self units="${2:-$HOME/.config/systemd/user}"
+    self="$(unit_path "$1")"
     mkdir -p "$units"
     write_timer_units "$units" stocktrader-health "archive health check" "\"$self\" health" 10min \
         "hourly" "RandomizedDelaySec=5m"
@@ -267,7 +331,8 @@ install_ops() {
 }
 
 install_timer() {
-    local self="${1//%/%%}" units="${2:-$HOME/.config/systemd/user}"
+    local self units="${2:-$HOME/.config/systemd/user}"
+    self="$(unit_path "$1")"
     mkdir -p "$units"
     # Retries cover a catch-up run firing at boot before Docker is up, or a transient API outage; the
     # start limit stops a persistent failure from retrying all day.

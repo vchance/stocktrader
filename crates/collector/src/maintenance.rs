@@ -32,14 +32,26 @@ fn source_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// Gzips every `.jsonl` day file dated before `before`, returning the compressed files.
+#[derive(Debug, Default)]
+pub struct CompactReport {
+    /// Newly written `.jsonl.gz` files.
+    pub compressed: Vec<PathBuf>,
+    /// Leftover `.jsonl` files removed because an identical `.jsonl.gz` already existed.
+    pub recovered: Vec<PathBuf>,
+    /// Files left untouched, with the reason.
+    pub errors: Vec<(PathBuf, String)>,
+}
+
+/// Gzips every `.jsonl` day file dated before `before`.
 ///
 /// The collector only appends to the file for the current UTC date, so callers pass a date at least a day
 /// back to stay clear of midnight. Each file is compressed to a temporary file, verified by decompressing
-/// and comparing byte for byte, renamed into place, and only then is the original deleted. An interrupted
-/// run can leave both versions, which readers dedupe like any other overlap; the next run redoes it.
-pub fn compact(root: &Path, before: NaiveDate) -> Result<Vec<PathBuf>> {
-    let mut done = Vec::new();
+/// and comparing byte for byte, renamed into place, and only then is the original deleted. An existing
+/// `.jsonl.gz` is never overwritten: if the `.jsonl` beside it is identical (a run interrupted between
+/// rename and delete), the `.jsonl` is removed; otherwise both are left for a human and reported. A file
+/// that fails is reported and the rest are still processed.
+pub fn compact(root: &Path, before: NaiveDate) -> Result<CompactReport> {
+    let mut report = CompactReport::default();
     for dir in source_dirs(root)? {
         let mut files: Vec<PathBuf> = fs::read_dir(&dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -48,17 +60,32 @@ pub fn compact(root: &Path, before: NaiveDate) -> Result<Vec<PathBuf>> {
             .collect();
         files.sort();
         for path in files {
-            compress_file(&path).with_context(|| format!("compressing {}", path.display()))?;
-            done.push(path.with_extension("jsonl.gz"));
+            match compress_file(&path) {
+                Ok(Compacted::Compressed(gz)) => report.compressed.push(gz),
+                Ok(Compacted::Recovered) => report.recovered.push(path),
+                Err(e) => report.errors.push((path, format!("{e:#}"))),
+            }
         }
     }
-    Ok(done)
+    Ok(report)
 }
 
-fn compress_file(path: &Path) -> Result<()> {
-    let gz = path.with_extension("jsonl.gz");
-    let tmp = path.with_extension("jsonl.gz.tmp");
+enum Compacted {
+    Compressed(PathBuf),
+    Recovered,
+}
 
+fn compress_file(path: &Path) -> Result<Compacted> {
+    let gz = path.with_extension("jsonl.gz");
+    if gz.exists() {
+        if same_contents(&mut File::open(path)?, &mut GzDecoder::new(File::open(&gz)?))? {
+            fs::remove_file(path)?;
+            return Ok(Compacted::Recovered);
+        }
+        bail!("{} already exists with different contents; left both for manual review", gz.display());
+    }
+
+    let tmp = path.with_extension("jsonl.gz.tmp");
     let mut encoder = GzEncoder::new(File::create(&tmp)?, Compression::default());
     io::copy(&mut File::open(path)?, &mut encoder)?;
     encoder.finish()?.sync_all()?;
@@ -68,8 +95,12 @@ fn compress_file(path: &Path) -> Result<()> {
         bail!("compressed copy does not match the original");
     }
     fs::rename(&tmp, &gz)?;
+    // Make the rename durable before the original disappears.
+    if let Some(dir) = gz.parent() {
+        File::open(dir)?.sync_all()?;
+    }
     fs::remove_file(path)?;
-    Ok(())
+    Ok(Compacted::Compressed(gz))
 }
 
 fn same_contents(a: &mut impl Read, b: &mut impl Read) -> io::Result<bool> {
@@ -103,6 +134,19 @@ pub enum Status {
     Ok,
     Stale,
     Missing,
+    /// Has archived data but is no longer configured (e.g. its keys were removed from `.env`).
+    Disabled,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Stale => "STALE",
+            Status::Missing => "MISSING",
+            Status::Disabled => "DISABLED",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,11 +158,25 @@ pub struct Check {
     pub detail: String,
 }
 
-/// How long a source may go without new records before it counts as stale: four polling intervals, but
-/// never less than half an hour.
-pub fn stale_after(interval: Duration) -> Duration {
-    (interval * 4).max(Duration::from_secs(30 * 60))
+/// How long a source may go without new records before it counts as stale: its longest backed-off polling
+/// gap plus two more intervals (at least four intervals), and never less than half an hour. Shorter limits
+/// would flap between ok and stale while a source is merely backing off.
+pub fn stale_after(interval: Duration, max_backoff: u32) -> Duration {
+    (interval * (max_backoff + 2).max(4)).max(Duration::from_secs(30 * 60))
 }
+
+/// A source that is not configured but has archived data, so its silence is visible.
+pub fn disabled_check(root: &Path, name: &str) -> Option<Check> {
+    root.join(name).is_dir().then(|| Check {
+        name: name.into(),
+        status: Status::Disabled,
+        last: None,
+        detail: "has archived data but is not configured; check its keys in .env".into(),
+    })
+}
+
+/// Newest records more than this far in the future mean the clock (now or when written) is wrong.
+const MAX_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 
 /// Checks the newest archived record of one source.
 pub fn source_check(root: &Path, name: &str, stale_after: Duration, now: DateTime<Utc>) -> Result<Check> {
@@ -130,6 +188,12 @@ fn classify(name: &str, last: Option<DateTime<Utc>>, limit: Duration, now: DateT
     let limit_text = humanize(limit);
     match last {
         None => Check { name: name.into(), status: Status::Missing, last, detail: "no records yet".into() },
+        Some(t) if t - now > chrono::TimeDelta::from_std(MAX_CLOCK_SKEW).expect("small duration") => Check {
+            name: name.into(),
+            status: Status::Stale,
+            last,
+            detail: format!("newest record is in the future ({t}); check the host clock"),
+        },
         Some(t) => {
             let age = (now - t).to_std().unwrap_or_default();
             let status = if age > limit { Status::Stale } else { Status::Ok };
@@ -252,16 +316,44 @@ mod tests {
         let original = fs::read(dir.path().join("reddit/2026-10-25.jsonl")).unwrap();
 
         let done = compact(dir.path(), day(26)).unwrap();
-        assert_eq!(done, vec![dir.path().join("reddit/2026-10-25.jsonl.gz")]);
+        assert_eq!(done.compressed, vec![dir.path().join("reddit/2026-10-25.jsonl.gz")]);
+        assert!(done.errors.is_empty());
         assert!(!dir.path().join("reddit/2026-10-25.jsonl").exists());
         assert!(dir.path().join("reddit/2026-10-26.jsonl").exists());
         assert!(dir.path().join(".state/2026-10-01.jsonl").exists());
 
         let mut restored = Vec::new();
-        GzDecoder::new(File::open(&done[0]).unwrap()).read_to_end(&mut restored).unwrap();
+        GzDecoder::new(File::open(&done.compressed[0]).unwrap()).read_to_end(&mut restored).unwrap();
         assert_eq!(restored, original);
 
-        assert!(compact(dir.path(), day(26)).unwrap().is_empty(), "second run is a no-op");
+        let again = compact(dir.path(), day(26)).unwrap();
+        assert!(again.compressed.is_empty() && again.recovered.is_empty(), "second run is a no-op");
+    }
+
+    #[test]
+    fn never_overwrites_an_existing_gz() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = Archive::new(dir.path());
+        archive.append(&[record("reddit", at(20, 1), "original"), record("finnhub_news", at(20, 1), "n")]).unwrap();
+        compact(dir.path(), day(26)).unwrap();
+        let gz = dir.path().join("reddit/2026-10-20.jsonl.gz");
+        let gz_before = fs::read(&gz).unwrap();
+
+        // A different .jsonl reappears beside the .gz (clock stepped back, manual restore...).
+        archive.append(&[record("reddit", at(20, 2), "different")]).unwrap();
+        // An identical leftover, as if a run died between rename and delete.
+        let mut identical = Vec::new();
+        GzDecoder::new(File::open(dir.path().join("finnhub_news/2026-10-20.jsonl.gz")).unwrap())
+            .read_to_end(&mut identical)
+            .unwrap();
+        fs::write(dir.path().join("finnhub_news/2026-10-20.jsonl"), &identical).unwrap();
+
+        let report = compact(dir.path(), day(26)).unwrap();
+        assert_eq!(report.errors.len(), 1, "conflict is reported, not resolved");
+        assert_eq!(fs::read(&gz).unwrap(), gz_before, "existing .gz untouched");
+        assert!(dir.path().join("reddit/2026-10-20.jsonl").exists(), "conflicting .jsonl kept");
+        assert_eq!(report.recovered, vec![dir.path().join("finnhub_news/2026-10-20.jsonl")]);
+        assert!(!dir.path().join("finnhub_news/2026-10-20.jsonl").exists());
     }
 
     #[test]
@@ -290,7 +382,16 @@ mod tests {
         let reddit = source_check(dir.path(), "reddit", limit, now).unwrap();
         assert_eq!(reddit.status, Status::Stale, "only a compressed old file exists");
         assert_eq!(source_check(dir.path(), "finnhub_news", limit, now).unwrap().status, Status::Missing);
-        assert_eq!(stale_after(Duration::from_secs(120)), Duration::from_secs(1800));
+        // Reddit (2m, no backoff) floors at 30m; ApeWisdom (15m, 4x) and Alpaca (5m, 16x) allow their backoff.
+        assert_eq!(stale_after(Duration::from_secs(120), 1), Duration::from_secs(1800));
+        assert_eq!(stale_after(Duration::from_secs(900), 4), Duration::from_secs(900 * 6));
+        assert_eq!(stale_after(Duration::from_secs(300), 16), Duration::from_secs(300 * 18));
+
+        let future = source_check(dir.path(), "apewisdom", limit, at(27, 9)).unwrap();
+        assert_eq!(future.status, Status::Stale, "a record an hour in the future means clock skew");
+
+        assert_eq!(disabled_check(dir.path(), "reddit").unwrap().status, Status::Disabled);
+        assert_eq!(disabled_check(dir.path(), "finnhub_news"), None, "never collected, nothing to flag");
     }
 
     #[test]

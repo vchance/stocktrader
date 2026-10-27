@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use chrono::{Days, Utc};
 use clap::{Parser, Subcommand};
-use st_collector::maintenance::{Status, compact, marketdata_check, source_check, stale_after};
+use st_collector::maintenance::{Status, compact, disabled_check, marketdata_check, source_check, stale_after};
 use st_collector::runner::{poll, run_forever};
 use st_collector::{Archive, Config, Source};
 use tokio::signal::unix::{SignalKind, signal};
@@ -30,15 +30,17 @@ enum Command {
     /// Show which sources are enabled and which environment variables the others need.
     Sources,
     /// Gzip day files older than yesterday (UTC); the file being written is never touched.
+    /// Exits 1 if any file could not be compacted (the rest still are).
     Compact,
-    /// Report how recently each enabled source (and the market data sync) produced data, one line each.
-    /// Exits 1 if anything is stale or missing.
+    /// Report how recently each source (and the market data sync) produced data, one line each.
+    /// Exits 1 if anything is stale, missing, or has data but is no longer configured.
     Health {
         /// Market data directory, checked if it holds a completed sync.
         #[arg(long, env = "STOCKTRADER_MARKETDATA_DIR", default_value = "data/marketdata")]
         marketdata_dir: PathBuf,
-        /// Allowed days since the last market data sync (weekends and a holiday need 4).
-        #[arg(long, default_value_t = 4)]
+        /// Allowed days since the last market data sync. The sync runs Tue-Sat, so a normal weekend
+        /// gap (Sat to Tue) is 3 days.
+        #[arg(long, default_value_t = 3)]
         marketdata_max_days: u64,
     },
 }
@@ -62,27 +64,38 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Compact => {
             let before = Utc::now().date_naive() - Days::new(1);
-            let done = compact(archive.root(), before)?;
-            println!("compressed {} file(s) dated before {before}", done.len());
+            let report = compact(archive.root(), before)?;
+            println!(
+                "compressed {} file(s) dated before {before}; removed {} leftover duplicate(s)",
+                report.compressed.len(),
+                report.recovered.len()
+            );
+            for (path, reason) in &report.errors {
+                println!("NOT COMPACTED {}: {reason}", path.display());
+            }
+            if !report.errors.is_empty() {
+                std::process::exit(1);
+            }
         }
         Command::Health { marketdata_dir, marketdata_max_days } => {
             let now = Utc::now();
             let mut checks = Vec::new();
             for source in config.sources() {
-                checks.push(source_check(archive.root(), source.name(), stale_after(source.interval()), now)?);
+                let limit = stale_after(source.interval(), source.max_backoff());
+                checks.push(source_check(archive.root(), source.name(), limit, now)?);
+            }
+            for (name, missing) in config.describe() {
+                if missing.is_some() {
+                    checks.extend(disabled_check(archive.root(), name));
+                }
             }
             // The sync runs in New York time; its manifest is dated in New York.
             let today = now.with_timezone(&chrono_tz::America::New_York).date_naive();
             checks.extend(marketdata_check(&marketdata_dir, marketdata_max_days, today)?);
             let mut problems = 0;
             for c in &checks {
-                let label = match c.status {
-                    Status::Ok => "ok",
-                    Status::Stale => "STALE",
-                    Status::Missing => "MISSING",
-                };
                 problems += usize::from(c.status != Status::Ok);
-                println!("{:<14} {label:<8} {}", c.name, c.detail);
+                println!("{:<14} {:<8} {}", c.name, c.status.label(), c.detail);
             }
             if problems > 0 {
                 std::process::exit(1);
