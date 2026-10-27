@@ -71,7 +71,7 @@ enum Command {
     Plans(plans::PlansArgs),
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct DataArgs {
     /// CSV of daily bars with header symbol,date,open,high,low,close,volume.
     #[arg(long, conflicts_with = "parquet")]

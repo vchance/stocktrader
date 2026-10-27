@@ -16,8 +16,9 @@
 #   deploy/collector.sh install-ops      hourly health check + nightly housekeeping (systemd user timers)
 #   deploy/collector.sh install-timer    nightly sync-marketdata (systemd user timer)
 #   deploy/collector.sh install-fundamentals-timer  daily sync-fundamentals (systemd user timer)
-#   deploy/collector.sh paper-trade      plan today's Alpaca paper-account orders with PAPER_ARGS from .env and
-#                                        print them; add --submit to send them (extra flags go to `stocktrader paper`)
+#   deploy/collector.sh paper-trade      plan today's paper orders for every plan in paper mode (each in its own
+#                                        Alpaca paper account), or for PAPER_ARGS from .env if set, and print them;
+#                                        add --submit to send them
 #   deploy/collector.sh install-paper-timer  paper-trade --submit each weekday before the open (systemd user timer)
 #                                        (the install-* commands given a DIR only write the units there)
 #   deploy/collector.sh check-symbols    how much of the Alpaca universe the SEC ticker map and fundamentals cover
@@ -248,7 +249,7 @@ health() {
     fi
     jobs+=("$(job_status fundamentals stocktrader-fundamentals.timer 'data/fundamentals/tickers/*.json' "$FUNDAMENTALS_MAX_AGE_SECS")")
     jobs+=("$(job_status facts stocktrader-fundamentals.timer data/fundamentals/facts.parquet "$FACTS_MAX_AGE_SECS")")
-    jobs+=("$(job_status paper stocktrader-paper.timer 'data/live/journal/*.jsonl' "$PAPER_MAX_AGE_SECS")")
+    jobs+=("$(job_status paper stocktrader-paper.timer 'data/live/journal/*.jsonl data/live/*/journal/*.jsonl' "$PAPER_MAX_AGE_SECS")")
     for job_line in "${jobs[@]}"; do
         echo "$job_line"
         summary+=$'\n'"$job_line"
@@ -497,30 +498,31 @@ install_fundamentals_timer() {
     enable_timers stocktrader-fundamentals.timer
 }
 
-# Runs `stocktrader paper` with PAPER_ARGS from .env (strategy and symbols) plus ARGS. A failed run that was
+# Runs `stocktrader plans paper ARGS` (every plan in paper mode), or `stocktrader paper` with PAPER_ARGS from .env
+# (one strategy, the single-account setup) when that is set. A failed run that was
 # meant to submit orders raises an alert.
 paper_trade() {
     prepare
-    local args=() status=0
+    local args=() status=0 run=()
     read -r -a args <<<"$(env_value PAPER_ARGS)"
     if ((${#args[@]} == 0)); then
-        echo "PAPER_ARGS is not set in .env; for example: PAPER_ARGS=--symbols AAPL,MSFT,NVDA --strategy sma" >&2
-        status=1
+        run=(--entrypoint stocktrader paper plans paper)
     else
-        docker compose build paper >/dev/null || status=$?
+        run=(paper)
     fi
+    docker compose build paper >/dev/null || status=$?
     local output="" report copy
     if ((status == 0)); then
         # Streamed (so a run killed by a timeout still leaves its output in the journal) and copied for the report.
         copy="$(mktemp)"
-        docker compose run --rm --no-deps -T paper "${args[@]}" "$@" 2>&1 </dev/null | tee "$copy" || status=$?
+        docker compose run --rm --no-deps -T "${run[@]}" "${args[@]}" "$@" 2>&1 </dev/null | tee "$copy" || status=$?
         output="$(cat "$copy")"
         rm -f "$copy"
     fi
     [[ " ${args[*]} $* " == *" --submit "* ]] || return "$status"
     # Only the runner's own report lines go into alerts, never raw docker/compose output, which can quote
     # .env lines.
-    report="$(grep -E '^(session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:|Caused by:|    [0-9]+: )' \
+    report="$(grep -E '^(plan |paper plan|session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:|Caused by:|    [0-9]+: )' \
         <<<"$output" || true)"
     if ((status != 0)); then
         local body="See: journalctl --user -u stocktrader-paper"
@@ -546,7 +548,9 @@ install_paper_timer() {
         echo "Wrote units to $units without installing them."
         return 0
     fi
-    [[ -z "$(env_value PAPER_ARGS)" ]] && echo "Warning: PAPER_ARGS is not set in .env; runs will fail until it is."
+    if [[ -z "$(env_value PAPER_ARGS)" ]]; then
+        echo "Runs trade every plan in plans/ with mode = \"paper\", each with its own APCA_API_KEY_ID_<PLAN> keys in .env."
+    fi
     enable_timers stocktrader-paper.timer
 }
 

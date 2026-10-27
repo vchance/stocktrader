@@ -1,6 +1,7 @@
 //! Trading plans: named, saved descriptions of how to trade (strategy, universe, risk and capital) kept as
 //! TOML files in `plans/`, so several can be backtested, compared and later paper-traded side by side.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,14 @@ enum PlansCommand {
         #[command(flatten)]
         run: RunArgs,
     },
+    /// Before the open, trade each plan in paper mode (or the plans named) in its own Alpaca paper account,
+    /// with keys from APCA_API_KEY_ID_<PLAN> and APCA_API_SECRET_KEY_<PLAN>. Prints the plans only, unless
+    /// --submit.
+    Paper {
+        names: Vec<String>,
+        #[command(flatten)]
+        run: PaperRunArgs,
+    },
 }
 
 #[derive(Args)]
@@ -50,6 +59,19 @@ struct RunArgs {
     /// Last session (overrides the plan's `[backtest] end`).
     #[arg(long)]
     end: Option<NaiveDate>,
+    #[command(flatten)]
+    dirs: DataDirs,
+    /// Run on generated prices instead of market data, to try the plumbing before any data is downloaded
+    /// (prices only: not for strategies that need fundamentals or attention).
+    #[arg(long)]
+    synthetic: bool,
+    /// Where HTML reports are written.
+    #[arg(long, env = "STOCKTRADER_REPORTS_DIR", default_value = "reports")]
+    reports_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct DataDirs {
     /// Directory with bars_daily_all.parquet (and the raw file) from `marketdata sync`.
     #[arg(long, env = "STOCKTRADER_MARKETDATA_DIR", default_value = "data/marketdata")]
     marketdata_dir: PathBuf,
@@ -59,13 +81,25 @@ struct RunArgs {
     /// Directory with apewisdom.parquet from `signals apewisdom`, for attention strategies.
     #[arg(long, env = "STOCKTRADER_SIGNALS_DIR", default_value = "data/signals")]
     signals_dir: PathBuf,
-    /// Run on generated prices instead of market data, to try the plumbing before any data is downloaded
-    /// (prices only: not for strategies that need fundamentals or attention).
+}
+
+#[derive(Args)]
+struct PaperRunArgs {
+    #[command(flatten)]
+    dirs: DataDirs,
+    /// Send the orders. Without this each plan's orders are only printed and journaled.
     #[arg(long)]
-    synthetic: bool,
-    /// Where HTML reports are written.
-    #[arg(long, env = "STOCKTRADER_REPORTS_DIR", default_value = "reports")]
-    reports_dir: PathBuf,
+    submit: bool,
+    /// Allow submitting while the market is open (orders then fill at once, not at the open).
+    #[arg(long)]
+    allow_open: bool,
+    /// Journals go to `<dir>/<plan>/journal/`. A KILL file in `<dir>` stops new exposure for every plan,
+    /// one in `<dir>/<plan>` for that plan; exits still go out.
+    #[arg(long, env = "STOCKTRADER_LIVE_DIR", default_value = "data/live")]
+    live_dir: PathBuf,
+    /// Alpaca trading endpoint; anything other than the paper endpoint is refused.
+    #[arg(long, default_value = st_paper::PAPER_URL)]
+    trading_url: String,
 }
 
 /// A plan file. Unknown keys are errors, so a typo can't silently fall back to a default.
@@ -90,6 +124,33 @@ pub struct Plan {
     pub risk: Risk,
     #[serde(default)]
     pub backtest: BacktestWindow,
+    #[serde(default)]
+    pub paper: PaperSettings,
+}
+
+/// Settings for paper runs (`mode = "paper"`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PaperSettings {
+    /// Refuse a run that would place more orders than this.
+    #[serde(default = "default_max_orders")]
+    pub max_orders: usize,
+    /// Calendar days of history replayed before each run to warm up the strategy.
+    #[serde(default = "default_history_days")]
+    pub history_days: u64,
+}
+
+impl Default for PaperSettings {
+    fn default() -> Self {
+        Self { max_orders: default_max_orders(), history_days: default_history_days() }
+    }
+}
+
+fn default_max_orders() -> usize {
+    20
+}
+fn default_history_days() -> u64 {
+    400
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
@@ -332,26 +393,26 @@ impl Plan {
     }
 
     /// The replay inputs for this plan over `window`.
-    fn data_args(&self, run: &RunArgs, window: (Option<NaiveDate>, Option<NaiveDate>)) -> Result<DataArgs> {
+    fn data_args(&self, dirs: &DataDirs, synthetic: bool, window: (Option<NaiveDate>, Option<NaiveDate>)) -> Result<DataArgs> {
         let needs_attention = matches!(self.strategy, StrategySpec::AttentionSpike { .. });
         let needs_fundamentals = matches!(self.strategy, StrategySpec::QualityValue { .. });
-        if run.synthetic && (needs_attention || needs_fundamentals) {
+        if synthetic && (needs_attention || needs_fundamentals) {
             bail!("plan {} needs real data (fundamentals or attention); --synthetic only generates prices", self.name);
         }
-        let parquet = run.marketdata_dir.join("bars_daily_all.parquet");
-        if !run.synthetic && !parquet.exists() {
+        let parquet = dirs.marketdata_dir.join("bars_daily_all.parquet");
+        if !synthetic && !parquet.exists() {
             bail!("no market data at {}; run `marketdata sync`, or try the plan with --synthetic", parquet.display());
         }
         Ok(DataArgs {
             bars: None,
-            parquet: (!run.synthetic).then_some(parquet),
+            parquet: (!synthetic).then_some(parquet),
             raw: None,
-            start: if run.synthetic { None } else { window.0 },
-            end: if run.synthetic { None } else { window.1 },
-            symbols: if run.synthetic { Vec::new() } else { self.universe.symbols.clone() },
-            attention: needs_attention.then(|| run.signals_dir.join("apewisdom.parquet")),
-            fundamentals: needs_fundamentals.then(|| run.fundamentals_dir.clone()),
-            benchmark: if run.synthetic { "none".into() } else { self.backtest.benchmark.clone() },
+            start: if synthetic { None } else { window.0 },
+            end: if synthetic { None } else { window.1 },
+            symbols: if synthetic { Vec::new() } else { self.universe.symbols.clone() },
+            attention: needs_attention.then(|| dirs.signals_dir.join("apewisdom.parquet")),
+            fundamentals: needs_fundamentals.then(|| dirs.fundamentals_dir.clone()),
+            benchmark: if synthetic { "none".into() } else { self.backtest.benchmark.clone() },
             synthetic_symbols: 50,
             synthetic_days: 750,
             seed: 42,
@@ -362,8 +423,29 @@ impl Plan {
         })
     }
 
+    /// The paper run for this plan: its universe, risk and strategy, its own journal and kill file.
+    fn paper_job(&self, dirs: &DataDirs, live_dir: &Path) -> Result<crate::paper::Job> {
+        let (params, weight) = self.strategy.params();
+        let mut data = self.data_args(dirs, false, (None, None))?;
+        data.benchmark = "none".into();
+        let plan = self.clone();
+        let plan_dir = live_dir.join(&self.name);
+        Ok(crate::paper::Job {
+            label: self.name.clone(),
+            params,
+            weight,
+            data,
+            limits: Box::new(move |limits| plan.limits(limits)),
+            symbols: self.universe.symbols.clone(),
+            kill_files: vec![live_dir.join("KILL"), plan_dir.join("KILL")],
+            live_dir: plan_dir,
+            history_days: self.paper.history_days,
+            max_orders: self.paper.max_orders,
+        })
+    }
+
     fn run(&self, args: &RunArgs, window: (Option<NaiveDate>, Option<NaiveDate>)) -> Result<Run> {
-        let data = self.data_args(args, window)?;
+        let data = self.data_args(&args.dirs, args.synthetic, window)?;
         let (params, weight) = self.strategy.params();
         run_backtest(&data, &params, weight, |limits| *limits = self.limits(limits.clone()))
     }
@@ -483,7 +565,69 @@ pub fn run(args: &PlansArgs) -> Result<()> {
             println!("report            {}", path.display());
             Ok(())
         }
+        PlansCommand::Paper { names, run } => paper(&args.plans_dir, names, run),
     }
+}
+
+/// `_QUALITY_VALUE_CORE` for `quality-value-core`: the suffix of the plan's Alpaca key variables.
+pub fn account_suffix(name: &str) -> String {
+    format!("_{}", name.to_ascii_uppercase().replace('-', "_"))
+}
+
+fn paper(dir: &Path, names: &[String], run: &PaperRunArgs) -> Result<()> {
+    let plans: Vec<Plan> = if names.is_empty() {
+        load_all(dir)?
+            .into_iter()
+            .map(|(_, p)| p.map(|(plan, _)| plan))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|p| p.mode == Mode::Paper)
+            .collect()
+    } else {
+        let named: Vec<Plan> = names.iter().map(|n| load_named(dir, n).map(|(p, _)| p)).collect::<Result<_>>()?;
+        if let Some(p) = named.iter().find(|p| p.mode != Mode::Paper) {
+            bail!("plan {} is in {} mode; set mode = \"paper\" to paper-trade it", p.name, p.mode);
+        }
+        named
+    };
+    if plans.is_empty() {
+        println!("no plans in paper mode in {}", dir.display());
+        return Ok(());
+    }
+    // Every plan needs its own account: two plans sharing one would trade against each other's positions.
+    let mut clients = Vec::new();
+    let mut by_key: HashMap<String, &str> = HashMap::new();
+    for plan in &plans {
+        let (client, key_id) = crate::paper::client_from_env(&account_suffix(&plan.name), &run.trading_url)
+            .with_context(|| format!("plan {} needs its own Alpaca paper account", plan.name))?;
+        if let Some(other) = by_key.insert(key_id, &plan.name) {
+            bail!("plans {other} and {} use the same Alpaca account; give each plan its own paper account", plan.name);
+        }
+        clients.push(client);
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut failed = Vec::new();
+    for (plan, client) in plans.iter().zip(&clients) {
+        println!();
+        println!("plan              {}", plan.name);
+        let result = plan.paper_job(&run.dirs, &run.live_dir).and_then(|job| {
+            rt.block_on(crate::paper::run_job(&job, client, run.submit, run.allow_open))
+        });
+        if let Err(e) = result {
+            println!("Error: {e:#}");
+            failed.push(plan.name.clone());
+        }
+    }
+    println!();
+    for plan in &plans {
+        let state = if failed.contains(&plan.name) { "FAILED" } else { "ok" };
+        println!("paper plan        {:<24} {state}", plan.name);
+    }
+    if !failed.is_empty() {
+        bail!("{} of {} plans failed: {}", failed.len(), plans.len(), failed.join(", "));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -541,6 +685,14 @@ mod tests {
         let half = "name = \"q\"\n[strategy]\nkind = \"quality-value\"\n[risk]\nmax_gross_exposure = 0.5\n";
         assert!(parse(half).is_err(), "quality-value can't fit 1/N weights under half exposure");
         assert!(parse("name = \"Bad Name\"\n[strategy]\nkind = \"quality-value\"\n").is_err());
+    }
+
+    #[test]
+    fn paper_settings_and_account_suffix() {
+        let plan = parse("name = \"p\"\nmode = \"paper\"\n[strategy]\nkind = \"sma\"\nfast = 5\nslow = 20\n[paper]\nmax_orders = 5\n").unwrap();
+        assert_eq!(plan.paper, PaperSettings { max_orders: 5, history_days: 400 });
+        assert!(parse("name = \"p\"\n[strategy]\nkind = \"sma\"\nfast = 5\nslow = 20\n[paper]\nmax_order = 5\n").is_err());
+        assert_eq!(account_suffix("quality-value-core"), "_QUALITY_VALUE_CORE");
     }
 
     #[test]

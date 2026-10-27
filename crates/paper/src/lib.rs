@@ -9,4 +9,4 @@ pub mod plan;
 
 pub use alpaca::{PAPER_URL, Sessions, TradingClient, sessions};
 pub use execute::{Journal, Outcome, submit_plan};
-pub use plan::{AccountState, Plan, PlannedOrder, check_account, open_requests, plan, portfolio_from};
+pub use plan::{AccountState, Plan, PlannedOrder, check_account, open_requests, plan, plan_stream, portfolio_from};
