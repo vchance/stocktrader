@@ -43,8 +43,8 @@ pub fn daily_bar(
 ) -> Bar {
     Bar {
         symbol,
-        start: new_york(date, 9, 30),
-        end: new_york(date, 16, 0),
+        start: session_open(date),
+        end: session_close(date),
         open,
         high,
         low,
@@ -52,6 +52,16 @@ pub fn daily_bar(
         volume,
         traded_close: None,
     }
+}
+
+/// 09:30 New York on `date`: when a daily bar starts.
+pub fn session_open(date: NaiveDate) -> Timestamp {
+    new_york(date, 9, 30)
+}
+
+/// 16:00 New York on `date`: when a daily bar's close becomes known.
+pub fn session_close(date: NaiveDate) -> Timestamp {
+    new_york(date, 16, 0)
 }
 
 fn new_york(date: NaiveDate, hour: u32, minute: u32) -> Timestamp {

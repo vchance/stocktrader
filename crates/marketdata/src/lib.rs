@@ -6,10 +6,14 @@
 //! while filters such as "price above $5" need what the stock actually traded at.
 
 pub mod alpaca;
+pub mod replay;
 pub mod store;
 pub mod sync;
 pub mod universe;
 
 pub use alpaca::{Adjustment, AlpacaClient, Asset};
-pub use store::{BarFilter, BarWriter, DailyBar, StagedFile, Stats, Summary, read_bars, summarize, to_core_bar};
+pub use replay::{BarEventSource, ReplayStats};
+pub use store::{
+    BarFilter, BarReader, BarWriter, DailyBar, StagedFile, Stats, Summary, date_range, read_bars, summarize, to_core_bar,
+};
 pub use sync::{SyncConfig, SyncReport, bars_path, sync};

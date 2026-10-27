@@ -1,17 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{Result, bail};
 use chrono::{NaiveDate, TimeDelta};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
-use st_core::{Bar, Event, Strategy, Timestamp};
-use st_data::{SyntheticConfig, VecEventSource, generate_daily_bars, load_daily_bars};
+use st_core::{Bar, Event, EventSource, Strategy, Timestamp};
+use st_data::{
+    MergeSource, SyntheticConfig, VecEventSource, generate_daily_bars, load_daily_bars, session_close, session_open,
+};
 use st_engine::metrics::{self, buy_and_hold, correlation};
 use st_engine::{Backtest, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
-use st_marketdata::{BarFilter, DailyBar, read_bars, to_core_bar};
+use st_marketdata::{BarEventSource, BarFilter, ReplayStats, date_range, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, SmaCrossover};
 use tracing_subscriber::EnvFilter;
@@ -66,8 +69,9 @@ struct DataArgs {
     /// CSV of daily bars with header symbol,date,open,high,low,close,volume.
     #[arg(long, conflicts_with = "parquet")]
     bars: Option<PathBuf>,
-    /// Parquet bars from `marketdata sync`, e.g. data/marketdata/bars_daily_all.parquet. Every matching bar
-    /// is held in memory, so narrow large files with --start/--end/--symbols.
+    /// Parquet bars from `marketdata sync`, e.g. data/marketdata/bars_daily_all.parquet. `backtest` streams
+    /// them from disk; `walk-forward` holds every matching bar in memory, so narrow it with
+    /// --start/--end/--symbols.
     #[arg(long)]
     parquet: Option<PathBuf>,
     /// As-traded bars for the price-level filter. Defaults to bars_daily_raw.parquet beside --parquet.
@@ -218,35 +222,52 @@ impl StrategyArgs {
 
 struct Loaded {
     events: Vec<Event>,
-    bars: usize,
     /// Buy-and-hold comparison bars, if the benchmark symbol was found.
     benchmark: Option<Vec<Bar>>,
     /// Risk limits for this data: strict about traded prices when a raw file supplied them.
     limits: RiskLimits,
 }
 
+/// A replay that hasn't run yet, for a single pass over data that may not fit in memory.
+struct Prepared {
+    source: Box<dyn EventSource>,
+    report: ReplayReport,
+    benchmark: Option<Vec<Bar>>,
+    limits: RiskLimits,
+}
+
+/// What a replay saw, to report once it has run.
+struct ReplayReport {
+    stats: Rc<RefCell<ReplayStats>>,
+    /// The symbols asked for with --symbols, if any.
+    wanted: Option<HashSet<String>>,
+    /// Bars carry as-traded closes from a raw file.
+    traded_prices: bool,
+}
+
 fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
     let params = args.params(data.attention.is_some())?;
     let strategy = make_strategy(&params, args.weight)?;
-    let loaded = load(data)?;
+    let prepared = prepare(data)?;
     let report = Backtest::new(
-        VecEventSource::new(loaded.events),
+        prepared.source,
         strategy,
         SimulatedBroker::new(fill_model(data)),
-        RiskManager::new(loaded.limits),
+        RiskManager::new(prepared.limits),
         data.cash,
     )
     .run()?;
+    report_replay(&prepared.report)?;
 
     println!("strategy          {params}");
-    println!("bars replayed     {}", loaded.bars);
+    println!("bars replayed     {}", prepared.report.stats.borrow().bars);
     print_metrics("", &report.metrics);
     println!("fills             {}", report.metrics.num_fills);
     println!("commissions       {:.2}", report.metrics.commissions);
     println!("rejected signals  {}", report.rejections.len());
     println!("open positions    {}", report.final_portfolio.positions().count());
 
-    if let Some(bench) = &loaded.benchmark {
+    if let Some(bench) = &prepared.benchmark {
         let refs: Vec<&Bar> = bench.iter().collect();
         let curve = buy_and_hold(&refs, data.cash);
         let m = metrics::compute(&curve, &[]);
@@ -365,24 +386,44 @@ fn raw_sibling(adjusted: &Path) -> Option<PathBuf> {
     name.contains("_all").then(|| adjusted.with_file_name(name.replacen("_all", "_raw", 1)))
 }
 
+/// Everything in memory, for runs that replay the data more than once (walk-forward) or need it as a whole
+/// (paper trading's freshness check).
 fn load(data: &DataArgs) -> Result<Loaded> {
+    let prepared = prepare(data)?;
+    let mut source = prepared.source;
+    let events: Vec<Event> = std::iter::from_fn(|| source.next_event()).collect();
+    report_replay(&prepared.report)?;
+    Ok(Loaded { events, benchmark: prepared.benchmark, limits: prepared.limits })
+}
+
+/// The replay for `data`: Parquet bars are streamed from disk (with as-traded closes merged in from the raw
+/// file), CSV and synthetic bars come from memory, and attention events are interleaved by time. Nothing is
+/// checked until the source is drained; call [`report_replay`] afterwards.
+fn prepare(data: &DataArgs) -> Result<Prepared> {
     let benchmark_symbol = (!data.benchmark.eq_ignore_ascii_case("none")).then(|| data.benchmark.to_ascii_uppercase());
-    let (bars, benchmark, traded_prices) = match (&data.bars, &data.parquet) {
-        (Some(path), _) => {
-            let bars = load_daily_bars(path)?;
-            let bench = benchmark_symbol.as_ref().map(|s| bars.iter().filter(|b| b.symbol.as_str() == s).cloned().collect());
-            (bars, bench, false)
+    let (bars, benchmark, report, span, tickers): (Box<dyn EventSource>, _, _, _, _) = match (&data.bars, &data.parquet) {
+        (None, Some(path)) => {
+            let p = open_parquet(data, path, benchmark_symbol.as_deref())?;
+            let tickers = p.report.wanted.clone();
+            (Box::new(p.source), p.benchmark, p.report, p.span, tickers)
         }
-        (None, Some(path)) => load_parquet(data, path, benchmark_symbol.as_deref())?,
-        (None, None) => {
-            let bars = generate_daily_bars(&SyntheticConfig {
-                symbols: data.synthetic_symbols,
-                days: data.synthetic_days,
-                start: NaiveDate::from_ymd_opt(2023, 1, 3).expect("valid date"),
-                seed: data.seed,
-            });
+        (bars_path, _) => {
+            let bars = match bars_path {
+                Some(path) => load_daily_bars(path)?,
+                None => generate_daily_bars(&SyntheticConfig {
+                    symbols: data.synthetic_symbols,
+                    days: data.synthetic_days,
+                    start: NaiveDate::from_ymd_opt(2023, 1, 3).expect("valid date"),
+                    seed: data.seed,
+                }),
+            };
             let bench = benchmark_symbol.as_ref().map(|s| bars.iter().filter(|b| b.symbol.as_str() == s).cloned().collect());
-            (bars, bench, false)
+            let symbols: HashSet<String> = bars.iter().map(|b| b.symbol.as_str().to_string()).collect();
+            let span = bars.iter().map(|b| b.start).min().zip(bars.iter().map(|b| b.end).max());
+            let stats = ReplayStats { bars: bars.len(), symbols: symbols.iter().cloned().collect(), ..ReplayStats::default() };
+            let report = ReplayReport { stats: Rc::new(RefCell::new(stats)), wanted: None, traded_prices: false };
+            let source = VecEventSource::new(bars.into_iter().map(Event::bar).collect());
+            (Box::new(source), bench, report, span, Some(symbols))
         }
     };
     let benchmark = match (benchmark, &benchmark_symbol) {
@@ -394,23 +435,21 @@ fn load(data: &DataArgs) -> Result<Loaded> {
         _ => None,
     };
 
-    let n_bars = bars.len();
     // Attention only matters for symbols we have prices for, within the replayed period; anything else
     // would cost memory and stretch the metrics' time span.
-    let bar_symbols: HashSet<String> = bars.iter().map(|b| b.symbol.as_str().to_string()).collect();
-    let first_bar = bars.iter().map(|b| b.start).min();
-    let last_bar = bars.iter().map(|b| b.end).max();
-    let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
+    let mut attention = Vec::new();
     if let Some(path) = &data.attention {
-        let to = data.attention_until.or(last_bar);
-        let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to };
+        let (first, last) = (span.map(|s| s.0), span.map(|s| s.1));
+        let filter = st_signals::RowFilter { tickers, from: first, to: data.attention_until.or(last) };
         let rows = st_signals::read_rows(path, &filter)?;
         println!("attention events  {}", rows.len());
-        warn_on_coverage(first_bar, rows.iter().map(|r| r.observed_at).min());
-        events.extend(st_signals::to_events(&rows));
+        warn_on_coverage(first, rows.iter().map(|r| r.observed_at).min());
+        attention = st_signals::to_events(&rows);
     }
-    let limits = RiskLimits { min_price: data.min_price, require_traded_price: traded_prices, ..RiskLimits::default() };
-    Ok(Loaded { events, bars: n_bars, benchmark, limits })
+    let source: Box<dyn EventSource> = Box::new(MergeSource::new(bars, VecEventSource::new(attention)));
+    let limits =
+        RiskLimits { min_price: data.min_price, require_traded_price: report.traded_prices, ..RiskLimits::default() };
+    Ok(Prepared { source, report, benchmark, limits })
 }
 
 fn warn_on_coverage(first_bar: Option<Timestamp>, first_attention: Option<Timestamp>) {
@@ -427,89 +466,81 @@ fn warn_on_coverage(first_bar: Option<Timestamp>, first_attention: Option<Timest
     }
 }
 
-/// Adjusted bars for the replay, each carrying its as-traded close from the raw file when available, the
-/// benchmark's bars (read separately, so `--symbols` needn't include it), and whether traded prices are in
-/// use.
-fn load_parquet(
-    data: &DataArgs,
-    path: &Path,
-    benchmark: Option<&str>,
-) -> Result<(Vec<Bar>, Option<Vec<Bar>>, bool)> {
-    let symbols = (!data.symbols.is_empty()).then(|| data.symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect());
-    let filter = BarFilter { symbols, start: data.start, end: data.end };
+struct ParquetReplay {
+    /// Adjusted bars, each carrying its as-traded close when the raw file is there.
+    source: BarEventSource,
+    report: ReplayReport,
+    /// Read separately, so `--symbols` needn't include it.
+    benchmark: Option<Vec<Bar>>,
+    /// From the first session's open to the last session's close.
+    span: Option<(Timestamp, Timestamp)>,
+}
+
+fn open_parquet(data: &DataArgs, path: &Path, benchmark: Option<&str>) -> Result<ParquetReplay> {
+    let symbols: Option<HashSet<String>> =
+        (!data.symbols.is_empty()).then(|| data.symbols.iter().map(|s| s.trim().to_ascii_uppercase()).collect());
+    let filter = BarFilter { symbols: symbols.clone(), start: data.start, end: data.end };
     let raw_path = match &data.raw {
         Some(raw) if !raw.exists() => bail!("--raw {} does not exist", raw.display()),
         Some(raw) => Some(raw.clone()),
         None => raw_sibling(path).filter(|p| p.exists()),
     };
-    let traded: HashMap<(String, NaiveDate), Decimal> = match &raw_path {
-        Some(raw) => read_bars(raw, &filter)?
-            .into_iter()
-            .filter_map(|b| Some(((b.symbol, b.date), Decimal::from_f64(b.close)?.round_dp(6))))
-            .collect(),
-        None => {
-            if data.min_price > Decimal::ZERO {
-                eprintln!(
-                    "warning: no raw bars found beside {}; --min-price {} will see split-adjusted prices, which \
-                     understate pre-split prices and bias the universe (pass --raw, or --min-price 0)",
-                    path.display(),
-                    data.min_price
-                );
-            }
-            HashMap::new()
-        }
-    };
-    let to_bar = |b: &DailyBar| {
-        to_core_bar(b).map(|mut bar| {
-            bar.traded_close = traded.get(&(b.symbol.clone(), b.date)).copied();
-            bar
-        })
-    };
-
-    let raw = read_bars(path, &filter)?;
-    let bars: Vec<Bar> = raw.iter().filter_map(to_bar).collect();
-    if bars.len() < raw.len() {
-        eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
+    if raw_path.is_none() && data.min_price > Decimal::ZERO {
+        eprintln!(
+            "warning: no raw bars found beside {}; --min-price {} will see split-adjusted prices, which \
+             understate pre-split prices and bias the universe (pass --raw, or --min-price 0)",
+            path.display(),
+            data.min_price
+        );
     }
-    if raw_path.is_some() {
-        report_traded_coverage(&bars);
-    }
-    if let Some(wanted) = &filter.symbols {
-        let found: HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
-        let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
-        if !missing.is_empty() {
-            eprintln!("no bars for: {}", missing.join(", "));
-        }
-    }
+    let (source, stats) = BarEventSource::open(path, raw_path.as_deref(), &filter)?;
+    let span = date_range(path)?.map(|(first, last)| {
+        let first = data.start.map_or(first, |s| s.max(first));
+        let last = data.end.map_or(last, |e| e.min(last));
+        (session_open(first), session_close(last))
+    });
     let bench = match benchmark {
         Some(symbol) => {
-            let filter = BarFilter { symbols: Some(HashSet::from([symbol.to_string()])), ..filter.clone() };
+            let filter = BarFilter { symbols: Some(HashSet::from([symbol.to_string()])), ..filter };
             Some(read_bars(path, &filter)?.iter().filter_map(to_core_bar).collect())
         }
         None => None,
     };
-    Ok((bars, bench, raw_path.is_some()))
+    let report = ReplayReport { stats, wanted: symbols, traded_prices: raw_path.is_some() };
+    Ok(ParquetReplay { source, report, benchmark: bench, span })
 }
 
-/// With traded prices in use, bars lacking one fail closed in the risk check; say how many and which.
-fn report_traded_coverage(bars: &[Bar]) {
-    let missing: Vec<&Bar> = bars.iter().filter(|b| b.traded_close.is_none()).collect();
-    if missing.is_empty() {
-        return;
+/// After a replay: fails on a read error that cut it short, and reports skipped bars, symbols that were
+/// asked for but never seen, and bars lacking an as-traded price (which fail closed in the risk check).
+fn report_replay(report: &ReplayReport) -> Result<()> {
+    let stats = report.stats.borrow();
+    if let Some(error) = &stats.error {
+        bail!("reading bars failed partway, so results are incomplete: {error}");
     }
-    let mut by_symbol: HashMap<&str, usize> = HashMap::new();
-    for b in &missing {
-        *by_symbol.entry(b.symbol.as_str()).or_default() += 1;
+    if stats.invalid > 0 {
+        eprintln!("skipped {} bars with invalid prices", stats.invalid);
     }
-    let mut worst: Vec<(&str, usize)> = by_symbol.into_iter().collect();
-    worst.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    if let Some(wanted) = &report.wanted {
+        let mut missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !stats.symbols.contains(*s)).collect();
+        missing.sort_unstable();
+        if !missing.is_empty() {
+            eprintln!("no bars for: {}", missing.join(", "));
+        }
+    }
+    if !report.traded_prices || stats.missing_traded.is_empty() {
+        return Ok(());
+    }
+    let missing: usize = stats.missing_traded.values().sum();
+    let mut worst: Vec<(&String, &usize)> = stats.missing_traded.iter().collect();
+    worst.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     let names: Vec<String> = worst.iter().take(10).map(|(s, n)| format!("{s} ({n})")).collect();
     eprintln!(
         "warning: {} of {} bars ({:.1}%) have no as-traded price; entries on those days are rejected rather \
          than judged on adjusted prices. Most affected: {}",
-        missing.len(),
-        bars.len(),
-        100.0 * missing.len() as f64 / bars.len().max(1) as f64,
+        missing,
+        stats.bars,
+        100.0 * missing as f64 / stats.bars.max(1) as f64,
         names.join(", ")
     );
+    Ok(())
 }

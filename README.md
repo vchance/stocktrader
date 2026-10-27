@@ -53,12 +53,20 @@ syncs. Symbols the API rejects are isolated and skipped, up to `--max-rejected` 
 beyond that the request itself is assumed wrong and the run aborts. `marketdata info <file>` summarizes a
 Parquet file.
 
+Layout: rows are ordered by date, then symbol, in row groups of about two weeks of the whole market, so a
+replay streams the file front to back and date filters skip whole row groups. Alpaca delivers history
+symbol by symbol, so the writer buckets rows by calendar quarter, spills them to disk as it goes, and sorts
+one quarter at a time; memory stays bounded however long the history. Files written before this layout are
+refused by the streaming replay; `marketdata info` reports the layout, and a sync rewrites them.
+
 Known limits:
 - Delisted coverage is only as complete as Alpaca's inactive list and history, so some survivorship bias
   remains; a reused ticker maps to whichever company Alpaca associates with it.
 - The backtest's `--min-price` filter uses as-traded prices from the raw file (see "Evaluating a strategy
   honestly"); without one it falls back to adjusted prices and warns.
-- Backtests load all selected bars into memory; narrow with `--start/--end/--symbols`.
+- `backtest` streams bars (with their as-traded closes merged in) from disk, so the whole universe fits;
+  `walk-forward` and `paper` still hold the selected bars in memory, so narrow those with
+  `--start/--end/--symbols`.
 
 ## Fundamentals
 
@@ -278,8 +286,8 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
 | Macro | FRED |
 
 ## Roadmap
-1. ~~Alpaca daily bars, universe snapshots, Parquet store~~ (`marketdata`). Next: use raw prices for the
-   risk price filter, and stream bars from Parquet instead of loading them all.
+1. ~~Alpaca daily bars, universe snapshots, Parquet store~~ (`marketdata`), ~~raw prices for the price
+   filter~~, ~~date-major files streamed into backtests~~.
 2. ~~Start archiving news and social feeds~~ (`collector`, running on `jabrony`). Next: compress old files.
 3. ~~EDGAR fundamentals with point-in-time filing dates~~ (`fundamentals`). Next: historical ticker
    mapping, and feeding facts into strategies.
@@ -289,6 +297,6 @@ EventSource ──► Backtest / live runner ──► Strategy ──► Signal
    sizing, file kill switch). Next: compare paper fills with the backtest's simulated fills; an intraday
    runner (async fills, partials, cancels) only if a strategy needs one; live trading behind an explicit
    opt-in once paper results justify it.
-6. ~~Benchmark comparison and walk-forward evaluation~~ (`--benchmark`, `walk-forward`). Next: stream bars
-   in date order (re-lay the Parquet store date-major) so full-universe backtests fit in memory;
-   dashboard and persistent kill switch.
+6. ~~Benchmark comparison and walk-forward evaluation~~ (`--benchmark`, `walk-forward`). Next: stream
+   walk-forward folds from disk too (one pass per candidate and fold) so it scales to the whole universe;
+   dashboard.
