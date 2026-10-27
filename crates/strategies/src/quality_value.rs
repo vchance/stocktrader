@@ -33,7 +33,8 @@ struct Stock {
     dollar_volume: VecDeque<Decimal>,
     /// Latest fiscal year's net income, as (period end, value).
     annual_income: Option<(NaiveDate, Decimal)>,
-    /// Latest fiscal year's revenue; for one period reported under several tags, the largest.
+    /// Latest fiscal year's revenue; for one period reported under several tags, the largest (so a later
+    /// downward restatement of that period isn't applied; only the sign is used).
     annual_revenue: Option<(NaiveDate, Decimal)>,
     assets: Option<(NaiveDate, Decimal)>,
     shares: Option<(NaiveDate, Decimal)>,
@@ -62,7 +63,9 @@ fn update(slot: &mut Option<(NaiveDate, Decimal)>, period_end: NaiveDate, value:
 ///
 /// Known simplifications: annual figures only (up to ~15 months old); a split after the latest share count
 /// misstates market cap until the next filing; for multi-class issuers the share count may cover one class;
-/// banks that tag no revenue concept (only interest income) are left out.
+/// filers whose income statement uses none of the five revenue tags (banks reporting only interest income,
+/// insurers' earned premiums, many REITs' rental revenue, some brokers and utilities) are left out; IFRS filers
+/// are out of scope, as only US GAAP income and assets are read.
 /// After a rebalance, dropped names are restated at 0 until the next one.
 pub struct QualityValue {
     top_n: usize,
@@ -324,6 +327,30 @@ mod tests {
     }
 
     #[test]
+    fn stale_or_vanished_revenue_makes_a_stock_ineligible() {
+        let (s23, e23) = (NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2023, 12, 31).unwrap());
+        let (s24, e24) = (NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2024, 12, 31).unwrap());
+        let mut events = financials("REAL", dec!(100e6), dec!(1e9), dec!(100e6), day(0));
+        // OLD's revenue is from 2022, too old by 2025, while its other figures are fresh.
+        let (s22, e22) = (NaiveDate::from_ymd_opt(2022, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2022, 12, 31).unwrap());
+        events.push(fact("OLD", NET_INCOME, Some(s24), e24, dec!(500e6), day(0)));
+        events.push(fact("OLD", ASSETS, None, e24, dec!(1e9), day(0)));
+        events.push(fact("OLD", SHARES[0], None, e24, dec!(100e6), day(0)));
+        events.push(fact("OLD", REVENUE[0], Some(s22), e22, dec!(1e9), day(0)));
+        // GONE had revenue in 2023 but reports none for 2024.
+        events.push(fact("GONE", NET_INCOME, Some(s24), e24, dec!(500e6), day(0)));
+        events.push(fact("GONE", ASSETS, None, e24, dec!(1e9), day(0)));
+        events.push(fact("GONE", SHARES[0], None, e24, dec!(100e6), day(0)));
+        events.push(fact("GONE", REVENUE[0], Some(s23), e23, dec!(1e9), day(0)));
+        events.push(fact("GONE", REVENUE[0], Some(s24), e24, dec!(0), day(0)));
+        for symbol in ["REAL", "OLD", "GONE"] {
+            events.extend(bars(symbol, 1, dec!(10)));
+        }
+        let mut s = QualityValue::new(3).unwrap();
+        assert_eq!(run(&mut s, events).keys().collect::<Vec<_>>(), vec!["REAL"]);
+    }
+
+    #[test]
     fn revenue_tags_for_one_year_combine_and_quarters_dont_count() {
         let mut s = QualityValue::new(1).unwrap();
         let portfolio = Portfolio::new(Decimal::ZERO);
@@ -334,10 +361,14 @@ mod tests {
             fact("A", REVENUE[0], Some(start), end, dec!(5), day(0)),
             fact("A", REVENUE[1], Some(start), end, dec!(0), day(0)),
             fact("A", REVENUE[0], Some(quarter), end, dec!(99), day(0)),
+            // B reports the zero tag first.
+            fact("B", REVENUE[1], Some(start), end, dec!(0), day(0)),
+            fact("B", REVENUE[0], Some(start), end, dec!(5), day(0)),
         ] {
             s.on_event(&e, &ctx);
         }
         assert_eq!(s.stocks[&Symbol::new("A")].annual_revenue, Some((end, dec!(5))));
+        assert_eq!(s.stocks[&Symbol::new("B")].annual_revenue, Some((end, dec!(5))));
     }
 
     /// Runs events grouped by timestamp, as the engine does, returning the last restated targets.
