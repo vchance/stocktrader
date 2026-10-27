@@ -83,6 +83,7 @@ fn attention_spike_buys_after_the_spike_and_exits_after_the_hold() {
     let held = report.fills[1].at - report.fills[0].at;
     assert!(held >= chrono::TimeDelta::days(5) && held <= chrono::TimeDelta::days(9), "held {held}");
     assert_eq!(report.final_portfolio.positions().count(), 0);
+    assert_eq!(report.equity_curve.len(), 60, "attention-only timestamps add no equity points");
 }
 
 /// Asks for 10% in every symbol on every bar: far more than the 100% gross budget.

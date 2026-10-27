@@ -239,8 +239,10 @@ housekeeping() {
     prepare
     local failed=""
     docker compose run --rm --no-deps -T collector compact </dev/null || failed+="compaction "
-    # Derived tables are rebuilt from the whole archive; a failure here never touches the archive.
-    docker compose run --rm --no-deps -T signals </dev/null || failed+="signals "
+    # Derived tables are rebuilt from the whole archive; a failure here never touches the archive. Build
+    # first so a host whose image predates the signals binary doesn't fail every night.
+    { docker compose build signals >/dev/null && docker compose run --rm --no-deps -T signals </dev/null; } ||
+        failed+="signals "
     backup || failed+="backup "
     if [[ -n "$failed" ]]; then
         notify "stocktrader on $(hostname): ${failed}failed" "See: journalctl --user -u stocktrader-housekeeping"
@@ -282,7 +284,7 @@ backup() {
     fi
     rsync -a --delete-after --max-delete="$max_delete" --filter='P! *.jsonl' \
         --exclude='*.tmp' --exclude='.sync.lock' --exclude='marketdata/*.parquet' \
-        --exclude='fundamentals/*.parquet' --exclude='fundamentals/*.zip' --exclude='signals/' \
+        --exclude='fundamentals/*.parquet' --exclude='fundamentals/*.zip' --exclude='/signals/' \
         -e 'ssh -o BatchMode=yes' \
         data/ "${dest%/}/" || rc=$?
     # 24: some source files vanished during the transfer (normal for a live archive).

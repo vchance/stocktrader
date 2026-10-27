@@ -100,10 +100,15 @@ pub struct ReadStats {
     pub skipped: usize,
 }
 
-/// Reads every record of `source` under `root`, day files in date order, from both `.jsonl` and compacted
-/// `.jsonl.gz` files. Unparseable lines are skipped and counted. Records are not deduplicated: polls
-/// overlap, and a day can briefly exist in both forms after an interrupted compaction.
-pub fn read_source(root: &Path, source: &str, mut each: impl FnMut(RawRecord)) -> io::Result<ReadStats> {
+/// Streams every record of `source` under `root` to `each`, day files in date order (within a day,
+/// `.jsonl` before `.jsonl.gz`), from both plain and compacted files. Nothing is held beyond the current
+/// line. Unparseable lines are skipped and counted; an error from `each` stops the read. Records are not
+/// deduplicated: polls overlap, and a day can briefly exist in both forms after an interrupted compaction.
+pub fn read_source(
+    root: &Path,
+    source: &str,
+    mut each: impl FnMut(RawRecord) -> io::Result<()>,
+) -> io::Result<ReadStats> {
     let dir = root.join(source);
     let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
         Ok(entries) => entries
@@ -141,7 +146,7 @@ pub fn read_source(root: &Path, source: &str, mut each: impl FnMut(RawRecord)) -
             match serde_json::from_slice::<RawRecord>(&line) {
                 Ok(record) => {
                     stats.records += 1;
-                    each(record);
+                    each(record)?;
                 }
                 Err(_) => stats.skipped += 1,
             }
@@ -232,10 +237,15 @@ mod tests {
             .unwrap();
 
         let mut seen = Vec::new();
-        let stats = read_source(dir.path(), "apewisdom", |r| seen.push(r)).unwrap();
+        let stats = read_source(dir.path(), "apewisdom", |r| {
+            seen.push(r);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(seen, vec![old, new]);
         assert_eq!(stats, ReadStats { records: 2, skipped: 1 });
-        assert_eq!(read_source(dir.path(), "never_collected", |_| {}).unwrap(), ReadStats::default());
+        assert_eq!(read_source(dir.path(), "never_collected", |_| Ok(())).unwrap(), ReadStats::default());
+        assert!(read_source(dir.path(), "apewisdom", |_| Err(io::Error::other("stop"))).is_err());
     }
 
     #[test]

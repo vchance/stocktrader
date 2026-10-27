@@ -4,5 +4,5 @@
 pub mod apewisdom;
 pub mod store;
 
-pub use apewisdom::{AttentionRow, Build, build_rows, to_events};
-pub use store::{read_rows, write_rows};
+pub use apewisdom::{AttentionRow, Build, SnapshotBuilder, build_rows, to_events};
+pub use store::{AttentionWriter, RowFilter, read_rows, write_rows};

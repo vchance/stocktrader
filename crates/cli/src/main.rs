@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -121,7 +122,7 @@ fn backtest(args: BacktestArgs) -> Result<()> {
                 eprintln!("skipped {} bars with invalid prices", raw.len() - bars.len());
             }
             if let Some(wanted) = &filter.symbols {
-                let found: std::collections::HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
+                let found: HashSet<&str> = raw.iter().map(|b| b.symbol.as_str()).collect();
                 let missing: Vec<&str> = wanted.iter().map(String::as_str).filter(|s| !found.contains(s)).collect();
                 if !missing.is_empty() {
                     eprintln!("no bars for: {}", missing.join(", "));
@@ -137,11 +138,29 @@ fn backtest(args: BacktestArgs) -> Result<()> {
         }),
     };
     let n_bars = bars.len();
+    // Attention only matters for symbols we have prices for, within the replayed period; anything else
+    // would cost memory and stretch the metrics' time span.
+    let bar_symbols: HashSet<String> = bars.iter().map(|b| b.symbol.as_str().to_string()).collect();
+    let first_bar = bars.iter().map(|b| b.start).min();
+    let last_bar = bars.iter().map(|b| b.end).max();
     let mut events: Vec<Event> = bars.into_iter().map(Event::bar).collect();
     if let Some(path) = &args.attention {
-        let attention = st_signals::to_events(&st_signals::read_rows(path, None)?);
-        println!("attention events  {}", attention.len());
-        events.extend(attention);
+        let filter = st_signals::RowFilter { tickers: Some(bar_symbols), from: first_bar, to: last_bar };
+        let rows = st_signals::read_rows(path, &filter)?;
+        println!("attention events  {}", rows.len());
+        let first_attention = rows.iter().map(|r| r.observed_at).min();
+        match (first_bar, first_attention) {
+            (_, None) => eprintln!("warning: no attention data for these symbols and dates"),
+            (Some(bar), Some(att)) if att - bar > chrono::TimeDelta::days(30) => eprintln!(
+                "warning: attention data starts {} but prices start {}; metrics cover the whole price \
+                 period, so consider --start {}",
+                att.date_naive(),
+                bar.date_naive(),
+                att.date_naive()
+            ),
+            _ => {}
+        }
+        events.extend(st_signals::to_events(&rows));
     }
     let source = VecEventSource::new(events);
 

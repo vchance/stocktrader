@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use st_collector::read_source;
 use st_signals::apewisdom::SOURCE;
-use st_signals::{build_rows, read_rows, write_rows};
+use st_signals::{AttentionWriter, RowFilter, SnapshotBuilder, read_rows};
 
 #[derive(Parser)]
 #[command(name = "signals", about = "Derive trading signals from the raw collector archive")]
@@ -37,27 +37,41 @@ fn main() -> Result<()> {
     let table = cli.out_dir.join("apewisdom.parquet");
     match cli.command {
         Command::Apewisdom => {
-            let mut records = Vec::new();
-            let read = read_source(&cli.archive, SOURCE, |r| records.push(r))?;
+            // A missing archive root is a misconfiguration (the collector creates it on its first poll);
+            // a root with nothing from this source yet is a fresh install.
+            if !cli.archive.is_dir() {
+                bail!("archive root {} does not exist; check STOCKTRADER_DATA_DIR", cli.archive.display());
+            }
+            // Streamed end to end: each page becomes rows as it is read, and rows go to disk in batches.
+            let mut builder = SnapshotBuilder::default();
+            let mut writer = AttentionWriter::create(&table)?;
+            let read = read_source(&cli.archive, SOURCE, |record| {
+                let mut result = Ok(());
+                builder.push(&record, |row| {
+                    if result.is_ok() {
+                        result = writer.push(row);
+                    }
+                });
+                result.map_err(std::io::Error::other)
+            })?;
             if read.records == 0 {
-                // A fresh install: nothing to derive yet, and any existing table is left as it is.
+                drop(writer);
+                let _ = std::fs::remove_file(table.with_extension("parquet.tmp"));
                 println!("no {SOURCE} records under {} yet; nothing to build", cli.archive.display());
                 return Ok(());
             }
-            let build = build_rows(records);
-            write_rows(&table, &build.rows)?;
+            let rows = writer.finish()?;
             println!(
-                "{} records ({} unreadable lines) -> {} snapshots, {} rows ({} malformed) -> {}",
+                "{} records ({} unreadable lines) -> {} snapshots, {rows} rows ({} malformed) -> {}",
                 read.records,
                 read.skipped,
-                build.snapshots,
-                build.rows.len(),
-                build.malformed,
+                builder.snapshots,
+                builder.malformed,
                 table.display()
             );
         }
         Command::Show { ticker, last } => {
-            let rows = read_rows(&table, Some(&ticker.to_ascii_uppercase()))?;
+            let rows = read_rows(&table, &RowFilter::ticker(&ticker.to_ascii_uppercase()))?;
             println!("{:<20} {:>5} {:>9} {:>8} {:>8} {:>9}", "observed_at", "rank", "mentions", "prev", "change", "upvotes");
             for r in rows.iter().rev().take(last).rev() {
                 let change = match r.mentions_24h_ago {

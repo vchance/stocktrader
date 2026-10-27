@@ -9,8 +9,13 @@ use chrono::TimeDelta;
 use rust_decimal::Decimal;
 use st_core::{Event, EventKind, Signal, Strategy, StrategyContext, Symbol, Timestamp};
 
-/// Buys a stock when its social-media mentions jump versus a day earlier, and holds it for a fixed time
-/// after the latest spike. A worked example of trading on attention events; not a validated strategy.
+/// Buys a symbol when its social-media mentions jump versus a day earlier, and holds it for a fixed number
+/// of calendar days after the latest spike (checked at each bar close, so the exit fills at the next open).
+/// A worked example of trading on attention events; not a validated strategy.
+///
+/// Notes: it trades whatever the attention source ranks, including ETFs such as SPY, wherever there are
+/// bars for it; a symbol with no previous-window count (new to the source, or previously zero) is never
+/// bought, because its jump can't be measured, so brand-new attention is deliberately ignored.
 pub struct AttentionSpike {
     min_mentions: u32,
     min_ratio: f64,

@@ -56,41 +56,60 @@ fn page_number(url: &str) -> Option<u32> {
     url.rsplit_once("/page/")?.1.split(['?', '/']).next()?.parse().ok()
 }
 
-/// Turns archived ApeWisdom page responses into one row per ticker per snapshot. Records may arrive in
-/// any order and with duplicates (overlapping reads, an interrupted compaction); they are sorted and
-/// exact duplicates dropped first. A ticker that appears on two pages of one snapshot (rankings shift
-/// while pages are fetched) is kept once, from the earlier page.
-pub fn build_rows(records: impl IntoIterator<Item = RawRecord>) -> Build {
-    let mut records: Vec<RawRecord> = records.into_iter().filter(|r| r.status == 200).collect();
-    records.sort_by(|a, b| (a.fetched_at, &a.url).cmp(&(b.fetched_at, &b.url)));
-    records.dedup_by(|a, b| a.fetched_at == b.fetched_at && a.url == b.url);
+/// Turns archived ApeWisdom page responses into one row per ticker per snapshot, one record at a time, so
+/// nothing but the current page is held. Feed records in archive order ([`st_collector::read_source`]
+/// order: chronological within each day file). Exact repeats of a record within a day (a day present as
+/// both `.jsonl` and `.jsonl.gz` after an interrupted compaction) are dropped. A ticker that appears on two
+/// pages of one snapshot (rankings shift while pages are fetched) is kept once, from the earlier page.
+#[derive(Default)]
+pub struct SnapshotBuilder {
+    snapshot: Option<DateTime<Utc>>,
+    seen_tickers: HashSet<String>,
+    day: Option<chrono::NaiveDate>,
+    seen_records: HashSet<(DateTime<Utc>, String)>,
+    pub snapshots: usize,
+    /// Pages or rows that could not be parsed.
+    pub malformed: usize,
+}
 
-    let mut build = Build::default();
-    let mut snapshot: Option<DateTime<Utc>> = None;
-    let mut seen: HashSet<String> = HashSet::new();
-    for record in records {
-        let starts_new = page_number(&record.url) == Some(1)
-            || snapshot.is_none_or(|start| record.fetched_at - start > MAX_SNAPSHOT_SPAN);
-        if starts_new {
-            snapshot = Some(record.fetched_at);
-            seen.clear();
-            build.snapshots += 1;
+impl SnapshotBuilder {
+    pub fn push(&mut self, record: &RawRecord, mut emit: impl FnMut(AttentionRow)) {
+        if record.status != 200 {
+            return;
         }
-        let snapshot_at = snapshot.expect("set above");
+        let day = record.fetched_at.date_naive();
+        if self.day != Some(day) {
+            self.day = Some(day);
+            self.seen_records.clear();
+        }
+        if !self.seen_records.insert((record.fetched_at, record.url.clone())) {
+            return;
+        }
+        let starts_new = page_number(&record.url) == Some(1)
+            || self.snapshot.is_none_or(|start| {
+                let gap = record.fetched_at - start;
+                gap > MAX_SNAPSHOT_SPAN || gap < TimeDelta::zero()
+            });
+        if starts_new {
+            self.snapshot = Some(record.fetched_at);
+            self.seen_tickers.clear();
+            self.snapshots += 1;
+        }
+        let snapshot_at = self.snapshot.expect("set above");
         let Ok(page) = serde_json::from_str::<Page>(&record.body) else {
-            build.malformed += 1;
-            continue;
+            self.malformed += 1;
+            return;
         };
         for value in page.results {
             let Ok(row) = Row::deserialize(&value) else {
-                build.malformed += 1;
+                self.malformed += 1;
                 continue;
             };
             let ticker = row.ticker.trim().to_ascii_uppercase();
-            if ticker.is_empty() || !seen.insert(ticker.clone()) {
+            if ticker.is_empty() || !self.seen_tickers.insert(ticker.clone()) {
                 continue;
             }
-            build.rows.push(AttentionRow {
+            emit(AttentionRow {
                 snapshot_at,
                 observed_at: record.fetched_at,
                 ticker,
@@ -102,7 +121,18 @@ pub fn build_rows(records: impl IntoIterator<Item = RawRecord>) -> Build {
             });
         }
     }
-    build
+}
+
+/// In-memory convenience over [`SnapshotBuilder`] for records in any order: sorts them first.
+pub fn build_rows(records: impl IntoIterator<Item = RawRecord>) -> Build {
+    let mut records: Vec<RawRecord> = records.into_iter().collect();
+    records.sort_by(|a, b| (a.fetched_at, &a.url).cmp(&(b.fetched_at, &b.url)));
+    let mut builder = SnapshotBuilder::default();
+    let mut rows = Vec::new();
+    for record in &records {
+        builder.push(record, |row| rows.push(row));
+    }
+    Build { rows, snapshots: builder.snapshots, malformed: builder.malformed }
 }
 
 /// Engine events, available when each row was observed and sorted by that time.
@@ -177,6 +207,20 @@ pub(crate) mod tests {
         assert_eq!(build.rows[1].mentions_24h_ago, None);
         assert_eq!(build.rows[0].mentions_24h_ago, Some(69));
         assert_eq!(build.rows[2].upvotes, Some(-5), "net votes can be negative");
+    }
+
+    #[test]
+    fn streaming_in_archive_order_drops_a_replayed_day() {
+        let p1 = page(at(6, 0), 1, r#"{"rank":1,"ticker":"SPY","mentions":97}"#);
+        let p2 = page(at(6, 1), 2, r#"{"rank":2,"ticker":"MU","mentions":79}"#);
+        // The same day read again from its .jsonl.gz copy.
+        let mut builder = SnapshotBuilder::default();
+        let mut rows = Vec::new();
+        for record in [&p1, &p2, &p1, &p2] {
+            builder.push(record, |r| rows.push(r));
+        }
+        assert_eq!(builder.snapshots, 1);
+        assert_eq!(rows.iter().map(|r| r.ticker.as_str()).collect::<Vec<_>>(), vec!["SPY", "MU"]);
     }
 
     #[test]
