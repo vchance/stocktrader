@@ -14,6 +14,13 @@ pub trait EventSource {
     fn next_event(&mut self) -> Option<Event>;
 }
 
+/// Lets a source chosen at runtime (in-memory or streamed from disk) run through the same generic engine.
+impl<E: EventSource + ?Sized> EventSource for Box<E> {
+    fn next_event(&mut self) -> Option<Event> {
+        (**self).next_event()
+    }
+}
+
 pub struct StrategyContext<'a> {
     pub now: Timestamp,
     pub portfolio: &'a Portfolio,

@@ -93,6 +93,12 @@ async fn main() -> Result<()> {
             println!("rows      {}", s.rows);
             println!("symbols   {}", s.symbols);
             println!("dates     {} .. {}", date(s.first), date(s.last));
+            let layout = if st_marketdata::BarReader::open(&file, &Default::default())?.is_date_major() {
+                "date-major"
+            } else {
+                "symbol-major (written by an older version; the next sync rewrites it)"
+            };
+            println!("layout    {layout}");
         }
     }
     Ok(())

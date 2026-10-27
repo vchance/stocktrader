@@ -98,3 +98,33 @@ fn price_filter_uses_raw_prices_beside_the_adjusted_file() {
     assert!(traded > 0, "raw prices are $10-200, so entries pass");
     assert_eq!(adjusted_only, 0, "adjusted-only filtering wrongly treats them all as penny stocks");
 }
+
+#[test]
+fn attention_is_limited_to_symbols_and_sessions_with_bars() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pair(dir.path(), true);
+    let row = |ticker: &str, at: &str| {
+        let t = chrono::DateTime::parse_from_rfc3339(at).unwrap().to_utc();
+        st_signals::AttentionRow {
+            snapshot_at: t,
+            observed_at: t,
+            ticker: ticker.into(),
+            rank: Some(1),
+            mentions: 100,
+            upvotes: None,
+            rank_24h_ago: None,
+            mentions_24h_ago: Some(10),
+        }
+    };
+    let attention = dir.path().join("apewisdom.parquet");
+    // Bars run from 2024-01-02 for SYN000..SYN009; only the first row is for a symbol and time with bars.
+    st_signals::write_rows(
+        &attention,
+        &[row("SYN001", "2024-02-01T12:00:00Z"), row("NOBARS", "2024-02-01T12:00:00Z"), row("SYN001", "2023-06-01T12:00:00Z")],
+    )
+    .unwrap();
+    let out = command(dir.path()).arg("--attention").arg(&attention).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("attention events  1\n"), "{stdout}");
+}

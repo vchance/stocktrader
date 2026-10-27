@@ -4,8 +4,8 @@ pub mod csv_bars;
 pub mod source;
 pub mod synthetic;
 
-pub use csv_bars::{daily_bar, load_daily_bars};
-pub use source::VecEventSource;
+pub use csv_bars::{daily_bar, load_daily_bars, session_close, session_open};
+pub use source::{MergeSource, VecEventSource};
 pub use synthetic::{SyntheticConfig, generate_daily_bars};
 
 #[derive(Debug, thiserror::Error)]
