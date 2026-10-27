@@ -139,7 +139,6 @@ health() {
         problems+="collector NOT-RUNNING"$'\n'
     fi
     report="$(docker compose run --rm --no-deps -T collector health 2>&1 </dev/null)" || status=$?
-    echo "$report"
     if ((status != 0)); then
         # Only names and states, so the alert key doesn't change as ages tick up.
         local found
@@ -151,13 +150,14 @@ health() {
         [[ -f data/.last-backup ]] && last="$(cat data/.last-backup)"
         if (($(date +%s) - last > BACKUP_MAX_AGE_SECS)); then
             problems+="backup STALE"$'\n'
-            echo "backup         STALE    last success $( ((last)) && date -d "@$last" -u +%FT%TZ || echo never)"
+            report+=$'\n'"backup         STALE    last success $( ((last)) && date -d "@$last" -u +%FT%TZ || echo never)"
         else
-            echo "backup         ok       last success $(date -d "@$last" -u +%FT%TZ)"
+            report+=$'\n'"backup         ok       last success $(date -d "@$last" -u +%FT%TZ)"
         fi
     else
-        echo "backup         -        BACKUP_DEST not set in .env"
+        report+=$'\n'"backup         -        BACKUP_DEST not set in .env"
     fi
+    echo "$report"
     problems="$(sed '/^[[:space:]]*$/d' <<<"$problems" | sort)"
     alert_on_change "$problems" "$report"
     [[ -z "$problems" ]]
