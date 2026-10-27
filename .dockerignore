@@ -1,5 +1,9 @@
 .git
 .claude
-.env
+.env*
+!.env.example
 target
 data
+deploy
+compose.yaml
+*.md

@@ -43,7 +43,9 @@ deploy/collector.sh logs      # follow logs
 deploy/collector.sh update    # git pull + rebuild + restart after a merge
 ```
 
-The archive lands in `~/stocktrader/data/raw/`, owned by the deploying user.
+The archive lands in `~/stocktrader/data/raw/`, owned by the deploying user. Always go through the script:
+plain `docker compose` commands refuse to run without the UID/GID it sets. The container is read-only apart
+from `data/`, drops all capabilities, and is capped at 512 MB and one CPU.
 
 SEC filings are deliberately not polled: EDGAR keeps a permanent archive with acceptance timestamps, so they
 are a backfill job.
