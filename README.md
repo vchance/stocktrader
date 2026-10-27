@@ -99,15 +99,17 @@ deploy/collector.sh housekeeping   # gzip day files older than yesterday, then `
   only logged (`journalctl --user -u stocktrader-health`).
 - **A source is stale** when it has gone longer than its slowest backed-off polling gap plus two intervals
   (at least 30 minutes) without a record, or if its newest record is in the future. A source that has
-  data but lost its keys shows DISABLED. The market data sync is stale after 3 days; a configured backup
+  data but lost its keys shows DISABLED (if you retire a source on purpose, move its directory out of
+  `data/raw` to stop the daily alert). The market data sync is stale after 3 days; a configured backup
   after 2 days.
 - **Dead-man's switch:** set `HEARTBEAT_URL` (e.g. a healthchecks.io check) and every hourly health run
   pings it, so you hear about it if the host or its timers stop entirely.
 - **Backups** go to `BACKUP_DEST` (any rsync destination; remote ones need key-based ssh). A local
   destination must contain a `.stocktrader-backup` file, so an unmounted drive fails loudly. Everything
   in `data/` is copied except the re-downloadable market data Parquet files. Nothing is ever deleted
-  from the backup except an uncompressed day file once its compressed copy is there (at most 50 per
-  run), so a local mistake can't wipe the backup.
+  from the backup except an uncompressed day file once its compressed copy is there, at most 50 per run
+  (`BACKUP_MAX_DELETE`), so a local mistake can't wipe the backup. After compacting a large backlog for
+  the first time, the backup reports that it needs more deletions; run it once with a higher limit.
 - **Compaction** gzips day files, verifies each copy byte for byte, and only then removes the original.
   It never overwrites an existing `.gz`; a conflicting leftover is reported and left for you. Archive
   readers must accept both `.jsonl` and `.jsonl.gz`.

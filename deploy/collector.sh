@@ -27,8 +27,9 @@ REALERT_SECS=$((24 * 3600))
 BACKUP_MAX_AGE_SECS=$((2 * 24 * 3600))
 # File that must exist at the root of a local BACKUP_DEST.
 BACKUP_MARKER=.stocktrader-backup
-# Most files one backup may delete (normally a few compacted .jsonl per night); more aborts the run.
-BACKUP_MAX_DELETE=50
+# Default cap on files one backup may delete (normally a few compacted .jsonl per night); more aborts the
+# run. Override with BACKUP_MAX_DELETE in the environment or .env, e.g. once after compacting a backlog.
+DEFAULT_BACKUP_MAX_DELETE=50
 
 # Wrapped in main and exited explicitly: `update` rewrites this file mid-run, and bash would otherwise
 # keep reading the new file from its old offset.
@@ -241,8 +242,10 @@ housekeeping() {
 # Every step checks its own result rather than relying on `set -e`, which bash ignores inside functions
 # called from `||` (as housekeeping does). Success is recorded only after rsync succeeds.
 backup() {
-    local dest rc=0
+    local dest rc=0 max_delete
     dest="$(env_value BACKUP_DEST)"
+    max_delete="${BACKUP_MAX_DELETE:-$(env_value BACKUP_MAX_DELETE)}"
+    [[ "$max_delete" =~ ^[0-9]+$ ]] || max_delete=$DEFAULT_BACKUP_MAX_DELETE
     if [[ -z "$dest" ]]; then
         echo "BACKUP_DEST not set in .env; skipping backup."
         return 0
@@ -252,16 +255,23 @@ backup() {
         return 1
     fi
     # A local destination must be marked, so an unmounted drive fails instead of filling the root disk.
-    if [[ "$dest" != *:* && ! -e "${dest%/}/$BACKUP_MARKER" ]]; then
+    # Like rsync, treat it as remote only if a colon comes before the first slash (host:path).
+    if [[ ! "$dest" =~ ^[^/]*: && ! -e "${dest%/}/$BACKUP_MARKER" ]]; then
         echo "BACKUP_DEST $dest has no $BACKUP_MARKER file (is the drive mounted?)." >&2
         echo "If this is the right place, create it once: touch '${dest%/}/$BACKUP_MARKER'" >&2
         return 1
     fi
-    rsync -a --delete-after --max-delete="$BACKUP_MAX_DELETE" --filter='P! *.jsonl' \
+    rsync -a --delete-after --max-delete="$max_delete" --filter='P! *.jsonl' \
         --exclude='*.tmp' --exclude='.sync.lock' --exclude='marketdata/*.parquet' \
         -e 'ssh -o BatchMode=yes' \
         data/ "${dest%/}/" || rc=$?
     # 24: some source files vanished during the transfer (normal for a live archive).
+    if ((rc == 25)); then
+        echo "Backup copied everything but needs to delete more than $max_delete compacted .jsonl files." >&2
+        echo "Expected after compacting a backlog: run once with BACKUP_MAX_DELETE=1000 deploy/collector.sh backup" >&2
+        echo "Unexpected otherwise: check data/raw for missing day files before raising the limit." >&2
+        return "$rc"
+    fi
     if ((rc != 0 && rc != 24)); then
         echo "rsync to $dest failed with exit $rc" >&2
         return "$rc"
