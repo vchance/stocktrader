@@ -31,7 +31,15 @@ cargo run --release -p st-collector -- run            # poll until Ctrl-C
 | `alpaca_news` | `APCA_API_KEY_ID/SECRET_KEY` | 5 min | Benzinga news with our own arrival timestamps (history is also backfillable) |
 
 SEC filings are deliberately not polled: EDGAR keeps a permanent archive with acceptance timestamps, so they
-are a backfill job. Polls overlap on purpose, so readers must dedupe. Failed polls back off up to 16x.
+are a backfill job.
+
+- **No silent gaps:** Reddit pages back to the newest item already archived; Alpaca resumes from a saved
+  time window (up to 7 days of catch-up). Cursors live in `data/raw/.state/` and only advance after the
+  records are synced to disk. A request that fails doesn't discard the rest of the poll.
+- **Backoff** after failures is capped per source: none for Reddit, 2x Finnhub, 4x ApeWisdom, 16x Alpaca.
+- **Readers** must dedupe (polls overlap on purpose) and skip unparseable lines (a crash can tear at most
+  the last line of a file). File dates are UTC fetch dates, not exchange dates.
+- Stop with Ctrl-C or SIGTERM. Check Reddit's and each provider's current API terms before relying on this.
 
 ## Decisions so far
 

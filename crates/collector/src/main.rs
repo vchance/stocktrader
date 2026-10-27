@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use st_collector::runner::{run_forever, run_once};
+use st_collector::runner::{poll, run_forever};
 use st_collector::{Archive, Config, Source};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
 use tracing_subscriber::EnvFilter;
 
@@ -20,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Poll every enabled source until interrupted (Ctrl-C).
+    /// Poll every enabled source until interrupted (Ctrl-C or SIGTERM).
     Run,
     /// Fetch every enabled source once and exit; non-zero exit if any source failed.
     Once,
@@ -56,17 +57,25 @@ async fn main() -> Result<()> {
         Command::Once => {
             let mut failed = 0;
             for mut source in config.sources() {
-                match run_once(&mut source, &http, &archive).await {
-                    Ok(n) => println!("{:<14} {n} records", source.name()),
+                let name = source.name();
+                source.restore(&archive)?;
+                match poll(&mut source, &http, &archive).await {
+                    Ok(result) => {
+                        println!("{name:<14} {} records", result.records);
+                        for e in &result.errors {
+                            failed += 1;
+                            println!("{name:<14} FAILED: {e:#}");
+                        }
+                    }
                     Err(e) => {
                         failed += 1;
-                        println!("{:<14} FAILED: {e:#}", source.name());
+                        println!("{name:<14} ARCHIVE WRITE FAILED: {e:#}");
                     }
                 }
             }
             println!("archive: {}", archive.root().display());
             if failed > 0 {
-                bail!("{failed} source(s) failed");
+                bail!("{failed} request(s) failed");
             }
         }
         Command::Run => {
@@ -75,9 +84,18 @@ async fn main() -> Result<()> {
                 tracing::info!(source = source.name(), every = ?source.interval(), "starting");
                 tasks.spawn(run_forever(source, http.clone(), archive.clone()));
             }
-            tokio::signal::ctrl_c().await?;
+            let mut terminate = signal(SignalKind::terminate())?;
+            let outcome = tokio::select! {
+                _ = tokio::signal::ctrl_c() => Ok(()),
+                _ = terminate.recv() => Ok(()),
+                // Source tasks loop forever, so any task ending means it panicked.
+                Some(ended) = tasks.join_next() => Err(anyhow!("a source task stopped unexpectedly: {ended:?}")),
+            };
             tracing::info!("shutting down");
+            // Archive writes are synchronous, so aborting can only interrupt a task between writes.
             tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return outcome;
         }
     }
     Ok(())

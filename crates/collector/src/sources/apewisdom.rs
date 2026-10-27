@@ -1,16 +1,17 @@
 use std::time::Duration;
 
+use anyhow::Context;
 use serde::Deserialize;
 
-use crate::archive::RawRecord;
 use crate::http::fetch;
-use crate::source::Source;
+use crate::source::{FetchOutcome, Source};
 
 /// Hard cap on pages per poll; the all-stocks feed is currently about 7 pages of 100.
 const MAX_PAGES: u32 = 20;
 
 /// ApeWisdom ticker mention counts aggregated from Reddit and 4chan. No key needed. Only the current
-/// snapshot is served, so history exists only if we keep polling it.
+/// snapshot is served, so history exists only if we keep polling it. Pages are fetched one after another,
+/// so rankings can shift slightly between pages of one snapshot.
 pub struct ApeWisdom {
     base_url: String,
     filter: String,
@@ -36,20 +37,30 @@ impl Source for ApeWisdom {
         Duration::from_secs(15 * 60)
     }
 
-    async fn fetch(&mut self, http: &reqwest::Client) -> anyhow::Result<Vec<RawRecord>> {
-        let mut records = Vec::new();
+    async fn fetch(&mut self, http: &reqwest::Client) -> FetchOutcome {
+        let mut outcome = FetchOutcome::default();
         let mut pages = 1;
         let mut page = 1;
         while page <= pages.min(MAX_PAGES) {
             let url = format!("{}/api/v1.0/filter/{}/page/{page}", self.base_url, self.filter);
-            let record = fetch(self.name(), http.get(&url), url).await?;
-            if page == 1 {
-                pages = serde_json::from_str::<Page>(&record.body)?.pages;
+            match fetch(self.name(), http.get(&url), url).await {
+                Ok(record) => {
+                    if page == 1 {
+                        match serde_json::from_str::<Page>(&record.body).context("parsing ApeWisdom page count") {
+                            Ok(p) => pages = p.pages,
+                            Err(e) => outcome.errors.push(e),
+                        }
+                    }
+                    outcome.records.push(record);
+                }
+                Err(e) => {
+                    outcome.errors.push(e);
+                    break;
+                }
             }
-            records.push(record);
             page += 1;
         }
-        Ok(records)
+        outcome
     }
 }
 
@@ -60,24 +71,34 @@ mod tests {
 
     use super::*;
 
+    async fn mount_page(server: &MockServer, page: u32, status: u16) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1.0/filter/all-stocks/page/{page}")))
+            .respond_with(ResponseTemplate::new(status).set_body_string(r#"{"count":250,"pages":3,"results":[]}"#))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn follows_page_count_from_first_page() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1.0/filter/all-stocks/page/1"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"count":150,"pages":2,"results":[]}"#))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1.0/filter/all-stocks/page/2"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"count":150,"pages":2,"results":[]}"#))
-            .expect(1)
-            .mount(&server)
-            .await;
+        for page in 1..=3 {
+            mount_page(&server, page, 200).await;
+        }
+        let outcome = ApeWisdom::new(server.uri()).fetch(&reqwest::Client::new()).await;
+        assert_eq!(outcome.records.len(), 3);
+        assert!(outcome.errors.is_empty());
+        assert!(outcome.records[2].url.ends_with("/page/3"));
+    }
 
-        let records = ApeWisdom::new(server.uri()).fetch(&reqwest::Client::new()).await.unwrap();
-        assert_eq!(records.len(), 2);
-        assert!(records[1].url.ends_with("/page/2"));
+    #[tokio::test]
+    async fn keeps_pages_fetched_before_a_failure() {
+        let server = MockServer::start().await;
+        mount_page(&server, 1, 200).await;
+        mount_page(&server, 2, 503).await;
+        let outcome = ApeWisdom::new(server.uri()).fetch(&reqwest::Client::new()).await;
+        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.errors.len(), 1);
     }
 }

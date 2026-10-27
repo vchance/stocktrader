@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::source::AnySource;
 use crate::sources::{AlpacaNews, ApeWisdom, FinnhubNews, Reddit};
 
@@ -10,7 +12,7 @@ pub const REDDIT_API_URL: &str = "https://oauth.reddit.com";
 const DEFAULT_REDDIT_USER_AGENT: &str = "macos:stocktrader-collector:v0.1";
 const DEFAULT_SUBREDDITS: &str = "wallstreetbets,stocks,investing";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct RedditConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -19,11 +21,35 @@ pub struct RedditConfig {
 }
 
 /// Credentials from the environment. A source is enabled only when all of its variables are set.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Config {
     pub alpaca: Option<(String, String)>,
     pub finnhub: Option<String>,
     pub reddit: Option<RedditConfig>,
+}
+
+// Debug output shows only which credentials are present, never their values.
+const SET: &str = "<set>";
+
+impl fmt::Debug for RedditConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedditConfig")
+            .field("client_id", &SET)
+            .field("client_secret", &SET)
+            .field("user_agent", &self.user_agent)
+            .field("subreddits", &self.subreddits)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("alpaca", &self.alpaca.as_ref().map(|_| SET))
+            .field("finnhub", &self.finnhub.as_ref().map(|_| SET))
+            .field("reddit", &self.reddit)
+            .finish()
+    }
 }
 
 impl Config {
@@ -113,6 +139,7 @@ mod tests {
         ]);
         assert_eq!(c.sources().len(), 4);
         assert!(c.describe().iter().all(|(_, missing)| missing.is_none()));
+        assert!(!format!("{c:?}").contains("\"r\""), "debug output leaked a secret: {c:?}");
         assert_eq!(c.reddit.unwrap().subreddits, vec!["stocks", "pennystocks"]);
     }
 }

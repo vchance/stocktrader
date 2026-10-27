@@ -1,5 +1,6 @@
 use anyhow::bail;
 use chrono::Utc;
+use reqwest::header::HeaderValue;
 
 use crate::archive::RawRecord;
 
@@ -14,4 +15,11 @@ pub async fn fetch(source: &str, request: reqwest::RequestBuilder, record_url: S
         bail!("HTTP {status} from {record_url}: {}", body.chars().take(200).collect::<String>());
     }
     Ok(RawRecord { fetched_at: Utc::now(), source: source.to_string(), url: record_url, status: status.as_u16(), body })
+}
+
+/// A header value marked sensitive, so HTTP-level debug logging redacts it.
+pub fn secret_header(value: &str) -> anyhow::Result<HeaderValue> {
+    let mut header = HeaderValue::from_str(value)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
