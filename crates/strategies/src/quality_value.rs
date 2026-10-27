@@ -88,6 +88,14 @@ impl QualityValue {
         })
     }
 
+    /// Overrides the eligibility filters, e.g. to match a plan's universe and risk limits.
+    pub fn with_filters(mut self, min_price: Decimal, min_dollar_volume: Decimal, liquidity_lookback: usize) -> Self {
+        self.min_price = min_price;
+        self.min_dollar_volume = min_dollar_volume;
+        self.liquidity_lookback = liquidity_lookback.max(1);
+        self
+    }
+
     fn on_fundamental(&mut self, r: &FundamentalRecord) {
         let stock = self.stocks.entry(r.symbol.clone()).or_default();
         match r.metric.as_str() {

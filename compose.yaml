@@ -77,7 +77,13 @@ services:
     profiles: [tools]
     restart: "no"
     entrypoint: ["stocktrader", "paper"]
+    # Plan files come from the checkout, read-only; reports are written under data/.
+    volumes:
+      - ./data:/data
+      - ./plans:/plans:ro
     environment:
       STOCKTRADER_MARKETDATA_DIR: /data/marketdata
       STOCKTRADER_LIVE_DIR: /data/live
+      STOCKTRADER_PLANS_DIR: /plans
+      STOCKTRADER_REPORTS_DIR: /data/reports
     mem_limit: 1g

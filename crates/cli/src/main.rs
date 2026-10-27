@@ -13,13 +13,15 @@ use st_data::{
     MergeSource, SyntheticConfig, VecEventSource, generate_daily_bars, load_daily_bars, session_close, session_open,
 };
 use st_engine::metrics::{self, buy_and_hold, correlation};
-use st_engine::{Backtest, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
+use st_engine::{Backtest, BacktestReport, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
 use st_marketdata::{BarEventSource, BarFilter, ReplayStats, coverage, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, QualityValue, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
 mod paper;
+mod plans;
+mod report;
 mod symbols;
 
 #[derive(Parser)]
@@ -65,6 +67,8 @@ enum Command {
     Paper(Box<paper::PaperArgs>),
     /// Check how many tradable Alpaca symbols the SEC ticker map (and so fundamentals strategies) covers.
     Symbols(symbols::SymbolsArgs),
+    /// Trading plans saved in plans/*.toml: list them, backtest one with an HTML report, or compare several.
+    Plans(plans::PlansArgs),
 }
 
 #[derive(Args)]
@@ -177,13 +181,19 @@ impl fmt::Display for Params {
     }
 }
 
-fn make_strategy(params: &Params, weight: Decimal) -> Result<Box<dyn Strategy>> {
+/// Builds a strategy. Strategies that screen the universe themselves (quality-value) use the same price and
+/// liquidity filters as `limits`, so they never pick names the risk manager would reject.
+fn make_strategy(params: &Params, weight: Decimal, limits: &RiskLimits) -> Result<Box<dyn Strategy>> {
     Ok(match *params {
         Params::Sma { fast, slow } => Box::new(SmaCrossover::new(fast, slow, weight).map_err(anyhow::Error::msg)?),
         Params::Spike { min_mentions, ratio, hold_days } => {
             Box::new(AttentionSpike::new(min_mentions, ratio, hold_days, weight).map_err(anyhow::Error::msg)?)
         }
-        Params::QualityValue { top_n } => Box::new(QualityValue::new(top_n).map_err(anyhow::Error::msg)?),
+        Params::QualityValue { top_n } => Box::new(
+            QualityValue::new(top_n)
+                .map_err(anyhow::Error::msg)?
+                .with_filters(limits.min_price, limits.min_avg_dollar_volume, limits.liquidity_lookback),
+        ),
     })
 }
 
@@ -217,6 +227,7 @@ fn main() -> Result<()> {
         }
         Command::Paper(args) => paper::run(&args),
         Command::Symbols(args) => symbols::run(&args),
+        Command::Plans(args) => plans::run(&args),
     }
 }
 
@@ -228,9 +239,8 @@ fn require_attention(data: &DataArgs) -> Result<()> {
 }
 
 /// Each name gets 1/N; above the risk manager's position cap that would be clamped and leave cash idle.
-fn check_top_n(top_n: usize) -> Result<()> {
-    let cap = RiskLimits::default().max_position_weight;
-    if top_n == 0 || Decimal::ONE / Decimal::from(top_n) > cap {
+fn check_top_n(top_n: usize, cap: Decimal) -> Result<()> {
+    if top_n == 0 || cap <= Decimal::ZERO || Decimal::ONE / Decimal::from(top_n) > cap {
         bail!("--top-n {top_n} gives each name more than the {cap} position cap; use at least {}", (Decimal::ONE / cap).ceil());
     }
     Ok(())
@@ -257,7 +267,7 @@ impl StrategyArgs {
                 if !have_fundamentals {
                     bail!("quality-value needs --fundamentals data/fundamentals");
                 }
-                check_top_n(self.top_n)?;
+                check_top_n(self.top_n, RiskLimits::default().max_position_weight)?;
                 Params::QualityValue { top_n: self.top_n }
             }
         })
@@ -289,10 +299,19 @@ struct ReplayReport {
     traded_prices: bool,
 }
 
-fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
-    let params = args.params(data.attention.is_some(), data.fundamentals.is_some())?;
-    let strategy = make_strategy(&params, args.weight)?;
-    let prepared = prepare(data)?;
+/// A finished backtest with what reports need.
+struct Run {
+    report: BacktestReport,
+    bars: usize,
+    /// Buy-and-hold of the benchmark over the same data, with its metrics.
+    benchmark: Option<(Vec<(Timestamp, Decimal)>, Metrics)>,
+}
+
+/// One streamed backtest of `params` over `data`, with `adjust` applied to the risk limits first.
+fn run_backtest(data: &DataArgs, params: &Params, weight: Decimal, adjust: impl FnOnce(&mut RiskLimits)) -> Result<Run> {
+    let mut prepared = prepare(data)?;
+    adjust(&mut prepared.limits);
+    let strategy = make_strategy(params, weight, &prepared.limits)?;
     let report = Backtest::new(
         prepared.source,
         strategy,
@@ -302,35 +321,49 @@ fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
     )
     .run()?;
     report_replay(&prepared.report)?;
+    let benchmark = prepared.benchmark.as_ref().map(|bench| {
+        let refs: Vec<&Bar> = bench.iter().collect();
+        let curve = buy_and_hold(&refs, data.cash);
+        let m = metrics::compute(&curve, &[]);
+        (curve, m)
+    });
+    let bars = prepared.report.stats.borrow().bars;
+    Ok(Run { report, bars, benchmark })
+}
 
+fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
+    let params = args.params(data.attention.is_some(), data.fundamentals.is_some())?;
+    let run = run_backtest(data, &params, args.weight, |_| {})?;
     println!("strategy          {params}");
-    println!("bars replayed     {}", prepared.report.stats.borrow().bars);
+    print_run(&run, &data.benchmark);
+    Ok(())
+}
+
+fn print_run(run: &Run, benchmark: &str) {
+    let report = &run.report;
+    println!("bars replayed     {}", run.bars);
     print_metrics("", &report.metrics);
     println!("fills             {}", report.metrics.num_fills);
     println!("commissions       {:.2}", report.metrics.commissions);
     println!("rejected signals  {}", report.rejections.len());
     println!("open positions    {}", report.final_portfolio.positions().count());
 
-    if let Some(bench) = &prepared.benchmark {
-        let refs: Vec<&Bar> = bench.iter().collect();
-        let curve = buy_and_hold(&refs, data.cash);
-        let m = metrics::compute(&curve, &[]);
-        warn_on_span(&report.equity_curve, &curve);
+    if let Some((curve, m)) = &run.benchmark {
+        warn_on_span(&report.equity_curve, curve);
         println!();
-        println!("benchmark: {} buy & hold, 100% invested", data.benchmark.to_ascii_uppercase());
-        print_metrics("  ", &m);
+        println!("benchmark: {} buy & hold, 100% invested", benchmark.to_ascii_uppercase());
+        print_metrics("  ", m);
         println!("excess CAGR       {:>7.2}%", (report.metrics.cagr - m.cagr) * 100.0);
-        if let Some(c) = correlation(&report.equity_curve, &curve) {
+        if let Some(c) = correlation(&report.equity_curve, curve) {
             println!("daily correlation {c:>7.2}");
         }
     }
-    Ok(())
 }
 
 fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup): (TimeDelta, TimeDelta, TimeDelta)) -> Result<()> {
     // Validate every candidate once, so a bad grid fails before hours of backtests.
     for p in grid {
-        make_strategy(p, weight)?;
+        make_strategy(p, weight, &RiskLimits::default())?;
     }
     // A candidate that can't warm up never trades, scores Sharpe 0, and so beats every losing candidate.
     let needed_sessions = grid
@@ -361,7 +394,7 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
         fill: fill_model(data),
         limits: loaded.limits.clone(),
     };
-    let report = walk_forward(&loaded.events, &cfg, grid, |p| make_strategy(p, weight).expect("validated above"))?;
+    let report = walk_forward(&loaded.events, &cfg, grid, |p| make_strategy(p, weight, &cfg.limits).expect("validated above"))?;
     if report.folds.is_empty() {
         bail!("not enough data for one fold: need warm-up + training + some test period");
     }

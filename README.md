@@ -144,6 +144,39 @@ cargo run -p st-cli -- backtest --strategy attention-spike --attention data/sign
 pipeline end to end; it is not a validated strategy. Real backtests need weeks of collected attention
 data overlapping the price history.
 
+## Trading plans
+
+A plan is a named, saved description of how to trade, kept as a TOML file in `plans/`: what it's for in your
+own words, the strategy and its parameters, which stocks it may trade, its risk limits and starting capital.
+Keep several and compare them; the ones that hold up get paper-traded (next step: one paper account per
+plan). `plans/quality-value-core.toml` is a commented template.
+
+```
+stocktrader plans list                               # every plan, and whether each file is valid
+stocktrader plans backtest quality-value-core        # metrics vs the benchmark + reports/quality-value-core.html
+stocktrader plans compare                            # all plans over the same dates + reports/compare.html
+stocktrader plans backtest trend-megacaps --synthetic   # try a price-only plan before any data is downloaded
+```
+
+On the server: `deploy/collector.sh plans list` (and so on); reports land in `data/reports/`.
+
+| Section | Keys |
+|---|---|
+| top level | `name` (must match the file name), `notes`, `mode` (`backtest` or `paper`), `capital` |
+| `[strategy]` | `kind` = `quality-value` (`top_n`), `sma` (`fast`, `slow`, `weight`), `attention-spike` (`min_mentions`, `ratio`, `hold_days`, `weight`) |
+| `[universe]` | `symbols` (empty = whole market), `min_price` (as traded), `min_dollar_volume` (20-session average) |
+| `[risk]` | `max_position`, `max_gross_exposure`, `max_daily_loss` (fractions of equity; defaults 0.10, 1.0, 0.03) |
+| `[backtest]` | `start`, `end` (TOML dates, e.g. `2018-01-01`), `benchmark` (default SPY, or `none`), `slippage_bps` |
+
+Unknown keys are errors, so a typo never silently falls back to a default; inconsistent settings (a fast
+average not below the slow one, `top_n` too small for the position cap) are refused. `compare` uses one
+window for every plan: the latest start and earliest end among them, unless `--start/--end` are given.
+Indicators warm up inside the window: an `sma` plan with `slow = 50` trades from about its 50th session.
+
+The HTML report is one self-contained file (no external scripts or fonts): summary against the benchmark,
+equity and drawdown charts with hover readouts, monthly returns, rejected signals by reason, recent fills,
+and the plan file itself. Light and dark themes follow the system setting.
+
 ## Paper trading
 
 `stocktrader paper` runs once per session, before the open, against an Alpaca **paper** account (the
