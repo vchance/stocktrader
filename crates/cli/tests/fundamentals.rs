@@ -66,6 +66,7 @@ fn write_fundamentals(dir: &Path) {
         facts.push(fact(cik, "us-gaap", "NetIncomeLoss", "USD", Some(date(2023, 1, 1)), income, filed));
         facts.push(fact(cik, "us-gaap", "Assets", "USD", None, 1e9, filed));
         facts.push(fact(cik, "dei", "EntityCommonStockSharesOutstanding", "shares", None, 50e6, filed));
+        facts.push(fact(cik, "us-gaap", "Revenues", "USD", Some(date(2023, 1, 1)), 5e8, filed));
     }
     facts.push(fact(1, "us-gaap", "Assets", "USD", None, 2e9, date(2030, 1, 1)));
     facts.push(fact(1, "us-gaap", "InventoryNet", "USD", None, 1e6, date(2024, 2, 15)));
@@ -101,8 +102,8 @@ fn quality_value_trades_on_filed_financials() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}\n{stdout}", String::from_utf8_lossy(&out.stderr));
-    // Three figures for each of the five companies with bars; not NOBARS, the 2030 filing or InventoryNet.
-    assert!(stdout.contains("fundamental events 15\n"), "{stdout}");
+    // Four figures for each of the five companies with bars; not NOBARS, the 2030 filing or InventoryNet.
+    assert!(stdout.contains("fundamental events 20\n"), "{stdout}");
     let fills: usize = stdout.lines().find_map(|l| l.strip_prefix("fills")).unwrap().trim().parse().unwrap();
     assert!(fills > 0, "{stdout}");
 

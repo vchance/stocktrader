@@ -12,6 +12,16 @@ use st_core::{Event, EventKind, FundamentalRecord, Signal, Strategy, StrategyCon
 /// stitching into a trailing twelve months.
 const NET_INCOME: &str = "us-gaap:NetIncomeLoss:USD";
 const ASSETS: &str = "us-gaap:Assets:USD";
+/// Annual revenue under any of the tags filers use for it. Only its sign matters: it marks an operating
+/// business. Commodity trusts and other funds that file 10-Ks report income (gains on their holdings) but
+/// no revenue, and would otherwise look extremely cheap.
+const REVENUE: [&str; 5] = [
+    "us-gaap:Revenues:USD",
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax:USD",
+    "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax:USD",
+    "us-gaap:SalesRevenueNet:USD",
+    "us-gaap:SalesRevenueGoodsNet:USD",
+];
 /// Shares outstanding, from the cover page or the balance sheet; the latest period wins.
 const SHARES: [&str; 2] = ["dei:EntityCommonStockSharesOutstanding:shares", "us-gaap:CommonStockSharesOutstanding:shares"];
 /// A fiscal year, allowing for 52/53-week years.
@@ -23,6 +33,9 @@ struct Stock {
     dollar_volume: VecDeque<Decimal>,
     /// Latest fiscal year's net income, as (period end, value).
     annual_income: Option<(NaiveDate, Decimal)>,
+    /// Latest fiscal year's revenue; for one period reported under several tags, the largest (so a later
+    /// downward restatement of that period isn't applied; only the sign is used).
+    annual_revenue: Option<(NaiveDate, Decimal)>,
     assets: Option<(NaiveDate, Decimal)>,
     shares: Option<(NaiveDate, Decimal)>,
 }
@@ -42,13 +55,17 @@ fn update(slot: &mut Option<(NaiveDate, Decimal)>, period_end: NaiveDate, value:
 /// - earnings yield: latest annual net income / market cap (shares outstanding x as-traded price);
 /// - return on assets: latest annual net income / total assets.
 ///
-/// Eligible means: an as-traded price of at least `min_price`, average daily dollar volume of at least
-/// `min_dollar_volume` over the last `liquidity_lookback` bars, positive assets and shares, and each figure
-/// from a period that ended within `max_report_age`. Only facts already public reach the strategy (the
+/// Eligible means: an operating company (positive annual revenue, which excludes commodity trusts and other
+/// funds that file 10-Ks), an as-traded price of at least `min_price`, average daily dollar volume of at
+/// least `min_dollar_volume` over the last `liquidity_lookback` bars, positive assets and shares, and each
+/// figure from a period that ended within `max_report_age`. Only facts already public reach the strategy (the
 /// engine releases them the day after filing), so there is no look-ahead.
 ///
 /// Known simplifications: annual figures only (up to ~15 months old); a split after the latest share count
-/// misstates market cap until the next filing; for multi-class issuers the share count may cover one class.
+/// misstates market cap until the next filing; for multi-class issuers the share count may cover one class;
+/// filers whose income statement uses none of the five revenue tags (banks reporting only interest income,
+/// insurers' earned premiums, many REITs' rental revenue, some brokers and utilities) are left out; IFRS filers
+/// are out of scope, as only US GAAP income and assets are read.
 /// After a rebalance, dropped names are restated at 0 until the next one.
 pub struct QualityValue {
     top_n: usize,
@@ -66,7 +83,17 @@ pub struct QualityValue {
 
 impl QualityValue {
     /// Fundamental concepts this strategy reads, for loaders that want to read nothing else.
-    pub const CONCEPTS: &[&str] = &["NetIncomeLoss", "Assets", "EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"];
+    pub const CONCEPTS: &[&str] = &[
+        "NetIncomeLoss",
+        "Assets",
+        "EntityCommonStockSharesOutstanding",
+        "CommonStockSharesOutstanding",
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "SalesRevenueNet",
+        "SalesRevenueGoodsNet",
+    ];
 
     /// Equal weight `1 / top_n`, so fully invested once `top_n` names qualify. Filters default to the
     /// risk manager's: $5 and $5M average dollar volume over 20 bars.
@@ -106,6 +133,14 @@ impl QualityValue {
                     update(&mut stock.annual_income, r.period_end, r.value);
                 }
             }
+            m if REVENUE.contains(&m) => {
+                let annual = r.period_start.is_some_and(|start| ANNUAL_DAYS.contains(&(r.period_end - start).num_days()));
+                match stock.annual_revenue {
+                    _ if !annual => {}
+                    Some((end, value)) if end == r.period_end => stock.annual_revenue = Some((end, value.max(r.value))),
+                    _ => update(&mut stock.annual_revenue, r.period_end, r.value),
+                }
+            }
             ASSETS => update(&mut stock.assets, r.period_end, r.value),
             m if SHARES.contains(&m) => update(&mut stock.shares, r.period_end, r.value),
             _ => {}
@@ -118,14 +153,14 @@ impl QualityValue {
         let lookback = Decimal::from(self.liquidity_lookback);
         let mut out = Vec::new();
         for (symbol, s) in &self.stocks {
-            let (Some(price), Some(income), Some(assets), Some(shares)) =
-                (s.traded_close, fresh(s.annual_income), fresh(s.assets), fresh(s.shares))
+            let (Some(price), Some(income), Some(assets), Some(shares), Some(revenue)) =
+                (s.traded_close, fresh(s.annual_income), fresh(s.assets), fresh(s.shares), fresh(s.annual_revenue))
             else {
                 continue;
             };
             let liquid = s.dollar_volume.len() >= self.liquidity_lookback
                 && s.dollar_volume.iter().sum::<Decimal>() / lookback >= self.min_dollar_volume;
-            if price < self.min_price || !liquid || assets <= Decimal::ZERO || shares <= Decimal::ZERO {
+            if revenue <= Decimal::ZERO || price < self.min_price || !liquid || assets <= Decimal::ZERO || shares <= Decimal::ZERO {
                 continue;
             }
             out.push((symbol.clone(), income / (shares * price), income / assets));
@@ -265,7 +300,75 @@ mod tests {
             fact(symbol, NET_INCOME, Some(start), end, income, filed),
             fact(symbol, ASSETS, None, end, assets, filed),
             fact(symbol, SHARES[0], None, end, shares, filed),
+            fact(symbol, REVENUE[1], Some(start), end, dec!(1e9), filed),
         ]
+    }
+
+    #[test]
+    fn funds_without_revenue_are_not_companies() {
+        let mut events = Vec::new();
+        // GOLD looks far cheaper and more profitable (gains on its metal) but reports no revenue.
+        events.extend(financials("REAL", dec!(100e6), dec!(1e9), dec!(100e6), day(0)));
+        let (start, end) = (NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2024, 12, 31).unwrap());
+        events.push(fact("GOLD", NET_INCOME, Some(start), end, dec!(900e6), day(0)));
+        events.push(fact("GOLD", ASSETS, None, end, dec!(1e9), day(0)));
+        events.push(fact("GOLD", SHARES[0], None, end, dec!(100e6), day(0)));
+        // ZERO tags revenue, but none: also not an operating business.
+        events.push(fact("ZERO", NET_INCOME, Some(start), end, dec!(500e6), day(0)));
+        events.push(fact("ZERO", ASSETS, None, end, dec!(1e9), day(0)));
+        events.push(fact("ZERO", SHARES[0], None, end, dec!(100e6), day(0)));
+        events.push(fact("ZERO", REVENUE[0], Some(start), end, dec!(0), day(0)));
+        for symbol in ["REAL", "GOLD", "ZERO"] {
+            events.extend(bars(symbol, 1, dec!(10)));
+        }
+        let mut s = QualityValue::new(3).unwrap();
+        let targets = run(&mut s, events);
+        assert_eq!(targets.keys().collect::<Vec<_>>(), vec!["REAL"], "{targets:?}");
+    }
+
+    #[test]
+    fn stale_or_vanished_revenue_makes_a_stock_ineligible() {
+        let (s23, e23) = (NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2023, 12, 31).unwrap());
+        let (s24, e24) = (NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2024, 12, 31).unwrap());
+        let mut events = financials("REAL", dec!(100e6), dec!(1e9), dec!(100e6), day(0));
+        // OLD's revenue is from 2022, too old by 2025, while its other figures are fresh.
+        let (s22, e22) = (NaiveDate::from_ymd_opt(2022, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2022, 12, 31).unwrap());
+        events.push(fact("OLD", NET_INCOME, Some(s24), e24, dec!(500e6), day(0)));
+        events.push(fact("OLD", ASSETS, None, e24, dec!(1e9), day(0)));
+        events.push(fact("OLD", SHARES[0], None, e24, dec!(100e6), day(0)));
+        events.push(fact("OLD", REVENUE[0], Some(s22), e22, dec!(1e9), day(0)));
+        // GONE had revenue in 2023 but reports none for 2024.
+        events.push(fact("GONE", NET_INCOME, Some(s24), e24, dec!(500e6), day(0)));
+        events.push(fact("GONE", ASSETS, None, e24, dec!(1e9), day(0)));
+        events.push(fact("GONE", SHARES[0], None, e24, dec!(100e6), day(0)));
+        events.push(fact("GONE", REVENUE[0], Some(s23), e23, dec!(1e9), day(0)));
+        events.push(fact("GONE", REVENUE[0], Some(s24), e24, dec!(0), day(0)));
+        for symbol in ["REAL", "OLD", "GONE"] {
+            events.extend(bars(symbol, 1, dec!(10)));
+        }
+        let mut s = QualityValue::new(3).unwrap();
+        assert_eq!(run(&mut s, events).keys().collect::<Vec<_>>(), vec!["REAL"]);
+    }
+
+    #[test]
+    fn revenue_tags_for_one_year_combine_and_quarters_dont_count() {
+        let mut s = QualityValue::new(1).unwrap();
+        let portfolio = Portfolio::new(Decimal::ZERO);
+        let ctx = StrategyContext { now: Timestamp::default(), portfolio: &portfolio };
+        let (start, end) = (NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2024, 12, 31).unwrap());
+        let quarter = NaiveDate::from_ymd_opt(2024, 10, 1).unwrap();
+        for e in [
+            fact("A", REVENUE[0], Some(start), end, dec!(5), day(0)),
+            fact("A", REVENUE[1], Some(start), end, dec!(0), day(0)),
+            fact("A", REVENUE[0], Some(quarter), end, dec!(99), day(0)),
+            // B reports the zero tag first.
+            fact("B", REVENUE[1], Some(start), end, dec!(0), day(0)),
+            fact("B", REVENUE[0], Some(start), end, dec!(5), day(0)),
+        ] {
+            s.on_event(&e, &ctx);
+        }
+        assert_eq!(s.stocks[&Symbol::new("A")].annual_revenue, Some((end, dec!(5))));
+        assert_eq!(s.stocks[&Symbol::new("B")].annual_revenue, Some((end, dec!(5))));
     }
 
     /// Runs events grouped by timestamp, as the engine does, returning the last restated targets.
