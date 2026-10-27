@@ -521,14 +521,17 @@ paper_trade() {
     fi
     [[ " ${args[*]} $* " == *" --submit "* ]] || return "$status"
     # Only the runner's own report lines go into alerts, never raw docker/compose output, which can quote
-    # .env lines.
-    report="$(grep -E '^(plan |paper plan|session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:|Caused by:|    [0-9]+: )' \
-        <<<"$output" || true)"
+    # .env lines: its labelled lines, and the indented cause lines that follow an error's "Caused by:".
+    report="$(awk '
+        /^(plan |paper plan|session|equity|open orders|kill switch|rejected|left alone|order|no orders|submitted|warning:|Error:)/ { print; cause = 0; next }
+        /^Caused by:/ { print; cause = 1; next }
+        cause && /^    [^ ]/ { print; next }
+        { cause = 0 }' <<<"$output")"
     if ((status != 0)); then
         local body="See: journalctl --user -u stocktrader-paper"
         [[ -n "$report" ]] && body="$report"$'\n\n'"$body"
         notify "stocktrader on $(hostname): paper trading failed" "$body" || true
-    elif ! grep -q 'nothing to do' <<<"$output"; then
+    elif ! grep -qE 'nothing to do|no plans in paper mode' <<<"$output"; then
         local sent
         sent="$(grep '^submitted' <<<"$report" | grep -vc 'already submitted' || true)"
         notify "stocktrader paper on $(hostname): ${sent} order(s) sent" "$report" || true

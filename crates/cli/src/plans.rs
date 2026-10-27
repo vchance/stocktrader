@@ -401,7 +401,7 @@ impl Plan {
         }
         let parquet = dirs.marketdata_dir.join("bars_daily_all.parquet");
         if !synthetic && !parquet.exists() {
-            bail!("no market data at {}; run `marketdata sync`, or try the plan with --synthetic", parquet.display());
+            bail!("no market data at {}; run `marketdata sync` first (backtests can also try --synthetic)", parquet.display());
         }
         Ok(DataArgs {
             bars: None,
