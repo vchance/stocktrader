@@ -1,7 +1,9 @@
 //! `stocktrader options-lab`: how monthly option strategies on a stock or ETF would have behaved, with
 //! option prices *estimated* by the Black-Scholes formula from the stock's own recent volatility. A learning
 //! tool: real option prices (skew, events, spreads) differ, so results are approximations, not evidence a
-//! strategy is tradeable.
+//! strategy is tradeable. Prices are split- and dividend-adjusted closes, treated as a stock that pays no
+//! dividend: no dividend yield enters the option prices (real calls on dividend payers are cheaper and can
+//! be exercised early near ex-dividend dates), and the prices and strikes shown are adjusted levels.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -155,9 +157,11 @@ pub fn simulate(rows: &[(Timestamp, NaiveDate, f64)], p: &LabParams) -> Result<L
     // Open option: (call strike, put strike, volatility it was priced at).
     let mut open: Option<(Option<f64>, Option<f64>, f64)> = None;
     let mut opened_at = first;
-    let mut curve = Vec::new();
-    let mut hold = Vec::new();
     let to_dec = |x: f64| Decimal::from_f64(x).unwrap_or_default().round_dp(2);
+    // Both curves start from the capital at the session before the first option, so the strategy's first
+    // bid-ask cost counts against it like every later one.
+    let mut curve = vec![(rows[first - 1].0, to_dec(p.capital))];
+    let mut hold = vec![(rows[first - 1].0, to_dec(p.capital))];
 
     for i in first..rows.len() {
         let s = closes[i];
@@ -212,6 +216,9 @@ pub fn simulate(rows: &[(Timestamp, NaiveDate, f64)], p: &LabParams) -> Result<L
         curve.push((rows[i].0, to_dec(value)));
         hold.push((rows[i].0, to_dec(shares * s)));
     }
+    if cycles.is_empty() {
+        bail!("no option cycle fits: {} sessions after the volatility window, but a cycle needs {}", rows.len() - first, p.cycle + 1);
+    }
     Ok(LabResult { curve, hold, cycles })
 }
 
@@ -228,6 +235,17 @@ pub fn run(args: &OptionsArgs) -> Result<()> {
         .iter()
         .filter_map(|b| Some((b.end, st_engine::exchange_date(b.end), b.close.to_f64()?)))
         .collect();
+    let checks = [
+        (args.call_otm >= 0.0 && args.call_otm < 1.0, "--call-otm must be at least 0 and below 1"),
+        (args.put_otm >= 0.0 && args.put_otm < 1.0, "--put-otm must be at least 0 and below 1"),
+        (args.vol_markup > 0.0, "--vol-markup must be positive"),
+        ((0.0..1.0).contains(&args.spread), "--spread must be at least 0 and below 1"),
+        (args.rate > -1.0, "--rate must be above -1"),
+        (rows.iter().all(|r| r.2 > 0.0), "prices must be positive"),
+    ];
+    if let Some((_, msg)) = checks.iter().find(|(ok, _)| !ok) {
+        bail!("{msg}");
+    }
     let params = LabParams {
         strategy: args.strategy,
         call_otm: args.call_otm,
@@ -330,7 +348,7 @@ mod tests {
         assert!(end < hold, "capped upside: {end} vs {hold}");
         // A steady climb has almost no volatility, so later premiums are near zero; the first sees the wiggles.
         assert!(r.cycles[0].net_premium > 0.0 && r.cycles.iter().all(|c| c.net_premium >= 0.0));
-        assert!(r.cycles.iter().filter(|c| c.closing_price != c.price).all(|c| c.call_assigned), "every full cycle rallied past the strike");
+        assert!(r.cycles.iter().all(|c| c.call_assigned), "every cycle rallied past the strike");
     }
 
     #[test]
@@ -345,10 +363,47 @@ mod tests {
     }
 
     #[test]
+    fn one_cycle_accounts_premium_spread_and_settlement_exactly() {
+        // Window 3, cycle 5: shares bought at 100 (index 3), one call opened there and settled at index 8.
+        let prices = [100.0, 102.0, 98.0, 100.0, 101.0, 103.0, 104.0, 105.0, 106.0, 106.0];
+        let p = LabParams { spread: 0.1, ..params(OptionStrategy::CoveredCall) };
+        let r = simulate(&rows(&prices), &p).unwrap();
+        let shares = 1000.0 / 100.0;
+        let vol = realized_vol(&prices, 3, 3).unwrap();
+        let model = black_scholes(true, 100.0, 103.0, 5.0 / 252.0, 0.0, vol);
+        assert_eq!(r.curve[0].1, Decimal::from(1000), "starts at the capital");
+        // On the opening day the call is marked at its model price, so only the spread is lost.
+        let open_value = 1000.0 - shares * model * p.spread;
+        assert!((r.curve[1].1.to_f64().unwrap() - open_value).abs() < 0.01, "{} vs {open_value}", r.curve[1].1);
+        // Settled at 106 against strike 103: shares worth 1060, premium kept, 3 a share paid on the call.
+        let settled = shares * 106.0 + shares * model * (1.0 - p.spread) - shares * 3.0;
+        assert!((r.curve[6].1.to_f64().unwrap() - settled).abs() < 0.01, "{} vs {settled}", r.curve[6].1);
+        assert_eq!(r.cycles.len(), 1);
+        assert!(r.cycles[0].call_assigned && (r.cycles[0].net_premium - model * (1.0 - p.spread)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn later_prices_never_change_an_earlier_cycle() {
+        let mut a = rising();
+        let first = simulate(&rows(&a), &params(OptionStrategy::Collar)).unwrap();
+        // Change everything after the second cycle opened (index 3 + 5 = 8).
+        for x in a.iter_mut().skip(9) {
+            *x *= 0.5;
+        }
+        let second = simulate(&rows(&a), &params(OptionStrategy::Collar)).unwrap();
+        for i in 0..2 {
+            let (x, y) = (&first.cycles[i], &second.cycles[i]);
+            assert_eq!((x.opened, x.vol, x.call_strike, x.put_strike, x.net_premium), (y.opened, y.vol, y.call_strike, y.put_strike, y.net_premium));
+        }
+    }
+
+    #[test]
     fn collar_nets_the_two_legs_and_too_little_data_is_an_error() {
         let r = simulate(&rows(&rising()), &params(OptionStrategy::Collar)).unwrap();
         let c = &r.cycles[0];
         assert!(c.call_strike.is_some() && c.put_strike.is_some());
         assert!(simulate(&rows(&[100.0, 101.0, 102.0]), &params(OptionStrategy::Collar)).is_err());
+        // Enough prices for the window but not for a whole cycle: no option would ever open.
+        assert!(simulate(&rows(&[100.0, 101.0, 99.0, 100.0, 101.0]), &params(OptionStrategy::Collar)).is_err());
     }
 }

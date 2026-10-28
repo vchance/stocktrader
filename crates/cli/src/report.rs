@@ -491,7 +491,8 @@ pub fn options_report(
         "<div class=\"banner\"><b>Estimated option prices.</b> Options are priced with the Black-Scholes formula at \
          {:.2}x the stock's recent {}-session volatility, {:.1}% interest, and a {:.0}% bid-ask cost on each trade. Real \
          prices differ (volatility skew, earnings, wider spreads in crashes), so this shows how the strategy behaves, \
-         not what it would have earned.</div>",
+         not what it would have earned. Prices are split- and dividend-adjusted and no dividend is modeled, so the \
+         prices and strikes below are adjusted levels, lower than the quotes of the time.</div>",
         p.vol_markup,
         p.vol_window,
         p.rate * 100.0,
