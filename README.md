@@ -222,6 +222,33 @@ Whole-market plans are fine: the runner streams its history rather than loading 
 On the server, `deploy/collector.sh paper-trade` does this when `PAPER_ARGS` isn't set in `.env`, and the
 paper timer submits it every weekday before the open.
 
+## Options lab
+
+`stocktrader options-lab` (`deploy/collector.sh options-lab` on the server) is a learning tool for three
+common ways of combining options with a stock or ETF you own, rolled every `--cycle` sessions (21, about a
+month):
+
+- `--strategy covered-call`: sell a call `--call-otm` (3%) above the price: income, but gains above the
+  strike are given up.
+- `--strategy protective-put`: buy a put `--put-otm` (5%) below: a cost, but losses below the strike are
+  capped.
+- `--strategy collar`: both; the call's income pays for the put.
+
+```
+stocktrader options-lab --symbol SPY --strategy covered-call --start 2017-01-01
+```
+
+Option prices are **estimated**, not historical: the Black-Scholes formula at `--vol-markup` (1.15) times
+the stock's recent `--vol-window` (20) session volatility (options usually price in more movement than
+happens, which is what sellers earn), `--rate` (3%) interest, and a `--spread` (5%) bid-ask cost per trade.
+Real prices differ (volatility skew, earnings, much wider spreads in crashes), so the report shows how a
+strategy behaves through rallies and crashes, not what it would have earned. Prices are split- and
+dividend-adjusted closes treated as a stock that pays no dividend: no dividend yield enters the option
+prices (real calls on dividend payers are cheaper and can be exercised early), and the prices and strikes
+shown are adjusted levels. The last few sessions after the final whole cycle are plain shares. The report
+compares the strategy with holding the shares from the same capital and lists each cycle's strikes, premium
+and outcome. It is outside the plans' research log and hold-out.
+
 ## Paper trading
 
 `stocktrader paper` runs once per session, before the open, against an Alpaca **paper** account (the

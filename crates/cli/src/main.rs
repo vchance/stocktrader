@@ -19,6 +19,7 @@ use st_risk::{RiskLimits, RiskManager};
 use st_strategies::{AttentionSpike, Momentum, QualityValue, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
+mod options_lab;
 mod paper;
 mod plans;
 mod report;
@@ -70,6 +71,9 @@ enum Command {
     Symbols(symbols::SymbolsArgs),
     /// Trading plans saved in plans/*.toml: list them, backtest one with an HTML report, or compare several.
     Plans(plans::PlansArgs),
+    /// Learning tool: how a covered call, protective put or collar on a stock or ETF would have behaved, with
+    /// option prices estimated by the Black-Scholes formula. Writes an HTML report.
+    OptionsLab(Box<options_lab::OptionsArgs>),
 }
 
 #[derive(Args, Clone)]
@@ -266,6 +270,7 @@ fn main() -> Result<()> {
         Command::Paper(args) => paper::run(&args),
         Command::Symbols(args) => symbols::run(&args),
         Command::Plans(args) => plans::run(&args),
+        Command::OptionsLab(args) => options_lab::run(&args),
     }
 }
 
