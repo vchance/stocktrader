@@ -475,6 +475,82 @@ pub fn plan_report(plan: &Plan, source: &str, run: &Run, synthetic: bool, window
     page(&format!("{} backtest", plan.name), &body)
 }
 
+/// An options-lab run: the strategy against holding the shares, with how each option cycle ended.
+pub fn options_report(
+    label: &str,
+    symbol: &str,
+    p: &crate::options_lab::LabParams,
+    r: &crate::options_lab::LabResult,
+    m: &Metrics,
+    hold: &Metrics,
+) -> String {
+    let mut body = format!("<h1>{}</h1><p class=\"sub\">{}</p>", esc(label), esc(&span(&r.curve)));
+    let _ = write!(
+        body,
+        "<div class=\"banner\"><b>Estimated option prices.</b> Options are priced with the Black-Scholes formula at \
+         {:.2}x the stock's recent {}-session volatility, {:.1}% interest, and a {:.0}% bid-ask cost on each trade. Real \
+         prices differ (volatility skew, earnings, wider spreads in crashes), so this shows how the strategy behaves, \
+         not what it would have earned.</div>",
+        p.vol_markup,
+        p.vol_window,
+        p.rate * 100.0,
+        p.spread * 100.0
+    );
+    let rows = vec![(label.to_string(), m, Some(m.cagr - hold.cagr)), (format!("Hold {symbol}"), hold, None)];
+    let _ = write!(body, "<h2>Summary</h2><section class=\"card\">{}</section>", metrics_table(&rows));
+    let series = vec![
+        Series { label: label.to_string(), color: color(0), dashed: false, points: to_points(&r.curve, 1.0) },
+        Series { label: format!("Hold {symbol}"), color: color(1), dashed: false, points: to_points(&r.hold, 1.0) },
+    ];
+    let _ = write!(body, "<h2>Equity</h2><section class=\"card\">{}</section>", line_chart(&series, Fmt::Money, false));
+    let dd: Vec<Series> = series
+        .iter()
+        .map(|s| Series { label: s.label.clone(), color: s.color, dashed: s.dashed, points: drawdown(&s.points) })
+        .collect();
+    let _ = write!(body, "<h2>Drawdown</h2><section class=\"card\">{}</section>", line_chart(&dd, Fmt::Pct, true));
+    let _ = write!(body, "<h2>Monthly returns</h2><section class=\"card\">{}</section>", monthly_table(&r.curve, m.start_equity));
+
+    let assigned = r.cycles.iter().filter(|c| c.call_assigned).count();
+    let paid = r.cycles.iter().filter(|c| c.put_paid).count();
+    let _ = write!(
+        body,
+        "<h2>Option cycles</h2><p class=\"sub\">{} cycles: calls exercised {assigned} times, puts paid off {paid} times. \
+         The latest 36, newest first; premium is per share, positive when received.</p>",
+        r.cycles.len()
+    );
+    let strike = |k: Option<f64>| k.map_or("-".to_string(), |k| format!("{k:.2}"));
+    let rows: String = r
+        .cycles
+        .iter()
+        .rev()
+        .take(36)
+        .map(|c| {
+            let outcome = match (c.call_assigned, c.put_paid) {
+                (true, _) => "call exercised",
+                (_, true) => "put paid off",
+                _ => "expired",
+            };
+            format!(
+                "<tr><td>{}</td><td>{:.2}</td><td>{:.0}%</td><td>{}</td><td>{}</td><td>{:+.2}</td><td>{:.2}</td><td>{outcome}</td></tr>",
+                c.opened,
+                c.price,
+                c.vol * 100.0,
+                strike(c.call_strike),
+                strike(c.put_strike),
+                c.net_premium,
+                c.closing_price
+            )
+        })
+        .collect();
+    let _ = write!(
+        body,
+        "<section class=\"card\"><div class=\"scroll\"><table><thead><tr><th>Opened</th><th>Price</th><th>Vol</th>\
+         <th>Call strike</th><th>Put strike</th><th>Premium</th><th>At expiry</th><th>Outcome</th></tr></thead>\
+         <tbody>{rows}</tbody></table></div></section>"
+    );
+    page(&format!("{label} (options lab)"), &body)
+}
+
 /// Several plans over the same dates: growth of 100 for each and the benchmark, and a summary table.
 pub fn compare_report(results: &[(&Plan, Run)], synthetic: bool, window: &Window) -> String {
     // The span the results actually cover, which the requested window may extend past.
