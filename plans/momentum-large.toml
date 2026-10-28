@@ -1,0 +1,20 @@
+name = "momentum-large"
+notes = """
+Momentum among large stocks: each month, hold the 20 that rose most over the past year, skipping the latest
+month, among the 500 most heavily traded. One of the most persistent effects documented in markets, though
+prone to sharp reversals after crashes.
+"""
+capital = 100000
+
+[strategy]
+kind = "momentum"
+top_n = 20
+lookback = 252     # a year of sessions...
+skip = 21          # ...excluding the latest month
+largest = 500
+
+[risk]
+max_position = 0.06
+
+[backtest]
+start = 2018-01-01

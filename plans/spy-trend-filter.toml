@@ -1,0 +1,21 @@
+name = "spy-trend-filter"
+notes = """
+Own the S&P 500 (SPY) while it closes above its 200-day average; hold cash while it is below. Aims at
+roughly the index's return with smaller crashes, not at beating it: a fallback if nothing else works.
+"""
+capital = 100000
+
+[strategy]
+kind = "sma"
+fast = 1           # today's close...
+slow = 200         # ...against the 200-day average
+weight = 0.98      # nearly all in, leaving room for the cash buffer
+
+[universe]
+symbols = ["SPY"]
+
+[risk]
+max_position = 1.0 # one holding, so no per-stock cap below the whole account
+
+[backtest]
+start = 2018-01-01

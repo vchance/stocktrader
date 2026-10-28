@@ -1,0 +1,17 @@
+name = "quality-value-large"
+notes = """
+quality-value-core restricted to large companies: rank only the 500 largest eligible operating companies by
+market value, where filings are cleanest and the evidence for cheap-and-profitable is strongest.
+"""
+capital = 100000
+
+[strategy]
+kind = "quality-value"
+top_n = 20
+largest = 500
+
+[risk]
+max_position = 0.06
+
+[backtest]
+start = 2018-01-01

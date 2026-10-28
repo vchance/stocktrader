@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
+mod momentum;
 mod quality_value;
+pub use momentum::Momentum;
 pub use quality_value::QualityValue;
 
 use chrono::TimeDelta;
