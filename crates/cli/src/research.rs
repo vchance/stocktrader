@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 /// Research settings, in the plans directory (skipped when listing plans).
 pub const CONFIG_FILE: &str = "_research.toml";
-/// History replayed before the held-back period so indicators and liquidity windows are warm.
-const HOLDOUT_WARMUP_DAYS: u64 = 400;
+/// History replayed before a run's first traded session (a plan's start, or the held-back period) so
+/// indicators and liquidity windows are warm: a year of momentum or a 200-day average, plus margin.
+const WARMUP_DAYS: u64 = 400;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -82,11 +83,15 @@ pub fn resolve(
         }
         // A plan's own end before the hold-out bounds its development period, not the held-back test.
         let end = requested.1.or(planned.1.filter(|e| *e >= h));
-        return Ok(Window { start: Some(h - Days::new(HOLDOUT_WARMUP_DAYS)), end, trade_from: Some(h), holdout: true });
+        return Ok(Window { start: Some(h - Days::new(WARMUP_DAYS)), end, trade_from: Some(h), holdout: true });
     }
     let start = requested.0.or(planned.0);
+    // A start date is the first traded session; the data begins earlier so the strategy is already warm,
+    // and every plan (and the benchmark) is measured from the same day.
+    let warm = |start: Option<NaiveDate>| (start.map(|s| s - Days::new(WARMUP_DAYS)), start);
     let Some(h) = research.holdout_start else {
-        return Ok(Window { start, end, trade_from: None, holdout: false });
+        let (data_start, trade_from) = warm(start);
+        return Ok(Window { start: data_start, end, trade_from, holdout: false });
     };
     let last = h - Days::new(1);
     for (flag, date) in [("--start", requested.0), ("--end", requested.1)] {
@@ -99,7 +104,8 @@ pub fn resolve(
     if start.is_some_and(|s| s >= h) {
         bail!("the plan starts at or after the held-back period (from {h}); move its start earlier");
     }
-    Ok(Window { start, end: Some(end.map_or(last, |e| e.min(last))), trade_from: None, holdout: false })
+    let (data_start, trade_from) = warm(start);
+    Ok(Window { start: data_start, end: Some(end.map_or(last, |e| e.min(last))), trade_from, holdout: false })
 }
 
 /// One plan's outcome in a logged run.
@@ -225,7 +231,8 @@ mod tests {
     #[test]
     fn ordinary_runs_stop_before_the_held_back_period() {
         let w = resolve(&research(), (None, None), (Some(d(2018, 1, 1)), None), false).unwrap();
-        assert_eq!(w, Window { start: Some(d(2018, 1, 1)), end: Some(d(2023, 12, 31)), trade_from: None, holdout: false });
+        // Trading starts on the plan's start date, after 400 days of warm-up history.
+        assert_eq!(w, Window { start: Some(d(2016, 11, 27)), end: Some(d(2023, 12, 31)), trade_from: Some(d(2018, 1, 1)), holdout: false });
         // A plan's own later end is clipped; an earlier one is kept.
         assert_eq!(resolve(&research(), (None, None), (None, Some(d(2025, 6, 1))), false).unwrap().end, Some(d(2023, 12, 31)));
         assert_eq!(resolve(&research(), (None, Some(d(2022, 6, 1))), (None, None), false).unwrap().end, Some(d(2022, 6, 1)));

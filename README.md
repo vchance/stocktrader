@@ -195,7 +195,9 @@ data, a small look-ahead inherent to adjusted series.
 Unknown keys are errors, so a typo never silently falls back to a default; inconsistent settings (a fast
 average not below the slow one, `top_n` too small for the position cap) are refused. `compare` uses one
 window for every plan: the latest start and earliest end among them, unless `--start/--end` are given.
-Indicators warm up inside the window: an `sma` plan with `slow = 50` trades from about its 50th session.
+A plan trades from its `start` date (or the first data) after 400 days of warm-up history, so indicators such
+as a 200-day average or a year of momentum are ready on day one, and every plan and the benchmark are measured
+from the same session.
 
 The HTML report is one self-contained file (no external scripts or fonts): summary against the benchmark,
 equity and drawdown charts with hover readouts, monthly returns, rejected signals by reason, recent fills,
