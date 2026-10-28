@@ -216,6 +216,11 @@ pub enum StrategySpec {
         /// Rank only the largest this many eligible companies by market value.
         largest: Option<usize>,
     },
+    /// Every symbol in `[universe] symbols` at the same weight, re-decided monthly; with `trend`, only those
+    /// whose close is above their `trend`-session average.
+    EqualWeight {
+        trend: Option<usize>,
+    },
     /// Monthly ranking on the return from `lookback` to `skip` sessions ago.
     Momentum {
         #[serde(default = "default_top_n")]
@@ -336,6 +341,7 @@ pub(crate) fn toml_date<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NaiveD
 impl StrategySpec {
     fn kind(&self) -> &'static str {
         match self {
+            StrategySpec::EqualWeight { .. } => "equal-weight",
             StrategySpec::Sma { .. } => "sma",
             StrategySpec::AttentionSpike { .. } => "attention-spike",
             StrategySpec::QualityValue { .. } => "quality-value",
@@ -343,8 +349,10 @@ impl StrategySpec {
         }
     }
 
-    fn params(&self) -> (Params, Decimal) {
+    /// `slots` is the number of symbols in the plan's universe (for equal weight).
+    fn params(&self, slots: usize) -> (Params, Decimal) {
         match *self {
+            StrategySpec::EqualWeight { trend } => (Params::EqualWeight { slots, trend }, Decimal::ONE),
             StrategySpec::Sma { fast, slow, weight } => (Params::Sma { fast, slow }, weight),
             StrategySpec::AttentionSpike { min_mentions, ratio, hold_days, weight } => {
                 (Params::Spike { min_mentions, ratio, hold_days }, weight)
@@ -389,6 +397,10 @@ impl Plan {
         fraction("risk.max_position", self.risk.max_position, Decimal::ONE)?;
         fraction("risk.max_gross_exposure", self.risk.max_gross_exposure, Decimal::ONE)?;
         fraction("risk.max_daily_loss", self.risk.max_daily_loss, Decimal::ONE)?;
+        let mut seen = std::collections::HashSet::new();
+        if let Some(dup) = self.universe.symbols.iter().find(|s| !seen.insert(s.trim().to_ascii_uppercase())) {
+            bail!("universe.symbols lists {dup} more than once");
+        }
         if self.universe.min_price < Decimal::ZERO || self.universe.min_dollar_volume < Decimal::ZERO {
             bail!("universe filters can't be negative");
         }
@@ -399,16 +411,17 @@ impl Plan {
         }
         let limits = self.limits(RiskLimits::default());
         match &self.strategy {
+            StrategySpec::EqualWeight { .. } => {
+                if self.universe.symbols.is_empty() {
+                    bail!("equal-weight needs [universe] symbols: the basket to hold");
+                }
+                check_top_n(self.universe.symbols.len(), limits.max_position_weight)?;
+                check_full_exposure(self.strategy.kind(), &limits)?;
+            }
             StrategySpec::QualityValue { top_n, largest } | StrategySpec::Momentum { top_n, largest, .. } => {
                 check_top_n(*top_n, limits.max_position_weight)?;
                 crate::check_largest(*top_n, *largest)?;
-                if limits.max_gross_exposure < Decimal::ONE {
-                    bail!(
-                        "{} invests 1/top_n in each name, so it needs risk.max_gross_exposure of 1, got {}",
-                        self.strategy.kind(),
-                        limits.max_gross_exposure
-                    );
-                }
+                check_full_exposure(self.strategy.kind(), &limits)?;
             }
             StrategySpec::Sma { weight, .. } | StrategySpec::AttentionSpike { weight, .. } => {
                 if *weight <= Decimal::ZERO || *weight > Decimal::ONE {
@@ -420,7 +433,7 @@ impl Plan {
                 }
             }
         }
-        let (params, weight) = self.strategy.params();
+        let (params, weight) = self.strategy.params(self.universe.symbols.len());
         crate::make_strategy(&params, weight, &limits)?;
         Ok(())
     }
@@ -449,6 +462,9 @@ impl Plan {
 
     /// The replay inputs for this plan over `window`.
     fn data_args(&self, dirs: &DataDirs, synthetic: bool, window: (Option<NaiveDate>, Option<NaiveDate>)) -> Result<DataArgs> {
+        if synthetic && matches!(self.strategy, StrategySpec::EqualWeight { .. }) {
+            bail!("plan {} holds a list of real symbols; --synthetic generates other ones", self.name);
+        }
         let needs_attention = matches!(self.strategy, StrategySpec::AttentionSpike { .. });
         let needs_fundamentals = matches!(self.strategy, StrategySpec::QualityValue { .. });
         if synthetic && (needs_attention || needs_fundamentals) {
@@ -480,7 +496,7 @@ impl Plan {
 
     /// The paper run for this plan: its universe, risk and strategy, its own journal and kill file.
     fn paper_job(&self, dirs: &DataDirs, live_dir: &Path) -> Result<crate::paper::Job> {
-        let (params, weight) = self.strategy.params();
+        let (params, weight) = self.strategy.params(self.universe.symbols.len());
         let mut data = self.data_args(dirs, false, (None, None))?;
         data.benchmark = "none".into();
         let plan = self.clone();
@@ -501,7 +517,7 @@ impl Plan {
 
     fn run(&self, args: &RunArgs, window: &Window) -> Result<Run> {
         let data = self.data_args(&args.dirs, args.synthetic, (window.start, window.end))?;
-        let (params, weight) = self.strategy.params();
+        let (params, weight) = self.strategy.params(self.universe.symbols.len());
         let trade_from = if args.synthetic { None } else { window.trade_from.map(st_data::session_open) };
         let run = run_backtest(&data, &params, weight, trade_from, |limits| *limits = self.limits(limits.clone()))?;
         if window.holdout && run.report.equity_curve.is_empty() {
@@ -528,6 +544,15 @@ impl Plan {
 
 /// A parsed plan and the file it came from, verbatim.
 type PlanFile = (Plan, String);
+
+/// Strategies that put 1/N in each of N names fill the whole account; a lower gross cap would fill only
+/// the first names alphabetically.
+fn check_full_exposure(kind: &str, limits: &RiskLimits) -> Result<()> {
+    if limits.max_gross_exposure < Decimal::ONE {
+        bail!("{kind} invests 1/N in each of N names, so it needs risk.max_gross_exposure of 1, got {}", limits.max_gross_exposure);
+    }
+    Ok(())
+}
 
 /// Every `*.toml` in `dir`, sorted, each parsed (or the error explaining why it isn't valid).
 fn load_all(dir: &Path) -> Result<Vec<(PathBuf, Result<PlanFile>)>> {
@@ -608,13 +633,13 @@ pub fn run(args: &PlansArgs) -> Result<()> {
                 println!("no plans in {}", args.plans_dir.display());
             }
             let mut invalid = 0;
-            println!("{:<24} {:<9} {:<38} {:<16} notes", "name", "mode", "strategy", "universe");
+            println!("{:<24} {:<9} {:<44} {:<16} notes", "name", "mode", "strategy", "universe");
             for (path, plan) in &plans {
                 match plan {
                     Ok((p, _)) => {
-                        let (params, _) = p.strategy.params();
+                        let (params, _) = p.strategy.params(p.universe.symbols.len());
                         let notes = p.notes.lines().next().unwrap_or("");
-                        println!("{:<24} {:<9} {:<38} {:<16} {notes}", p.name, p.mode.to_string(), params.to_string(), p.universe_label());
+                        println!("{:<24} {:<9} {:<44} {:<16} {notes}", p.name, p.mode.to_string(), params.to_string(), p.universe_label());
                     }
                     Err(e) => {
                         invalid += 1;
@@ -632,7 +657,7 @@ pub fn run(args: &PlansArgs) -> Result<()> {
             let (plan, source) = load_named(&args.plans_dir, name)?;
             let window = window(&args.plans_dir, run, (plan.backtest.start, plan.backtest.end))?;
             let result = plan.run(run, &window)?;
-            let (params, _) = plan.strategy.params();
+            let (params, _) = plan.strategy.params(plan.universe.symbols.len());
             println!("plan              {} ({params})", plan.name);
             if !run.synthetic {
                 println!("window            {}", window.describe());
@@ -833,6 +858,12 @@ mod tests {
         assert!(parse("name = \"Bad Name\"\n[strategy]\nkind = \"quality-value\"\n").is_err());
         assert!(parse("name = \"kill\"\n[strategy]\nkind = \"quality-value\"\n").is_err(), "reserved name");
         assert!(parse("name = \"m\"\n[strategy]\nkind = \"momentum\"\ntop_n = 20\nlargest = 10\n").is_err(), "largest below top_n");
+        assert!(parse("name = \"e\"\n[strategy]\nkind = \"equal-weight\"\n").is_err(), "equal weight needs symbols");
+        let ew = "name = \"e\"\n[strategy]\nkind = \"equal-weight\"\ntrend = 200\n[universe]\nsymbols = [\"A\", \"B\"]\n[risk]\nmax_position = 0.5\n";
+        assert_eq!(parse(ew).unwrap().strategy, StrategySpec::EqualWeight { trend: Some(200) });
+        assert!(parse(&ew.replace("max_position = 0.5", "max_position = 0.4")).is_err(), "1/2 above the cap");
+        assert!(parse(&format!("{ew}max_gross_exposure = 0.5\n")).is_err(), "equal weight needs full exposure");
+        assert!(parse(&ew.replace("\"B\"", "\"a\"")).is_err(), "duplicate symbol, any case");
         assert!(parse("name = \"m\"\n[strategy]\nkind = \"momentum\"\nlookback = 21\nskip = 21\n").is_err(), "skip >= lookback");
     }
 

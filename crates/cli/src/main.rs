@@ -16,7 +16,7 @@ use st_engine::metrics::{self, buy_and_hold, correlation};
 use st_engine::{Backtest, BacktestReport, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
 use st_marketdata::{BarEventSource, BarFilter, ReplayStats, coverage, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
-use st_strategies::{AttentionSpike, Momentum, QualityValue, SmaCrossover};
+use st_strategies::{AttentionSpike, EqualWeight, Momentum, QualityValue, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
 mod options_lab;
@@ -185,6 +185,7 @@ enum Params {
     Spike { min_mentions: u32, ratio: f64, hold_days: u32 },
     QualityValue { top_n: usize, largest: Option<usize> },
     Momentum { top_n: usize, lookback: usize, skip: usize, largest: Option<usize> },
+    EqualWeight { slots: usize, trend: Option<usize> },
 }
 
 impl fmt::Display for Params {
@@ -201,6 +202,10 @@ impl fmt::Display for Params {
             Params::Momentum { top_n, lookback, skip, largest } => {
                 write!(f, "momentum {lookback}-{skip} top {top_n}")?;
                 largest.map_or(Ok(()), |n| write!(f, " of largest {n}"))
+            }
+            Params::EqualWeight { slots, trend } => {
+                write!(f, "equal weight of {slots}")?;
+                trend.map_or(Ok(()), |n| write!(f, " above {n}-day average"))
             }
         }
     }
@@ -223,6 +228,7 @@ fn make_strategy(params: &Params, weight: Decimal, limits: &RiskLimits) -> Resul
                 None => s,
             })
         }
+        Params::EqualWeight { slots, trend } => Box::new(EqualWeight::new(slots, trend).map_err(anyhow::Error::msg)?),
         Params::Momentum { top_n, lookback, skip, largest } => {
             let s = Momentum::new(top_n, lookback, skip)
                 .map_err(anyhow::Error::msg)?
@@ -445,6 +451,7 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
             Params::QualityValue { .. } => 0,
             // A full return window before the first ranking.
             Params::Momentum { lookback, .. } => *lookback,
+            Params::EqualWeight { trend, .. } => trend.unwrap_or(0),
         })
         .max()
         .unwrap_or(0)

@@ -1,0 +1,26 @@
+name = "ai-power-equal"
+notes = """
+AI and the power behind it: ten AI companies and ten power producers, utilities and grid/data-centre
+equipment makers, each at 5%, rebalanced monthly. CAUTION: the names were chosen in 2026, knowing this
+theme's run; backtests are hindsight-biased. The real test is paper trading from now on.
+"""
+capital = 100000
+
+[strategy]
+kind = "equal-weight"
+
+[universe]
+symbols = [
+    # AI
+    "NVDA", "MSFT", "GOOGL", "META", "AMZN", "AVGO", "AMD", "TSM", "ASML", "PLTR",
+    # Power producers and utilities
+    "VST", "CEG", "NRG", "NEE", "SO", "DUK",
+    # Grid and data-centre equipment
+    "ETN", "PWR", "VRT", "GEV",
+]
+
+[risk]
+max_position = 0.06
+
+[backtest]
+start = 2018-01-01
