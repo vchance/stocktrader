@@ -171,6 +171,27 @@ On the server: `deploy/collector.sh plans list` (and so on); reports land in `da
 | `[backtest]` | `start`, `end` (TOML dates, e.g. `2018-01-01`), `benchmark` (default SPY, or `none`), `slippage_bps` |
 | `[paper]` | `max_orders` (default 20: a run planning more is refused), `history_days` (default 400 of warm-up) |
 
+### Testing plans honestly
+
+Try enough ideas on the same history and one will look good by luck. Two safeguards:
+- **Held-back period.** `plans/_research.toml` sets `holdout_start` (2024-01-01). `plans backtest` and
+  `plans compare` stop the day before it, and asking for later dates is an error. Develop and compare on the
+  earlier years; once a plan is final, run it once with `--holdout`, which warms up on the earlier history
+  and then trades and reports only the held-back period. Reports say which period they show.
+- **Experiment log.** Every run is appended to `research/experiments.jsonl` (`data/research/` on the server)
+  with the window, the full plan files and the results. `stocktrader plans log` shows how many runs and
+  plan versions there were, and how many times each plan's held-back period has been looked at; a held-back
+  run says so when it isn't the first look.
+
+`quality-value-core` and `trend-megacaps` were run over 2024-2026 before the hold-out existed, so their
+held-back results are already known; the period is unseen for plans written since.
+
+The guard covers `plans backtest` and `plans compare` only: `stocktrader backtest`, `walk-forward` and the
+data tools read whatever dates they're given. The log is a record, not a lock: it sits beside the plans
+directory by default (`--research-log` or `STOCKTRADER_RESEARCH_LOG` move it), runs are logged before their
+results are shown, and a fresh log is announced. Split- and dividend-adjusted prices are computed with later
+data, a small look-ahead inherent to adjusted series.
+
 Unknown keys are errors, so a typo never silently falls back to a default; inconsistent settings (a fast
 average not below the slow one, `top_n` too small for the position cap) are refused. `compare` uses one
 window for every plan: the latest start and earliest end among them, unless `--start/--end` are given.

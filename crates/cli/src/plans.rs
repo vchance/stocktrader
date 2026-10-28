@@ -14,6 +14,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Deserializer};
 use st_risk::RiskLimits;
 
+use crate::research::{self, Research, Window};
 use crate::{DataArgs, Params, Run, check_top_n, print_run, report, run_backtest};
 
 #[derive(Args)]
@@ -34,6 +35,15 @@ enum PlansCommand {
         name: String,
         #[command(flatten)]
         run: RunArgs,
+    },
+    /// Show how many experiments have been run, per plan, including looks at the held-back period.
+    Log {
+        /// How many recent runs to list.
+        #[arg(long, default_value_t = 20)]
+        last: usize,
+        /// Defaults to research/experiments.jsonl beside the plans directory.
+        #[arg(long, env = "STOCKTRADER_RESEARCH_LOG")]
+        research_log: Option<PathBuf>,
     },
     /// Backtest several plans (all, if none are named) over the same dates and write a comparison report.
     Compare {
@@ -61,6 +71,14 @@ struct RunArgs {
     end: Option<NaiveDate>,
     #[command(flatten)]
     dirs: DataDirs,
+    /// Evaluate the held-back period set in plans/_research.toml (warming up on the history before it).
+    /// Ordinary runs never include it; look at it once a plan is final, and expect each look to be logged.
+    #[arg(long)]
+    holdout: bool,
+    /// Every run is appended here, so the number of experiments behind a result stays visible. Defaults to
+    /// research/experiments.jsonl beside the plans directory, wherever the command is run from.
+    #[arg(long, env = "STOCKTRADER_RESEARCH_LOG")]
+    research_log: Option<PathBuf>,
     /// Run on generated prices instead of market data, to try the plumbing before any data is downloaded
     /// (prices only: not for strategies that need fundamentals or attention).
     #[arg(long)]
@@ -283,7 +301,7 @@ fn default_slippage() -> Decimal {
 }
 
 /// Accepts a bare TOML date (`start = 2018-01-01`).
-fn toml_date<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NaiveDate>, D::Error> {
+pub(crate) fn toml_date<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NaiveDate>, D::Error> {
     let Some(dt) = Option::<toml::value::Datetime>::deserialize(d)? else {
         return Ok(None);
     };
@@ -448,10 +466,30 @@ impl Plan {
         })
     }
 
-    fn run(&self, args: &RunArgs, window: (Option<NaiveDate>, Option<NaiveDate>)) -> Result<Run> {
-        let data = self.data_args(&args.dirs, args.synthetic, window)?;
+    fn run(&self, args: &RunArgs, window: &Window) -> Result<Run> {
+        let data = self.data_args(&args.dirs, args.synthetic, (window.start, window.end))?;
         let (params, weight) = self.strategy.params();
-        run_backtest(&data, &params, weight, |limits| *limits = self.limits(limits.clone()))
+        let trade_from = if args.synthetic { None } else { window.trade_from.map(st_data::session_open) };
+        let run = run_backtest(&data, &params, weight, trade_from, |limits| *limits = self.limits(limits.clone()))?;
+        if window.holdout && run.report.equity_curve.is_empty() {
+            bail!("no market data in the held-back period for plan {}; nothing to evaluate (not logged)", self.name);
+        }
+        Ok(run)
+    }
+
+    fn result(&self, source: &str, run: &Run) -> research::PlanResult {
+        let m = &run.report.metrics;
+        research::PlanResult {
+            name: self.name.clone(),
+            source: source.to_string(),
+            total_return: m.total_return,
+            cagr: m.cagr,
+            max_drawdown: m.max_drawdown,
+            sharpe: m.sharpe,
+            fills: m.num_fills,
+            benchmark: run.benchmark.as_ref().map(|_| self.backtest.benchmark.to_ascii_uppercase()),
+            benchmark_cagr: run.benchmark.as_ref().map(|(_, b)| b.cagr),
+        }
     }
 }
 
@@ -464,6 +502,8 @@ fn load_all(dir: &Path) -> Result<Vec<(PathBuf, Result<PlanFile>)>> {
         .with_context(|| format!("reading plans directory {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+        // `_research.toml` and other `_` files are settings, not plans.
+        .filter(|p| !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('_')))
         .collect();
     paths.sort();
     Ok(paths.into_iter().map(|p| (p.clone(), Plan::load(&p))).collect())
@@ -477,8 +517,47 @@ fn load_named(dir: &Path, name: &str) -> Result<(Plan, String)> {
     Plan::load(&path)
 }
 
-fn window(args: &RunArgs, plan: &Plan) -> (Option<NaiveDate>, Option<NaiveDate>) {
-    (args.start.or(plan.backtest.start), args.end.or(plan.backtest.end))
+/// The experiment log: as given, or research/experiments.jsonl beside the plans directory.
+fn research_log(plans_dir: &Path, given: Option<&PathBuf>) -> PathBuf {
+    given.cloned().unwrap_or_else(|| {
+        let base = plans_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        base.join("research").join("experiments.jsonl")
+    })
+}
+
+/// The run's window under the research settings. Synthetic data has its own dates, so it ignores them.
+fn window(dir: &Path, args: &RunArgs, planned: (Option<NaiveDate>, Option<NaiveDate>)) -> Result<Window> {
+    if args.synthetic {
+        if args.holdout {
+            bail!("--holdout needs real data; synthetic prices have no held-back period");
+        }
+        return Ok(Window::default());
+    }
+    research::resolve(&Research::load(dir)?, (args.start, args.end), planned, args.holdout)
+}
+
+/// Logs a run, before any of its results are shown, so a look at the held-back period can't go unrecorded;
+/// for held-back runs, says how many times each plan's held-back period has now been seen.
+fn log_run(plans_dir: &Path, args: &RunArgs, command: &str, window: &Window, results: Vec<research::PlanResult>) -> Result<()> {
+    let log = research_log(plans_dir, args.research_log.as_ref());
+    if !log.exists() {
+        eprintln!("starting a new experiment log at {}", log.display());
+    }
+    let names: Vec<String> = results.iter().map(|r| r.name.clone()).collect();
+    let entry = research::Entry { at: chrono::Utc::now(), command: command.into(), synthetic: args.synthetic, window: *window, plans: results };
+    research::append(&log, &entry).context("the run could not be logged, so its results are not shown")?;
+    if window.holdout && !args.synthetic {
+        let (entries, bad) = research::read(&log)?;
+        if bad > 0 {
+            eprintln!("warning: {bad} unreadable line(s) in {}; the look counts below may be low", log.display());
+        }
+        for name in names {
+            let looks = research::holdout_looks(&entries, &name);
+            let note = if looks > 1 { ": results seen more than once are no longer unbiased" } else { "" };
+            println!("held-back looks   {name}: {looks}{note}");
+        }
+    }
+    Ok(())
 }
 
 fn write_report(dir: &Path, file: &str, html: &str) -> Result<PathBuf> {
@@ -518,11 +597,16 @@ pub fn run(args: &PlansArgs) -> Result<()> {
         }
         PlansCommand::Backtest { name, run } => {
             let (plan, source) = load_named(&args.plans_dir, name)?;
-            let result = plan.run(run, window(run, &plan))?;
+            let window = window(&args.plans_dir, run, (plan.backtest.start, plan.backtest.end))?;
+            let result = plan.run(run, &window)?;
             let (params, _) = plan.strategy.params();
             println!("plan              {} ({params})", plan.name);
+            if !run.synthetic {
+                println!("window            {}", window.describe());
+            }
+            log_run(&args.plans_dir, run, "backtest", &window, vec![plan.result(&source, &result)])?;
             print_run(&result, &plan.backtest.benchmark);
-            let html = report::plan_report(&plan, &source, &result, run.synthetic);
+            let html = report::plan_report(&plan, &source, &result, run.synthetic, &window);
             let path = write_report(&run.reports_dir, &format!("{}.html", plan.name), &html)?;
             println!("report            {}", path.display());
             Ok(())
@@ -537,18 +621,24 @@ pub fn run(args: &PlansArgs) -> Result<()> {
                 bail!("no plans to compare in {}", args.plans_dir.display());
             }
             // One window for all: the latest start and the earliest end any plan asks for.
-            let start = run.start.or_else(|| plans.iter().filter_map(|(p, _)| p.backtest.start).max());
-            let end = run.end.or_else(|| plans.iter().filter_map(|(p, _)| p.backtest.end).min());
-            if let (Some(s), Some(e)) = (start, end)
+            let start = plans.iter().filter_map(|(p, _)| p.backtest.start).max();
+            let end = plans.iter().filter_map(|(p, _)| p.backtest.end).min();
+            let window = window(&args.plans_dir, run, (start, end))?;
+            if let (Some(s), Some(e)) = (window.trade_from.or(window.start), window.end)
                 && s >= e
             {
                 bail!("the plans' backtest windows don't overlap ({s} to {e}); pass --start and --end");
             }
+            if !run.synthetic {
+                println!("window            {}", window.describe());
+            }
             let mut results = Vec::new();
             for (plan, _) in &plans {
                 eprintln!("running {}", plan.name);
-                results.push((plan, plan.run(run, (start, end))?));
+                results.push((plan, plan.run(run, &window)?));
             }
+            let logged = results.iter().zip(&plans).map(|((plan, r), (_, source))| plan.result(source, r)).collect();
+            log_run(&args.plans_dir, run, "compare", &window, logged)?;
             println!("{:<24} {:>9} {:>9} {:>8} {:>8} {:>10} {:>7}", "plan", "return", "CAGR", "max DD", "Sharpe", "vs bench", "fills");
             for (plan, r) in &results {
                 let m = &r.report.metrics;
@@ -564,12 +654,13 @@ pub fn run(args: &PlansArgs) -> Result<()> {
                     m.num_fills
                 );
             }
-            let html = report::compare_report(&results, run.synthetic);
+            let html = report::compare_report(&results, run.synthetic, &window);
             let path = write_report(&run.reports_dir, "compare.html", &html)?;
             println!("report            {}", path.display());
             Ok(())
         }
         PlansCommand::Paper { names, run } => paper(&args.plans_dir, names, run),
+        PlansCommand::Log { last, research_log: log } => research::print_log(&research_log(&args.plans_dir, log.as_ref()), *last),
     }
 }
 

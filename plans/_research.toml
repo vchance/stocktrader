@@ -1,0 +1,11 @@
+# Research settings for `stocktrader plans` (not a plan; files starting with _ are skipped).
+#
+# Results from holdout_start on are held back: `plans backtest` and `plans compare` end the day before it,
+# and asking for later dates is an error. Develop and compare plans on the earlier years only. Once a plan is
+# final, evaluate it on the held-back period with --holdout, ideally once: every look is logged
+# (`stocktrader plans log`), and a result looked at repeatedly, or tuned after looking, is no longer an
+# unbiased test.
+#
+# Note: quality-value-core and trend-megacaps were run over 2024-2026 before this was set up, so their
+# held-back results are already known. The period is unseen for plans written after 2026-10-27.
+holdout_start = 2024-01-01

@@ -48,6 +48,8 @@ fn plans(dir: &Path, args: &[&str]) -> Output {
         .arg(dir.join("marketdata"))
         .arg("--reports-dir")
         .arg(dir.join("reports"))
+        .arg("--research-log")
+        .arg(dir.join("research/experiments.jsonl"))
         .output()
         .unwrap()
 }
@@ -116,4 +118,70 @@ benchmark = "SYN000"
     assert!(!plans(dir.path(), &["compare"]).status.success());
     let missing = plans(dir.path(), &["backtest", "nope"]);
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no plan nope"));
+}
+
+#[test]
+fn the_held_back_period_is_only_seen_deliberately_and_every_run_is_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let market = dir.path().join("marketdata");
+    std::fs::create_dir_all(&market).unwrap();
+    write_bars(&market);
+    let plan_dir = dir.path().join("plans");
+    std::fs::create_dir_all(&plan_dir).unwrap();
+    std::fs::write(plan_dir.join("_research.toml"), "holdout_start = 2024-10-01\n").unwrap();
+    std::fs::write(
+        plan_dir.join("fast.toml"),
+        "name = \"fast\"\n[strategy]\nkind = \"sma\"\nfast = 5\nslow = 20\nweight = 0.1\n[backtest]\nbenchmark = \"SYN000\"\n",
+    )
+    .unwrap();
+
+    // The settings file isn't a plan.
+    let list = Command::new(env!("CARGO_BIN_EXE_stocktrader")).args(["plans", "--plans-dir"]).arg(&plan_dir).arg("list").output().unwrap();
+    let listed = ok(&list);
+    assert!(!listed.contains("_research") && !listed.contains("INVALID"), "{listed}");
+
+    let out = ok(&plans(dir.path(), &["backtest", "fast"]));
+    assert!(out.contains("window            … .. 2024-09-30"), "{out}");
+    let html = std::fs::read_to_string(dir.path().join("reports/fast.html")).unwrap();
+    assert!(html.contains("Development period, through 2024-09-30"));
+    assert!(html.contains(" to 2024-09-30 · "), "the equity curve itself ends at the cutoff");
+
+    // compare, with a plan whose own end lies inside the held-back period, still stops at the cutoff.
+    std::fs::write(
+        plan_dir.join("late.toml"),
+        "name = \"late\"\n[strategy]\nkind = \"sma\"\nfast = 10\nslow = 30\nweight = 0.1\n[backtest]\nbenchmark = \"SYN000\"\nend = 2025-01-31\n",
+    )
+    .unwrap();
+    let out = ok(&plans(dir.path(), &["compare"]));
+    assert!(out.contains("window            … .. 2024-09-30"), "{out}");
+    let html = std::fs::read_to_string(dir.path().join("reports/compare.html")).unwrap();
+    assert!(html.contains(" to 2024-09-30<"), "comparison span ends at the cutoff");
+    std::fs::remove_file(plan_dir.join("late.toml")).unwrap();
+    assert!(!plans(dir.path(), &["backtest", "fast", "--holdout", "--synthetic"]).status.success());
+
+    let peek = plans(dir.path(), &["backtest", "fast", "--end", "2024-12-01"]);
+    assert!(!peek.status.success());
+    assert!(String::from_utf8_lossy(&peek.stderr).contains("reaches into the held-back period"));
+
+    let out = ok(&plans(dir.path(), &["backtest", "fast", "--holdout"]));
+    assert!(out.contains("window            HELD-BACK PERIOD 2024-10-01"), "{out}");
+    assert!(out.contains("held-back looks   fast: 1\n"), "{out}");
+    let html = std::fs::read_to_string(dir.path().join("reports/fast.html")).unwrap();
+    assert!(html.contains("Held-back period from 2024-10-01"));
+    // Trading starts at the held-back period: no fill before it.
+    let fills: Vec<&str> = html.split("<tr><td>").skip(1).filter_map(|r| r.get(..10)).filter(|d| d.starts_with("20") && d.as_bytes()[4] == b'-').collect();
+    assert!(!fills.is_empty() && fills.iter().all(|d| *d >= "2024-10-01"), "{fills:?}");
+
+    let out = ok(&plans(dir.path(), &["backtest", "fast", "--holdout"]));
+    assert!(out.contains("held-back looks   fast: 2: results seen more than once"), "{out}");
+
+    let log = Command::new(env!("CARGO_BIN_EXE_stocktrader"))
+        .args(["plans", "--plans-dir"]).arg(&plan_dir)
+        .args(["log", "--research-log"]).arg(dir.path().join("research/experiments.jsonl"))
+        .output()
+        .unwrap();
+    let log = ok(&log);
+    assert!(log.contains("experiments       4 on real data"), "{log}");
+    assert!(log.contains("fast                         4         1              2"), "{log}");
+    assert!(log.contains("late                         1         1              0"), "{log}");
 }
