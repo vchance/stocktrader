@@ -5,8 +5,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
+mod equal_weight;
 mod momentum;
 mod quality_value;
+pub use equal_weight::EqualWeight;
 pub use momentum::Momentum;
 pub use quality_value::QualityValue;
 

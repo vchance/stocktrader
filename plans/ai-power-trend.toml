@@ -1,0 +1,27 @@
+name = "ai-power-trend"
+notes = """
+ai-power-equal with a trend filter: each month, hold a name only while it closes above its 200-day average,
+otherwise keep its 5% in cash, aiming to sidestep long slides like 2022. CAUTION: names chosen in 2026,
+knowing this theme's run; backtests are hindsight-biased. The real test is paper trading from now on.
+"""
+capital = 100000
+
+[strategy]
+kind = "equal-weight"
+trend = 200
+
+[universe]
+symbols = [
+    # AI
+    "NVDA", "MSFT", "GOOGL", "META", "AMZN", "AVGO", "AMD", "TSM", "ASML", "PLTR",
+    # Power producers and utilities
+    "VST", "CEG", "NRG", "NEE", "SO", "DUK",
+    # Grid and data-centre equipment
+    "ETN", "PWR", "VRT", "GEV",
+]
+
+[risk]
+max_position = 0.06
+
+[backtest]
+start = 2018-01-01
