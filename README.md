@@ -186,6 +186,12 @@ Try enough ideas on the same history and one will look good by luck. Two safegua
 `quality-value-core` and `trend-megacaps` were run over 2024-2026 before the hold-out existed, so their
 held-back results are already known; the period is unseen for plans written since.
 
+The guard covers `plans backtest` and `plans compare` only: `stocktrader backtest`, `walk-forward` and the
+data tools read whatever dates they're given. The log is a record, not a lock: it sits beside the plans
+directory by default (`--research-log` or `STOCKTRADER_RESEARCH_LOG` move it), runs are logged before their
+results are shown, and a fresh log is announced. Split- and dividend-adjusted prices are computed with later
+data, a small look-ahead inherent to adjusted series.
+
 Unknown keys are errors, so a typo never silently falls back to a default; inconsistent settings (a fast
 average not below the slow one, `top_n` too small for the position cap) are refused. `compare` uses one
 window for every plan: the latest start and earliest end among them, unless `--start/--end` are given.

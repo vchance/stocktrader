@@ -144,6 +144,20 @@ fn the_held_back_period_is_only_seen_deliberately_and_every_run_is_logged() {
     assert!(out.contains("window            … .. 2024-09-30"), "{out}");
     let html = std::fs::read_to_string(dir.path().join("reports/fast.html")).unwrap();
     assert!(html.contains("Development period, through 2024-09-30"));
+    assert!(html.contains(" to 2024-09-30 · "), "the equity curve itself ends at the cutoff");
+
+    // compare, with a plan whose own end lies inside the held-back period, still stops at the cutoff.
+    std::fs::write(
+        plan_dir.join("late.toml"),
+        "name = \"late\"\n[strategy]\nkind = \"sma\"\nfast = 10\nslow = 30\nweight = 0.1\n[backtest]\nbenchmark = \"SYN000\"\nend = 2025-01-31\n",
+    )
+    .unwrap();
+    let out = ok(&plans(dir.path(), &["compare"]));
+    assert!(out.contains("window            … .. 2024-09-30"), "{out}");
+    let html = std::fs::read_to_string(dir.path().join("reports/compare.html")).unwrap();
+    assert!(html.contains(" to 2024-09-30<"), "comparison span ends at the cutoff");
+    std::fs::remove_file(plan_dir.join("late.toml")).unwrap();
+    assert!(!plans(dir.path(), &["backtest", "fast", "--holdout", "--synthetic"]).status.success());
 
     let peek = plans(dir.path(), &["backtest", "fast", "--end", "2024-12-01"]);
     assert!(!peek.status.success());
@@ -167,6 +181,7 @@ fn the_held_back_period_is_only_seen_deliberately_and_every_run_is_logged() {
         .output()
         .unwrap();
     let log = ok(&log);
-    assert!(log.contains("experiments       3 on real data"), "{log}");
-    assert!(log.contains("fast                         3         1              2"), "{log}");
+    assert!(log.contains("experiments       4 on real data"), "{log}");
+    assert!(log.contains("fast                         4         1              2"), "{log}");
+    assert!(log.contains("late                         1         1              0"), "{log}");
 }

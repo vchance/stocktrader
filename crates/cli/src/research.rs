@@ -77,9 +77,11 @@ pub fn resolve(
         if requested.0.is_some() {
             bail!("--start can't be combined with --holdout: the held-back period starts at {h}");
         }
-        if end.is_some_and(|e| e < h) {
-            bail!("the requested end is before the held-back period, which starts at {h}");
+        if requested.1.is_some_and(|e| e < h) {
+            bail!("--end is before the held-back period, which starts at {h}");
         }
+        // A plan's own end before the hold-out bounds its development period, not the held-back test.
+        let end = requested.1.or(planned.1.filter(|e| *e >= h));
         return Ok(Window { start: Some(h - Days::new(HOLDOUT_WARMUP_DAYS)), end, trade_from: Some(h), holdout: true });
     }
     let start = requested.0.or(planned.0);
@@ -131,7 +133,9 @@ pub fn append(log: &Path, entry: &Entry) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(log).with_context(|| format!("opening {}", log.display()))?;
-    writeln!(file, "{}", serde_json::to_string(entry)?).with_context(|| format!("writing {}", log.display()))
+    // One write per entry, so concurrent runs can't interleave within a line.
+    let line = format!("{}\n", serde_json::to_string(entry)?);
+    file.write_all(line.as_bytes()).with_context(|| format!("writing {}", log.display()))
 }
 
 /// Every entry, oldest first, and how many lines couldn't be read. A missing log is empty.
@@ -239,6 +243,9 @@ mod tests {
         assert_eq!(w.start, Some(d(2022, 11, 27)), "warm-up before the period");
         assert!(w.holdout);
         assert!(resolve(&research(), (Some(d(2020, 1, 1)), None), (None, None), true).is_err());
+        // A plan's own earlier end doesn't block the held-back test; an explicit one does.
+        assert_eq!(resolve(&research(), (None, None), (None, Some(d(2023, 6, 30))), true).unwrap().end, None);
+        assert!(resolve(&research(), (None, Some(d(2023, 6, 30))), (None, None), true).is_err());
         assert!(resolve(&Research::default(), (None, None), (None, None), true).is_err());
     }
 
