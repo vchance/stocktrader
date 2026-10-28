@@ -250,7 +250,7 @@ pub fn run(args: &OptionsArgs) -> Result<()> {
     println!("strategy          {label}");
     println!("ESTIMATED option prices (Black-Scholes, {:.2}x recent volatility): a learning tool, not tradeable evidence", params.vol_markup);
     println!("{:<22} {:>9} {:>9} {:>8} {:>8}", "", "return", "CAGR", "max DD", "Sharpe");
-    for (name, x) in [(label.as_str(), &m), ("hold the shares", &h)] {
+    for (name, x) in [("with options", &m), ("hold the shares", &h)] {
         println!("{name:<22} {:>8.2}% {:>8.2}% {:>7.2}% {:>8.2}", x.total_return * 100.0, x.cagr * 100.0, x.max_drawdown * 100.0, x.sharpe);
     }
     println!("cycles            {} (calls exercised {assigned}, puts paid off {paid})", result.cycles.len());
