@@ -21,7 +21,7 @@ cargo run --release -p st-cli -- walk-forward --parquet data/marketdata/bars_dai
   the correlation of daily returns.
 - **Walk-forward:** `walk-forward` picks parameters from a small grid on each training window
   (`--train-days`, default 365) by Sharpe, then runs the choice on the next `--test-days` (91) only,
-  after replaying `--warmup-days` (330, enough for a 200-day average plus the liquidity window; too little
+  after replaying `--warmup-days` (by default enough for the slowest window in the grid plus the liquidity window, at least 330 days; too little
   is refused, since a candidate that can't warm up never trades and would win on a Sharpe of 0) of
   history without trading so indicators are ready. The
   compounded test windows are the number to believe; the table also shows each choice's in-sample return,

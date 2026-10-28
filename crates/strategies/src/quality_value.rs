@@ -57,7 +57,8 @@ fn update(slot: &mut Option<(NaiveDate, Decimal)>, period_end: NaiveDate, value:
 /// - earnings yield: latest annual net income / market cap (shares outstanding x as-traded price);
 /// - return on assets: latest annual net income / total assets.
 ///
-/// Eligible means: a bar today (a stock that stopped trading can't be bought), an operating company (positive annual revenue, which excludes commodity trusts and other
+/// Eligible means: a bar today (a stock that stopped trading can't be bought), an operating company (positive
+/// annual revenue, which excludes commodity trusts and other
 /// funds that file 10-Ks), an as-traded price of at least `min_price`, average daily dollar volume of at
 /// least `min_dollar_volume` over the last `liquidity_lookback` bars, positive assets and shares, and each
 /// figure from a period that ended within `max_report_age`. Only facts already public reach the strategy (the

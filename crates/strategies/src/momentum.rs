@@ -26,7 +26,8 @@ struct Stock {
 /// Eligible: a bar today, an as-traded price of at least `min_price`, average daily dollar volume of at least
 /// `min_dollar_volume` over `liquidity_lookback` sessions, and a full `lookback` of history. With `largest`,
 /// only the most heavily traded eligible stocks (by that average dollar volume, a proxy for size that needs
-/// no fundamentals) are ranked. Dropped names are restated at 0 until the next rebalance.
+/// no fundamentals) are ranked. Dropped names are restated at 0 until the next rebalance. Windows count the
+/// stock's own bars, so a stock with missing sessions looks back slightly further in calendar time.
 pub struct Momentum {
     top_n: usize,
     weight: Decimal,
@@ -235,14 +236,31 @@ mod tests {
 
     #[test]
     fn holds_the_strongest_past_returns_skipping_the_last_month() {
-        // Lookback 40 sessions, skip 10. UP rose steadily; LATE was flat until a spike in the skipped weeks;
-        // DOWN fell. Bars run 70 calendar days (into March), so the March rebalance has full history.
-        let up = series("UP", 0, 70, |i| dec!(10) + Decimal::from(i) / dec!(10));
-        let late = series("LATE", 0, 70, |i| if i >= 62 { dec!(30) } else { dec!(10) });
-        let down = series("DOWN", 0, 70, |i| dec!(20) - Decimal::from(i) / dec!(10));
+        // Lookback 40 sessions, skip 10, daily bars to day 58 (March 1, the last rebalance). UP rose steadily;
+        // LATE was flat until a spike from day 52, inside the skipped window at that rebalance; DOWN fell.
+        let up = series("UP", 0, 59, |i| dec!(10) + Decimal::from(i) / dec!(10));
+        let late = series("LATE", 0, 59, |i| if i >= 52 { dec!(30) } else { dec!(10) });
+        let down = series("DOWN", 0, 59, |i| dec!(20) - Decimal::from(i) / dec!(10));
         let events: Vec<Event> = [up, late, down].concat();
-        let mut s = Momentum::new(1, 40, 10).unwrap();
-        assert_eq!(run(&mut s, events), BTreeMap::from([("UP".into(), dec!(1))]));
+        let mut skipping = Momentum::new(1, 40, 10).unwrap();
+        assert_eq!(run(&mut skipping, events.clone()), BTreeMap::from([("UP".into(), dec!(1))]));
+        // Without the skip, the recent spike would win.
+        let mut not_skipping = Momentum::new(1, 40, 0).unwrap();
+        assert_eq!(run(&mut not_skipping, events).get("LATE"), Some(&dec!(1)));
+    }
+
+    #[test]
+    fn return_runs_from_lookback_to_skip_sessions_ago() {
+        // Closes 10, 11, ..., 14 on days 0-4; lookback 3 and skip 1 on day 4: from day 1 (11) to day 3 (13).
+        let mut s = Momentum::new(1, 3, 1).unwrap().with_filters(Decimal::ZERO, Decimal::ZERO, 1);
+        let portfolio = Portfolio::new(Decimal::ZERO);
+        for i in 0..5u64 {
+            let e = bar("X", day(i), dec!(10) + Decimal::from(i), dec!(1));
+            s.on_event(&e, &StrategyContext { now: e.available_at, portfolio: &portfolio });
+        }
+        assert_eq!(s.candidates(day(4)), vec![(Symbol::new("X"), dec!(13) / dec!(11) - Decimal::ONE)]);
+        // A day later (no new bar), X has no bar "today" and isn't eligible.
+        assert!(s.candidates(day(5)).is_empty());
     }
 
     #[test]

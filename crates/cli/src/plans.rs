@@ -399,8 +399,9 @@ impl Plan {
         }
         let limits = self.limits(RiskLimits::default());
         match &self.strategy {
-            StrategySpec::QualityValue { top_n, .. } | StrategySpec::Momentum { top_n, .. } => {
+            StrategySpec::QualityValue { top_n, largest } | StrategySpec::Momentum { top_n, largest, .. } => {
                 check_top_n(*top_n, limits.max_position_weight)?;
+                crate::check_largest(*top_n, *largest)?;
                 if limits.max_gross_exposure < Decimal::ONE {
                     bail!(
                         "{} invests 1/top_n in each name, so it needs risk.max_gross_exposure of 1, got {}",
@@ -831,6 +832,8 @@ mod tests {
         assert!(parse(half).is_err(), "quality-value can't fit 1/N weights under half exposure");
         assert!(parse("name = \"Bad Name\"\n[strategy]\nkind = \"quality-value\"\n").is_err());
         assert!(parse("name = \"kill\"\n[strategy]\nkind = \"quality-value\"\n").is_err(), "reserved name");
+        assert!(parse("name = \"m\"\n[strategy]\nkind = \"momentum\"\ntop_n = 20\nlargest = 10\n").is_err(), "largest below top_n");
+        assert!(parse("name = \"m\"\n[strategy]\nkind = \"momentum\"\nlookback = 21\nskip = 21\n").is_err(), "skip >= lookback");
     }
 
     #[test]

@@ -58,10 +58,10 @@ enum Command {
         train_days: i64,
         #[arg(long, default_value_t = 91)]
         test_days: i64,
-        /// History replayed before each window without trading, so indicators are warm. The default covers
-        /// the slowest grid window (200 sessions) plus the 20-session liquidity lookback.
-        #[arg(long, default_value_t = 330)]
-        warmup_days: i64,
+        /// History replayed before each window without trading, so indicators are warm. By default, enough
+        /// for the slowest window in the grid plus the 20-session liquidity lookback, and at least 330 days.
+        #[arg(long)]
+        warmup_days: Option<i64>,
     },
     /// Before the open, trade the Alpaca paper account towards the strategy's current targets, sized and
     /// risk-checked exactly as in a backtest. Prints the plan only, unless --submit.
@@ -260,7 +260,7 @@ fn main() -> Result<()> {
                     .map(|top_n| Params::Momentum { top_n, lookback: 252, skip: 21, largest: None })
                     .collect(),
             };
-            let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), TimeDelta::days(warmup_days));
+            let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), warmup_days.map(TimeDelta::days));
             walk(&data, &grid, weight, windows)
         }
         Command::Paper(args) => paper::run(&args),
@@ -280,6 +280,16 @@ fn require_attention(data: &DataArgs) -> Result<()> {
 fn check_top_n(top_n: usize, cap: Decimal) -> Result<()> {
     if top_n == 0 || cap <= Decimal::ZERO || Decimal::ONE / Decimal::from(top_n) > cap {
         bail!("--top-n {top_n} gives each name more than the {cap} position cap; use at least {}", (Decimal::ONE / cap).ceil());
+    }
+    Ok(())
+}
+
+/// Ranking only the largest N can't fill more than N slots.
+fn check_largest(top_n: usize, largest: Option<usize>) -> Result<()> {
+    if let Some(n) = largest
+        && n < top_n
+    {
+        bail!("largest ({n}) is smaller than top_n ({top_n}), so fewer than top_n names could ever be held");
     }
     Ok(())
 }
@@ -306,10 +316,12 @@ impl StrategyArgs {
                     bail!("quality-value needs --fundamentals data/fundamentals");
                 }
                 check_top_n(self.top_n, RiskLimits::default().max_position_weight)?;
+                check_largest(self.top_n, self.largest)?;
                 Params::QualityValue { top_n: self.top_n, largest: self.largest }
             }
             StrategyName::Momentum => {
                 check_top_n(self.top_n, RiskLimits::default().max_position_weight)?;
+                check_largest(self.top_n, self.largest)?;
                 Params::Momentum { top_n: self.top_n, lookback: self.momentum_lookback, skip: self.momentum_skip, largest: self.largest }
             }
         })
@@ -413,7 +425,7 @@ fn print_run(run: &Run, benchmark: &str) {
     }
 }
 
-fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup): (TimeDelta, TimeDelta, TimeDelta)) -> Result<()> {
+fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup): (TimeDelta, TimeDelta, Option<TimeDelta>)) -> Result<()> {
     // Validate every candidate once, so a bad grid fails before hours of backtests.
     for p in grid {
         make_strategy(p, weight, &RiskLimits::default())?;
@@ -432,6 +444,8 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
         .max()
         .unwrap_or(0)
         + RiskLimits::default().liquidity_lookback;
+    // About 252 sessions a year; a few days' margin for holidays.
+    let warmup = warmup.unwrap_or_else(|| TimeDelta::days(((needed_sessions * 365).div_ceil(252) as i64 + 10).max(330)));
     let warmup_sessions = warmup.num_days() * 252 / 365;
     if (warmup_sessions as usize) < needed_sessions {
         bail!(
