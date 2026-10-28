@@ -22,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 mod paper;
 mod plans;
 mod report;
+mod research;
 mod symbols;
 
 #[derive(Parser)]
@@ -307,22 +308,33 @@ struct Run {
     benchmark: Option<(Vec<(Timestamp, Decimal)>, Metrics)>,
 }
 
-/// One streamed backtest of `params` over `data`, with `adjust` applied to the risk limits first.
-fn run_backtest(data: &DataArgs, params: &Params, weight: Decimal, adjust: impl FnOnce(&mut RiskLimits)) -> Result<Run> {
+/// One streamed backtest of `params` over `data`, with `adjust` applied to the risk limits first. With
+/// `trade_from`, everything before it only warms the strategy up: trading, the equity curve, the metrics and
+/// the benchmark all start there.
+fn run_backtest(
+    data: &DataArgs,
+    params: &Params,
+    weight: Decimal,
+    trade_from: Option<Timestamp>,
+    adjust: impl FnOnce(&mut RiskLimits),
+) -> Result<Run> {
     let mut prepared = prepare(data)?;
     adjust(&mut prepared.limits);
     let strategy = make_strategy(params, weight, &prepared.limits)?;
-    let report = Backtest::new(
+    let mut backtest = Backtest::new(
         prepared.source,
         strategy,
         SimulatedBroker::new(fill_model(data)),
         RiskManager::new(prepared.limits),
         data.cash,
-    )
-    .run()?;
+    );
+    if let Some(t) = trade_from {
+        backtest = backtest.trade_from(t);
+    }
+    let report = backtest.run()?;
     report_replay(&prepared.report)?;
     let benchmark = prepared.benchmark.as_ref().map(|bench| {
-        let refs: Vec<&Bar> = bench.iter().collect();
+        let refs: Vec<&Bar> = bench.iter().filter(|b| trade_from.is_none_or(|t| b.end >= t)).collect();
         let curve = buy_and_hold(&refs, data.cash);
         let m = metrics::compute(&curve, &[]);
         (curve, m)
@@ -333,7 +345,7 @@ fn run_backtest(data: &DataArgs, params: &Params, weight: Decimal, adjust: impl 
 
 fn backtest(data: &DataArgs, args: &StrategyArgs) -> Result<()> {
     let params = args.params(data.attention.is_some(), data.fundamentals.is_some())?;
-    let run = run_backtest(data, &params, args.weight, |_| {})?;
+    let run = run_backtest(data, &params, args.weight, None, |_| {})?;
     println!("strategy          {params}");
     print_run(&run, &data.benchmark);
     Ok(())

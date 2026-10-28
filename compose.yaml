@@ -86,4 +86,5 @@ services:
       STOCKTRADER_LIVE_DIR: /data/live
       STOCKTRADER_PLANS_DIR: /plans
       STOCKTRADER_REPORTS_DIR: /data/reports
+      STOCKTRADER_RESEARCH_LOG: /data/research/experiments.jsonl
     mem_limit: 1g

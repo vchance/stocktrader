@@ -12,6 +12,7 @@ use st_engine::{Metrics, exchange_date};
 
 use crate::Run;
 use crate::plans::Plan;
+use crate::research::Window;
 
 /// Categorical series slots, light and dark (the validated reference order; never cycled).
 const SLOTS: usize = 7;
@@ -384,12 +385,25 @@ fn span(curve: &[(Timestamp, Decimal)]) -> String {
     }
 }
 
+/// Says which part of history a report covers: the held-back period, or everything before it.
+fn window_banner(window: &Window) -> String {
+    match (window.holdout, window.trade_from, window.end) {
+        (true, Some(from), _) => format!(
+            "<div class=\"banner\"><b>Held-back period from {from}.</b> These results are from data the plan was not \
+             developed on. Each look is logged; a result looked at more than once, or tuned after looking, is no \
+             longer an unbiased test.</div>"
+        ),
+        (false, _, Some(end)) => format!("<p class=\"sub\">Development period, through {end}. Later data is held back.</p>"),
+        _ => String::new(),
+    }
+}
+
 const SYNTHETIC: &str = "<div class=\"banner\"><b>Synthetic prices.</b> These results come from generated data and only show \
     that the plan runs; they say nothing about how it would trade on the real market.</div>";
 
 /// One plan's backtest: summary against the benchmark, equity and drawdown charts, monthly returns,
 /// recent fills, rejected signals by reason, and the plan file itself.
-pub fn plan_report(plan: &Plan, source: &str, run: &Run, synthetic: bool) -> String {
+pub fn plan_report(plan: &Plan, source: &str, run: &Run, synthetic: bool, window: &Window) -> String {
     let report = &run.report;
     let m = &report.metrics;
     let bench_name = plan.backtest.benchmark.to_ascii_uppercase();
@@ -400,6 +414,7 @@ pub fn plan_report(plan: &Plan, source: &str, run: &Run, synthetic: bool) -> Str
     if synthetic {
         body.push_str(SYNTHETIC);
     }
+    body.push_str(&window_banner(window));
 
     let mut rows = vec![(plan.name.clone(), m, run.benchmark.as_ref().map(|(_, b)| m.cagr - b.cagr))];
     if let Some((_, b)) = &run.benchmark {
@@ -461,13 +476,14 @@ pub fn plan_report(plan: &Plan, source: &str, run: &Run, synthetic: bool) -> Str
 }
 
 /// Several plans over the same dates: growth of 100 for each and the benchmark, and a summary table.
-pub fn compare_report(results: &[(&Plan, Run)], synthetic: bool) -> String {
+pub fn compare_report(results: &[(&Plan, Run)], synthetic: bool, window: &Window) -> String {
     // The span the results actually cover, which the requested window may extend past.
     let range = results.first().map_or("no data".to_string(), |(_, r)| span(&r.report.equity_curve));
     let mut body = format!("<h1>Plan comparison</h1><p class=\"sub\">{} plans · {}</p>", results.len(), esc(&range));
     if synthetic {
         body.push_str(SYNTHETIC);
     }
+    body.push_str(&window_banner(window));
     if results.len() > SLOTS {
         let _ = write!(body, "<p class=\"sub\">Charting the first {SLOTS} plans; all are in the table.</p>");
     }
