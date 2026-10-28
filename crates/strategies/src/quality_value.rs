@@ -31,6 +31,8 @@ const ANNUAL_DAYS: std::ops::RangeInclusive<i64> = 350..=380;
 struct Stock {
     traded_close: Option<Decimal>,
     dollar_volume: VecDeque<Decimal>,
+    /// Session of the latest bar; stocks without a bar today (delisted, halted) can't be bought.
+    last_bar: Option<NaiveDate>,
     /// Latest fiscal year's net income, as (period end, value).
     annual_income: Option<(NaiveDate, Decimal)>,
     /// Latest fiscal year's revenue; for one period reported under several tags, the largest (so a later
@@ -55,7 +57,8 @@ fn update(slot: &mut Option<(NaiveDate, Decimal)>, period_end: NaiveDate, value:
 /// - earnings yield: latest annual net income / market cap (shares outstanding x as-traded price);
 /// - return on assets: latest annual net income / total assets.
 ///
-/// Eligible means: an operating company (positive annual revenue, which excludes commodity trusts and other
+/// Eligible means: a bar today (a stock that stopped trading can't be bought), an operating company (positive
+/// annual revenue, which excludes commodity trusts and other
 /// funds that file 10-Ks), an as-traded price of at least `min_price`, average daily dollar volume of at
 /// least `min_dollar_volume` over the last `liquidity_lookback` bars, positive assets and shares, and each
 /// figure from a period that ended within `max_report_age`. Only facts already public reach the strategy (the
@@ -69,6 +72,8 @@ fn update(slot: &mut Option<(NaiveDate, Decimal)>, period_end: NaiveDate, value:
 /// After a rebalance, dropped names are restated at 0 until the next one.
 pub struct QualityValue {
     top_n: usize,
+    /// Rank only the largest this many eligible companies by market value.
+    largest: Option<usize>,
     weight: Decimal,
     min_price: Decimal,
     min_dollar_volume: Decimal,
@@ -103,6 +108,7 @@ impl QualityValue {
         }
         Ok(Self {
             top_n,
+            largest: None,
             weight: Decimal::ONE / Decimal::from(top_n),
             min_price: dec!(5),
             min_dollar_volume: dec!(5_000_000),
@@ -113,6 +119,13 @@ impl QualityValue {
             saw_bars: false,
             targets: BTreeMap::new(),
         })
+    }
+
+    /// Ranks only the `n` largest eligible companies by market value (shares outstanding x as-traded price),
+    /// where data is cleanest and the evidence for the factors strongest.
+    pub fn with_largest(mut self, n: usize) -> Self {
+        self.largest = Some(n.max(1));
+        self
     }
 
     /// Overrides the eligibility filters, e.g. to match a plan's universe and risk limits.
@@ -147,25 +160,34 @@ impl QualityValue {
         }
     }
 
-    /// (symbol, earnings yield, return on assets) for every eligible stock on `today`.
+    /// (symbol, earnings yield, return on assets) for every eligible stock on `today`, limited to the
+    /// largest by market value when `largest` is set.
     fn candidates(&self, today: NaiveDate) -> Vec<(Symbol, Decimal, Decimal)> {
         let fresh = |slot: Option<(NaiveDate, Decimal)>| slot.filter(|(end, _)| today - *end <= self.max_report_age).map(|(_, v)| v);
         let lookback = Decimal::from(self.liquidity_lookback);
-        let mut out = Vec::new();
+        let mut out: Vec<(Symbol, Decimal, Decimal, Decimal)> = Vec::new();
         for (symbol, s) in &self.stocks {
             let (Some(price), Some(income), Some(assets), Some(shares), Some(revenue)) =
                 (s.traded_close, fresh(s.annual_income), fresh(s.assets), fresh(s.shares), fresh(s.annual_revenue))
             else {
                 continue;
             };
+            if s.last_bar != Some(today) {
+                continue;
+            }
             let liquid = s.dollar_volume.len() >= self.liquidity_lookback
                 && s.dollar_volume.iter().sum::<Decimal>() / lookback >= self.min_dollar_volume;
             if revenue <= Decimal::ZERO || price < self.min_price || !liquid || assets <= Decimal::ZERO || shares <= Decimal::ZERO {
                 continue;
             }
-            out.push((symbol.clone(), income / (shares * price), income / assets));
+            let market_cap = shares * price;
+            out.push((symbol.clone(), income / market_cap, income / assets, market_cap));
         }
-        out
+        if let Some(n) = self.largest {
+            out.sort_by(|a, b| b.3.cmp(&a.3).then(a.0.cmp(&b.0)));
+            out.truncate(n);
+        }
+        out.into_iter().map(|(symbol, ey, roa, _)| (symbol, ey, roa)).collect()
     }
 
     /// Re-ranks; `false` if nothing was eligible.
@@ -218,6 +240,7 @@ impl Strategy for QualityValue {
                 self.saw_bars = true;
                 let stock = self.stocks.entry(bar.symbol.clone()).or_default();
                 stock.traded_close = Some(bar.traded_close());
+                stock.last_bar = Some(new_york_date(bar.end));
                 // Same measure as the risk manager's liquidity filter.
                 stock.dollar_volume.push_back(bar.close * bar.volume);
                 if stock.dollar_volume.len() > self.liquidity_lookback {
@@ -302,6 +325,35 @@ mod tests {
             fact(symbol, SHARES[0], None, end, shares, filed),
             fact(symbol, REVENUE[1], Some(start), end, dec!(1e9), filed),
         ]
+    }
+
+    #[test]
+    fn largest_limits_the_ranking_to_the_biggest_companies() {
+        let mut events = Vec::new();
+        // TINY is the best by both measures but by far the smallest (10M shares vs 100M at the same price).
+        events.extend(financials("TINY", dec!(50e6), dec!(100e6), dec!(10e6), day(0)));
+        events.extend(financials("BIG1", dec!(100e6), dec!(1e9), dec!(100e6), day(0)));
+        events.extend(financials("BIG2", dec!(50e6), dec!(1e9), dec!(100e6), day(0)));
+        for symbol in ["TINY", "BIG1", "BIG2"] {
+            events.extend(bars(symbol, 1, dec!(10)));
+        }
+        let mut all = QualityValue::new(1).unwrap();
+        assert_eq!(run(&mut all, events.clone()).keys().collect::<Vec<_>>(), vec!["TINY"]);
+        let mut large = QualityValue::new(1).unwrap().with_largest(2);
+        assert_eq!(run(&mut large, events).keys().collect::<Vec<_>>(), vec!["BIG1"]);
+    }
+
+    #[test]
+    fn a_stock_that_stopped_trading_is_not_bought_and_is_sold() {
+        let mut events = Vec::new();
+        // GONE ranks best but its bars stop in January; at the February rebalance only LIVE trades.
+        events.extend(financials("GONE", dec!(500e6), dec!(1e9), dec!(100e6), day(0)));
+        events.extend(financials("LIVE", dec!(100e6), dec!(1e9), dec!(100e6), day(0)));
+        events.extend(bars("GONE", 1, dec!(10)));
+        events.extend(bars("LIVE", 1, dec!(10)));
+        events.extend(bars("LIVE", 30, dec!(10)));
+        let mut s = QualityValue::new(1).unwrap();
+        assert_eq!(run(&mut s, events), BTreeMap::from([("GONE".into(), dec!(0)), ("LIVE".into(), dec!(1))]));
     }
 
     #[test]

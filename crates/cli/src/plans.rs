@@ -213,7 +213,27 @@ pub enum StrategySpec {
     QualityValue {
         #[serde(default = "default_top_n")]
         top_n: usize,
+        /// Rank only the largest this many eligible companies by market value.
+        largest: Option<usize>,
     },
+    /// Monthly ranking on the return from `lookback` to `skip` sessions ago.
+    Momentum {
+        #[serde(default = "default_top_n")]
+        top_n: usize,
+        #[serde(default = "default_lookback")]
+        lookback: usize,
+        #[serde(default = "default_skip")]
+        skip: usize,
+        /// Rank only the most heavily traded this many eligible stocks.
+        largest: Option<usize>,
+    },
+}
+
+fn default_lookback() -> usize {
+    252
+}
+fn default_skip() -> usize {
+    21
 }
 
 /// Which stocks the plan may trade.
@@ -314,14 +334,26 @@ pub(crate) fn toml_date<'de, D: Deserializer<'de>>(d: D) -> Result<Option<NaiveD
 }
 
 impl StrategySpec {
+    fn kind(&self) -> &'static str {
+        match self {
+            StrategySpec::Sma { .. } => "sma",
+            StrategySpec::AttentionSpike { .. } => "attention-spike",
+            StrategySpec::QualityValue { .. } => "quality-value",
+            StrategySpec::Momentum { .. } => "momentum",
+        }
+    }
+
     fn params(&self) -> (Params, Decimal) {
         match *self {
             StrategySpec::Sma { fast, slow, weight } => (Params::Sma { fast, slow }, weight),
             StrategySpec::AttentionSpike { min_mentions, ratio, hold_days, weight } => {
                 (Params::Spike { min_mentions, ratio, hold_days }, weight)
             }
-            // Weight is 1/top_n inside the strategy.
-            StrategySpec::QualityValue { top_n } => (Params::QualityValue { top_n }, Decimal::ONE),
+            // Weight is 1/top_n inside these strategies.
+            StrategySpec::QualityValue { top_n, largest } => (Params::QualityValue { top_n, largest }, Decimal::ONE),
+            StrategySpec::Momentum { top_n, lookback, skip, largest } => {
+                (Params::Momentum { top_n, lookback, skip, largest }, Decimal::ONE)
+            }
         }
     }
 }
@@ -367,12 +399,13 @@ impl Plan {
         }
         let limits = self.limits(RiskLimits::default());
         match &self.strategy {
-            StrategySpec::QualityValue { top_n } => {
+            StrategySpec::QualityValue { top_n, largest } | StrategySpec::Momentum { top_n, largest, .. } => {
                 check_top_n(*top_n, limits.max_position_weight)?;
+                crate::check_largest(*top_n, *largest)?;
                 if limits.max_gross_exposure < Decimal::ONE {
                     bail!(
-                        "quality-value invests 1/top_n in each name, so it needs risk.max_gross_exposure of 1, \
-                         got {}",
+                        "{} invests 1/top_n in each name, so it needs risk.max_gross_exposure of 1, got {}",
+                        self.strategy.kind(),
                         limits.max_gross_exposure
                     );
                 }
@@ -575,13 +608,13 @@ pub fn run(args: &PlansArgs) -> Result<()> {
                 println!("no plans in {}", args.plans_dir.display());
             }
             let mut invalid = 0;
-            println!("{:<24} {:<9} {:<28} {:<16} notes", "name", "mode", "strategy", "universe");
+            println!("{:<24} {:<9} {:<38} {:<16} notes", "name", "mode", "strategy", "universe");
             for (path, plan) in &plans {
                 match plan {
                     Ok((p, _)) => {
                         let (params, _) = p.strategy.params();
                         let notes = p.notes.lines().next().unwrap_or("");
-                        println!("{:<24} {:<9} {:<28} {:<16} {notes}", p.name, p.mode.to_string(), params.to_string(), p.universe_label());
+                        println!("{:<24} {:<9} {:<38} {:<16} {notes}", p.name, p.mode.to_string(), params.to_string(), p.universe_label());
                     }
                     Err(e) => {
                         invalid += 1;
@@ -775,7 +808,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.mode, Mode::Paper);
-        assert_eq!(plan.strategy, StrategySpec::QualityValue { top_n: 25 });
+        assert_eq!(plan.strategy, StrategySpec::QualityValue { top_n: 25, largest: None });
         assert_eq!(plan.backtest.start, NaiveDate::from_ymd_opt(2018, 1, 1));
         let limits = plan.limits(RiskLimits::default());
         assert_eq!((limits.min_price, limits.max_position_weight, limits.max_daily_loss), (dec!(10), dec!(0.06), dec!(0.03)));
@@ -799,6 +832,8 @@ mod tests {
         assert!(parse(half).is_err(), "quality-value can't fit 1/N weights under half exposure");
         assert!(parse("name = \"Bad Name\"\n[strategy]\nkind = \"quality-value\"\n").is_err());
         assert!(parse("name = \"kill\"\n[strategy]\nkind = \"quality-value\"\n").is_err(), "reserved name");
+        assert!(parse("name = \"m\"\n[strategy]\nkind = \"momentum\"\ntop_n = 20\nlargest = 10\n").is_err(), "largest below top_n");
+        assert!(parse("name = \"m\"\n[strategy]\nkind = \"momentum\"\nlookback = 21\nskip = 21\n").is_err(), "skip >= lookback");
     }
 
     #[test]

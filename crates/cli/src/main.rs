@@ -16,7 +16,7 @@ use st_engine::metrics::{self, buy_and_hold, correlation};
 use st_engine::{Backtest, BacktestReport, FillModel, Metrics, SimulatedBroker, WalkForwardConfig, walk_forward};
 use st_marketdata::{BarEventSource, BarFilter, ReplayStats, coverage, read_bars, to_core_bar};
 use st_risk::{RiskLimits, RiskManager};
-use st_strategies::{AttentionSpike, QualityValue, SmaCrossover};
+use st_strategies::{AttentionSpike, Momentum, QualityValue, SmaCrossover};
 use tracing_subscriber::EnvFilter;
 
 mod paper;
@@ -58,10 +58,10 @@ enum Command {
         train_days: i64,
         #[arg(long, default_value_t = 91)]
         test_days: i64,
-        /// History replayed before each window without trading, so indicators are warm. The default covers
-        /// the slowest grid window (200 sessions) plus the 20-session liquidity lookback.
-        #[arg(long, default_value_t = 330)]
-        warmup_days: i64,
+        /// History replayed before each window without trading, so indicators are warm. By default, enough
+        /// for the slowest window in the grid plus the 20-session liquidity lookback, and at least 330 days.
+        #[arg(long)]
+        warmup_days: Option<i64>,
     },
     /// Before the open, trade the Alpaca paper account towards the strategy's current targets, sized and
     /// risk-checked exactly as in a backtest. Prints the plan only, unless --submit.
@@ -143,10 +143,20 @@ struct StrategyArgs {
     /// Attention spike: days to hold after the latest spike.
     #[arg(long, default_value_t = 5)]
     spike_hold_days: u32,
-    /// Quality-value: names held, each at 1/N of equity (--weight doesn't apply). At least 10, the number the
-    /// 10% position cap allows to be fully invested.
+    /// Quality-value and momentum: names held, each at 1/N of equity (--weight doesn't apply). At least 10,
+    /// the number the 10% position cap allows to be fully invested.
     #[arg(long, default_value_t = 20)]
     top_n: usize,
+    /// Quality-value and momentum: rank only the largest N eligible stocks (by market value for
+    /// quality-value, by trading volume for momentum).
+    #[arg(long)]
+    largest: Option<usize>,
+    /// Momentum: sessions of return measured (252: a year).
+    #[arg(long, default_value_t = 252)]
+    momentum_lookback: usize,
+    /// Momentum: most recent sessions skipped (21: a month).
+    #[arg(long, default_value_t = 21)]
+    momentum_skip: usize,
     /// Target weight per position when long.
     #[arg(long, default_value = "0.05")]
     weight: Decimal,
@@ -160,6 +170,8 @@ enum StrategyName {
     AttentionSpike,
     /// Monthly: hold the stocks ranking best on earnings yield plus return on assets (needs --fundamentals).
     QualityValue,
+    /// Monthly: hold the stocks with the highest return over the past year, skipping the last month.
+    Momentum,
 }
 
 /// One point in a strategy's parameter space.
@@ -167,7 +179,8 @@ enum StrategyName {
 enum Params {
     Sma { fast: usize, slow: usize },
     Spike { min_mentions: u32, ratio: f64, hold_days: u32 },
-    QualityValue { top_n: usize },
+    QualityValue { top_n: usize, largest: Option<usize> },
+    Momentum { top_n: usize, lookback: usize, skip: usize, largest: Option<usize> },
 }
 
 impl fmt::Display for Params {
@@ -177,7 +190,14 @@ impl fmt::Display for Params {
             Params::Spike { min_mentions, ratio, hold_days } => {
                 write!(f, "spike >={min_mentions} x{ratio} {hold_days}d")
             }
-            Params::QualityValue { top_n } => write!(f, "quality-value top {top_n}"),
+            Params::QualityValue { top_n, largest } => {
+                write!(f, "quality-value top {top_n}")?;
+                largest.map_or(Ok(()), |n| write!(f, " of largest {n}"))
+            }
+            Params::Momentum { top_n, lookback, skip, largest } => {
+                write!(f, "momentum {lookback}-{skip} top {top_n}")?;
+                largest.map_or(Ok(()), |n| write!(f, " of largest {n}"))
+            }
         }
     }
 }
@@ -190,11 +210,24 @@ fn make_strategy(params: &Params, weight: Decimal, limits: &RiskLimits) -> Resul
         Params::Spike { min_mentions, ratio, hold_days } => {
             Box::new(AttentionSpike::new(min_mentions, ratio, hold_days, weight).map_err(anyhow::Error::msg)?)
         }
-        Params::QualityValue { top_n } => Box::new(
-            QualityValue::new(top_n)
+        Params::QualityValue { top_n, largest } => {
+            let s = QualityValue::new(top_n)
                 .map_err(anyhow::Error::msg)?
-                .with_filters(limits.min_price, limits.min_avg_dollar_volume, limits.liquidity_lookback),
-        ),
+                .with_filters(limits.min_price, limits.min_avg_dollar_volume, limits.liquidity_lookback);
+            Box::new(match largest {
+                Some(n) => s.with_largest(n),
+                None => s,
+            })
+        }
+        Params::Momentum { top_n, lookback, skip, largest } => {
+            let s = Momentum::new(top_n, lookback, skip)
+                .map_err(anyhow::Error::msg)?
+                .with_filters(limits.min_price, limits.min_avg_dollar_volume, limits.liquidity_lookback);
+            Box::new(match largest {
+                Some(n) => s.with_largest(n),
+                None => s,
+            })
+        }
     })
 }
 
@@ -220,10 +253,14 @@ fn main() -> Result<()> {
                 }
                 StrategyName::QualityValue => {
                     require_fundamentals(&data)?;
-                    [10, 20, 40].into_iter().map(|top_n| Params::QualityValue { top_n }).collect()
+                    [10, 20, 40].into_iter().map(|top_n| Params::QualityValue { top_n, largest: None }).collect()
                 }
+                StrategyName::Momentum => [10, 20, 40]
+                    .into_iter()
+                    .map(|top_n| Params::Momentum { top_n, lookback: 252, skip: 21, largest: None })
+                    .collect(),
             };
-            let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), TimeDelta::days(warmup_days));
+            let windows = (TimeDelta::days(train_days), TimeDelta::days(test_days), warmup_days.map(TimeDelta::days));
             walk(&data, &grid, weight, windows)
         }
         Command::Paper(args) => paper::run(&args),
@@ -243,6 +280,16 @@ fn require_attention(data: &DataArgs) -> Result<()> {
 fn check_top_n(top_n: usize, cap: Decimal) -> Result<()> {
     if top_n == 0 || cap <= Decimal::ZERO || Decimal::ONE / Decimal::from(top_n) > cap {
         bail!("--top-n {top_n} gives each name more than the {cap} position cap; use at least {}", (Decimal::ONE / cap).ceil());
+    }
+    Ok(())
+}
+
+/// Ranking only the largest N can't fill more than N slots.
+fn check_largest(top_n: usize, largest: Option<usize>) -> Result<()> {
+    if let Some(n) = largest
+        && n < top_n
+    {
+        bail!("largest ({n}) is smaller than top_n ({top_n}), so fewer than top_n names could ever be held");
     }
     Ok(())
 }
@@ -269,7 +316,13 @@ impl StrategyArgs {
                     bail!("quality-value needs --fundamentals data/fundamentals");
                 }
                 check_top_n(self.top_n, RiskLimits::default().max_position_weight)?;
-                Params::QualityValue { top_n: self.top_n }
+                check_largest(self.top_n, self.largest)?;
+                Params::QualityValue { top_n: self.top_n, largest: self.largest }
+            }
+            StrategyName::Momentum => {
+                check_top_n(self.top_n, RiskLimits::default().max_position_weight)?;
+                check_largest(self.top_n, self.largest)?;
+                Params::Momentum { top_n: self.top_n, lookback: self.momentum_lookback, skip: self.momentum_skip, largest: self.largest }
             }
         })
     }
@@ -372,7 +425,7 @@ fn print_run(run: &Run, benchmark: &str) {
     }
 }
 
-fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup): (TimeDelta, TimeDelta, TimeDelta)) -> Result<()> {
+fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup): (TimeDelta, TimeDelta, Option<TimeDelta>)) -> Result<()> {
     // Validate every candidate once, so a bad grid fails before hours of backtests.
     for p in grid {
         make_strategy(p, weight, &RiskLimits::default())?;
@@ -385,10 +438,14 @@ fn walk(data: &DataArgs, grid: &[Params], weight: Decimal, (train, test, warmup)
             Params::Spike { .. } => 0,
             // It first ranks once its liquidity window, the risk lookback added below, is full.
             Params::QualityValue { .. } => 0,
+            // A full return window before the first ranking.
+            Params::Momentum { lookback, .. } => *lookback,
         })
         .max()
         .unwrap_or(0)
         + RiskLimits::default().liquidity_lookback;
+    // About 252 sessions a year; a few days' margin for holidays.
+    let warmup = warmup.unwrap_or_else(|| TimeDelta::days(((needed_sessions * 365).div_ceil(252) as i64 + 10).max(330)));
     let warmup_sessions = warmup.num_days() * 252 / 365;
     if (warmup_sessions as usize) < needed_sessions {
         bail!(
