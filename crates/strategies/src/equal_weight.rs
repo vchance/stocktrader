@@ -17,7 +17,8 @@ struct Stock {
 /// Holds each symbol it sees (the plan's list) at `weight`, re-decided on the first session of each month.
 /// With a trend filter of `n` sessions, a symbol is held only while its close is above its `n`-session
 /// average, and otherwise left in cash; without one, every symbol trading that session is held. A symbol
-/// that hasn't started trading yet (or stopped) leaves its slot in cash. Between rebalances the targets are
+/// that hasn't started trading yet leaves its slot in cash. A held symbol without a bar on the rebalance day
+/// keeps its position if it traded within the last week (a data gap or halt), and is sold if not. Between rebalances the targets are
 /// restated each session, so positions are topped up or trimmed once they drift past the rebalance band.
 pub struct EqualWeight {
     weight: Decimal,
@@ -49,6 +50,8 @@ impl EqualWeight {
 
     /// Re-decides every position; `false` until at least one symbol can be judged.
     fn rebalance(&mut self, today: NaiveDate) -> bool {
+        // A held name that missed a bar this recently is assumed to be in a gap or halt, not gone.
+        const GAP_DAYS: i64 = 7;
         let mut targets = BTreeMap::new();
         let mut judged = 0;
         for (symbol, s) in &self.stocks {
@@ -69,11 +72,18 @@ impl EqualWeight {
                 targets.insert(symbol.clone(), (self.weight, format!("{why} on {today}")));
             }
         }
-        for (symbol, (weight, _)) in &self.targets {
-            if !weight.is_zero() && !targets.contains_key(symbol) {
-                let why = if self.trend.is_some() { "below its trend average" } else { "no longer trading" };
-                targets.insert(symbol.clone(), (Decimal::ZERO, format!("{why} on {today}")));
+        for (symbol, (weight, reason)) in &self.targets {
+            if weight.is_zero() || targets.contains_key(symbol) {
+                continue;
             }
+            let last_bar = self.stocks.get(symbol).and_then(|s| s.last_bar);
+            let judged_today = last_bar == Some(today);
+            if !judged_today && last_bar.is_some_and(|d| (today - d).num_days() <= GAP_DAYS) {
+                targets.insert(symbol.clone(), (*weight, reason.clone()));
+                continue;
+            }
+            let why = if judged_today { "below its trend average" } else { "no longer trading" };
+            targets.insert(symbol.clone(), (Decimal::ZERO, format!("{why} on {today}")));
         }
         self.targets = targets;
         judged > 0
@@ -201,6 +211,30 @@ mod tests {
         let t = run(&mut EqualWeight::new(2, Some(10)).unwrap(), events);
         assert_eq!(t.get("DOWN"), Some(&dec!(0)));
         assert_eq!(t.get("UP"), Some(&dec!(0.5)));
+    }
+
+    #[test]
+    fn a_short_gap_keeps_a_holding_a_long_one_sells_it_and_zeros_clear_next_month() {
+        // GAP has no bar on February 1 (day 30, the rebalance) but trades again on day 31: kept at 1/3.
+        // GONE stops on day 20: sold at the February rebalance, then dropped from the targets in March.
+        let mut events = series("A", 0, 60, |_| dec!(10));
+        events.extend(series("GAP", 0, 60, |_| dec!(10)).into_iter().filter(|e| e.available_at != bar("X", day(30), dec!(1)).available_at));
+        events.extend(series("GONE", 0, 21, |_| dec!(10)));
+        let third = Decimal::ONE / dec!(3);
+        let before_march = bar("X", day(58), dec!(1)).available_at;
+        let february = run(&mut EqualWeight::new(3, None).unwrap(), events.iter().filter(|e| e.available_at < before_march).cloned().collect());
+        assert_eq!(february, BTreeMap::from([("A".into(), third), ("GAP".into(), third), ("GONE".into(), dec!(0))]));
+        let march = run(&mut EqualWeight::new(3, None).unwrap(), events);
+        assert_eq!(march, BTreeMap::from([("A".into(), third), ("GAP".into(), third)]));
+    }
+
+    #[test]
+    fn decides_once_a_month() {
+        // A trend name that turns down mid-month is held until the next month's rebalance.
+        let mut events = series("X", 0, 45, |i| if i < 33 { dec!(10) + Decimal::from(i) } else { dec!(10) });
+        events.extend(series("Y", 0, 45, |_| dec!(10)));
+        let t = run(&mut EqualWeight::new(2, Some(5)).unwrap(), events);
+        assert_eq!(t.get("X"), Some(&dec!(0.5)), "judged above average on February 1, kept all month");
     }
 
     #[test]
