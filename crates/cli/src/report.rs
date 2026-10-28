@@ -162,12 +162,13 @@ fn nice_step(range: f64, target: f64) -> f64 {
 }
 
 fn axis_label(v: f64, fmt: Fmt) -> String {
+    // Ticks are built by repeated addition, so zero can arrive as -1e-17 and print as "-0".
+    let v = if v.abs() < 1e-9 { 0.0 } else { v };
     match fmt {
         Fmt::Money if v.abs() >= 1e6 => format!("${:.1}M", v / 1e6),
         Fmt::Money if v.abs() >= 1e3 => format!("${:.0}k", v / 1e3),
         Fmt::Money => format!("${v:.0}"),
-        // Adding 0.0 turns -0 into 0, so the top of a drawdown axis reads "0%".
-        Fmt::Pct => format!("{:.0}%", v * 100.0 + 0.0),
+        Fmt::Pct => format!("{:.0}%", v * 100.0),
         Fmt::Index => format!("{v:.0}"),
     }
 }
@@ -606,6 +607,8 @@ mod tests {
         assert_eq!(money(dec!(1234567.6)), "$1,234,568");
         assert_eq!(money(dec!(-950)), "-$950");
         assert_eq!(nice_step(87.0, 4.0), 50.0);
+        assert_eq!(axis_label(-1e-17, Fmt::Pct), "0%");
+        assert_eq!(axis_label(-0.0, Fmt::Pct), "0%");
         assert_eq!(nice_step(0.37, 4.0), 0.1);
         assert_eq!(reason_kind("avg dollar volume 1234567 below minimum"), "avg dollar volume # below minimum");
         assert_eq!(reason_kind("traded price 4.25 below minimum 5"), "traded price # below minimum #");
