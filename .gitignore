@@ -4,3 +4,18 @@
 /research
 .env*
 !.env.example
+
+# agent-rules:begin (managed by agent-rules/scripts/sync.py; edit it there, not here)
+# Shared Claude Code config is tracked; everything else under .claude/ (worktrees,
+# settings.local.json, local memory) stays per-machine. "!.claude/" also overrides a
+# .git/info/exclude or global ignore that hides the whole folder.
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+!.claude/skills/
+!.claude/commands/
+!.claude/rules/
+!.claude/hooks/
+CLAUDE.local.md
+# agent-rules:end
