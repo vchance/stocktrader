@@ -4,3 +4,8 @@
 /research
 .env*
 !.env.example
+
+# Local agent files (agent-rules)
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
