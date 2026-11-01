@@ -10,8 +10,10 @@ stocktrader: automated US-equity research and trading in Rust (11 crates under `
 and **paper** modes, a news/social data collector, and SEC/Alpaca data syncs, deployed with Docker on the owner's server
 `jabrony` (README.md). The only order path today is `st-paper`, which places real orders on **Alpaca paper accounts**
 and refuses every other endpoint (`crates/paper/src/alpaca.rs:150`); the README's "live" mode is a roadmap item, not code.
-There is **no CI build or test**: the only automation is the two policy workflows, so every build/test check is manual
-and recorded with date, SHA, operator and test count (PROFILE.md › Check selection).
+CI: the `ci` job (`.github/workflows/ci.yml`) runs clippy (`-D warnings`), `cargo test --workspace` and a release build
+on every PR and on push to `main`; `cargo fmt --check` is not in it yet (the tree is not rustfmt-clean). Besides it there
+are only the two policy workflows; anything `ci` does not run is manual and recorded with date, SHA, operator and test
+count (PROFILE.md › Check selection).
 
 ## Commands
 ```sh
@@ -19,14 +21,15 @@ git config core.hooksPath .githooks   # once per clone: enables the pre-push gua
 cargo build --workspace                                  # build
 cargo test --workspace                                   # all tests (escalation only; see PROFILE.md › Check selection)
 cargo test -p st-paper -p st-cli                         # one crate and its consumers (selection per PROFILE.md)
-cargo clippy --workspace --all-targets -- -D warnings    # lint (not enforced anywhere yet; current status unknown)
-cargo fmt --all --check                                  # format check (no rustfmt.toml; current status unknown)
+cargo clippy --workspace --all-targets -- -D warnings    # lint (enforced by the `ci` job; clean at d8b8eb5)
+cargo fmt --all --check                                  # format check (no rustfmt.toml; fails at d8b8eb5, not in `ci`)
 cargo run -p st-cli -- plans list                        # validates every plans/*.toml (README › Trading plans)
 cargo run -p st-cli -- backtest                          # synthetic data, no keys (README top)
 bash -n deploy/collector.sh                              # syntax check only; the script itself is run by the owner on jabrony
 ```
-The commands come from the README and the workspace layout; the clippy and fmt lines were added by the author of this
-overlay and have not been run, so their first run may report existing findings (record them, do not suppress them, D8).
+The commands come from the README and the workspace layout. First run of clippy and fmt (2026-11-01, d8b8eb5, Rust
+1.97.1): clippy clean; fmt reports 740 hunks in 62 files, so it stays out of `ci` until a reformat PR (record findings,
+do not suppress them, D8).
 Never pass `--submit` (see Repository additions).
 
 ## Layout
@@ -41,8 +44,8 @@ Never pass `--submit` (see Repository additions).
   systemd timers, backups, paper submission at 08:45 New York on weekdays).
 
 ## Gotchas
-- No CI: reviewers cannot reuse CI evidence (core D1); see PROFILE.md › Proposed D-rule overrides (D1) and the
-  proposed CI workflow in PROFILE.md › Lanes (owner decision, not added).
+- The `ci` job's run on the head SHA is the CI evidence reviewers can reuse (core D1) for clippy, the workspace tests
+  and the release build; fmt, `plans list`, `bash -n deploy/collector.sh` and everything on `jabrony` stay manual.
 - Tests use `wiremock` loopback servers; `check_base_url` admits `http://127.0.0.1`/`localhost` for that reason. Do not
   widen it.
 - Secrets live only in the untracked `.env` on the host (read by `dotenvy` and compose `env_file`); `.env.example` is
@@ -56,8 +59,10 @@ Never pass `--submit` (see Repository additions).
   checkout, so whatever is on `main` and pulled there is what trades next.
 
 ## Repository additions
-- **A1** Until a CI test job exists, every PR that changes anything outside prose docs is classified **high** tier
-  (stricter than core §3; this sets review depth, the wrapper merges every tier since core 0.1.9; PROFILE.md › Merge authority).
+- **A1** Every PR that changes anything outside prose docs is classified **high** tier (stricter than core §3; this sets
+  review depth, the wrapper merges every tier since core 0.1.9; PROFILE.md › Merge authority). The rule was written
+  for "until a CI test job exists"; that job now exists (`ci`: clippy, `cargo test --workspace`, release build, no fmt),
+  and the rule stays in force until the owner decides otherwise.
 - **A2** Agents never run `--submit` (`stocktrader paper`, `stocktrader plans paper`, `deploy/collector.sh paper-trade`),
   never set `--allow-open`, and never create, edit or delete files under `data/live/` (including `KILL`). Dry runs are
   allowed only with keys the owner has already configured; agents do not handle broker keys (audit

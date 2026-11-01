@@ -5,8 +5,8 @@
 | Repository | vchance/stocktrader · default branch `main` · visibility **public** · GitHub plan Free (public repos can have rulesets; none exist today: `gh api repos/vchance/stocktrader/rulesets` returned 0 on 2026-10-31) |
 | Classification | active product (single-user US-equity research and paper-trading system; README.md). Young: 30 commits, all 2026-10-27 (audit `evidence/repos-B.md` › stocktrader) |
 | Accountable owner | Von Chance (vchance) — approver of exceptions and owner-reserved decisions (no merge-acceptance step since core 0.1.9); sole operator of the server `jabrony` and of the Alpaca, SEC, Reddit and Finnhub accounts |
-| Supported platforms | Linux Docker host `jabrony` (README › Running on a server; `Dockerfile`, `compose.yaml`, `deploy/collector.sh`) = `manual` (owner); developer machine via `cargo` (README top) = `manual`. Nothing is `CI`: there is no build or test workflow |
-| Toolchain | Rust, edition 2024, workspace resolver 3 (`Cargo.toml`), `Cargo.lock` tracked. No `rust-toolchain.toml`; the image builds with `rust:1.97-slim-trixie` (`Dockerfile:5`) and runs on `debian:trixie-slim`. No `rustfmt.toml`/`clippy.toml`; lint and format are not enforced anywhere |
+| Supported platforms | Linux Docker host `jabrony` (README › Running on a server; `Dockerfile`, `compose.yaml`, `deploy/collector.sh`) = `manual` (owner); developer machine via `cargo` (README top) = `manual`. Linux x86_64 build, clippy and tests = `CI` (`ci` job, hosted `ubuntu-24.04`); macOS and the Docker image are not built in CI |
+| Toolchain | Rust, edition 2024, workspace resolver 3 (`Cargo.toml`), `Cargo.lock` tracked. No `rust-toolchain.toml`; the image builds with `rust:1.97-slim-trixie` (`Dockerfile:5`) and runs on `debian:trixie-slim`. No `rustfmt.toml`/`clippy.toml`; clippy is enforced by the `ci` job (stable Rust), format is not enforced (the tree is not rustfmt-clean) |
 | Required services for tests | none external: HTTP clients are tested against `wiremock` loopback servers (`crates/{paper,marketdata,fundamentals,collector,cli}`), and `check_base_url` (`crates/paper/src/alpaca.rs:150`) admits loopback for that purpose. Whether any test reaches the network was not verified (audit: unknown). No CI provides anything |
 
 ## Components and critical paths
@@ -31,10 +31,14 @@ attributes counted by grep on 2026-10-31 (171 in all; the audit recorded ~159), 
 | `README.md` | owner | no | review only | readers |
 
 ## Check selection (impact-based; core D2)
-There is no CI build, so every row except the policy and docs rows is **manual with evidence** (date, SHA, operator,
-exit code, test count from the `test result:` lines) and the R5 fallback is the commands in `AGENTS.md › Commands`.
-Anything not run is recorded `unavailable`, never `passed`. **Until a CI test job exists, every PR that changes anything
-outside prose docs is classified high** (AGENTS.md › A1; Merge authority).
+The `ci` job (`.github/workflows/ci.yml`) runs on every PR and on push to `main`: `cargo clippy --workspace
+--all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (the full suite, so it covers every selection
+row below) and `cargo build --workspace --release --locked`, on the latest stable Rust. It does not run `cargo fmt
+--check` (the tree is not rustfmt-clean yet), `plans list`, `bash -n deploy/collector.sh` or anything on `jabrony`; those
+stay **manual with evidence** (date, SHA, operator, exit code, test count from the `test result:` lines), and the R5
+fallback is the commands in `AGENTS.md › Commands`. Anything not run is recorded `unavailable`, never `passed`. **Every
+PR that changes anything outside prose docs is classified high** (AGENTS.md › A1; Merge authority): the rule was
+written for "until a CI test job exists"; the job now exists and the rule stays until the owner decides otherwise.
 
 | Changed paths | Checks that run on the PR | Evidence recorded as |
 |---|---|---|
@@ -65,8 +69,8 @@ variable is set (`gh variable list --repo vchance/stocktrader` empty, 2026-10-31
 
 | Lane | What runs | When | Owner of a failure |
 |---|---|---|---|
-| PR (fast) | `pr-evidence` on every PR; `policy-drift` when policy paths change. **These are the only automation**; no build or test runs in CI | every PR commit | author |
-| Integration batch | none. **Proposed — owner decision:** a `ci.yml` running `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` on `pull_request` and on push to `main` (hosted `ubuntu-24.04`, free for a public repo; `permissions: contents: read`, `timeout-minutes`, no secrets: tests use loopback mocks). Not added by this PR | — | merger |
+| PR (fast) | `pr-evidence` on every PR; `policy-drift` when policy paths change; `ci` (Integration batch row) | every PR commit | author |
+| Integration batch | `ci` (`.github/workflows/ci.yml`): clippy `-D warnings`, `cargo test --workspace`, `cargo build --workspace --release` (all `--locked`) on hosted `ubuntu-24.04` via `RUNS_ON_SMALL`, `permissions: contents: read`, `timeout-minutes: 45`, no secrets. `cargo fmt --all --check` is left out until the tree is reformatted | every PR commit and every push to `main` | author (PR); merger (`main`) |
 | Scheduled | none. Proposed — owner decision: weekly `cargo audit` (or `cargo deny`) once the CI job exists | — | owner |
 | Release | none automated; deployment is the owner's `deploy/collector.sh update` on `jabrony` (Release and operations) | owner | owner |
 | Manual with evidence | every build/test check in Check selection; `bash -n deploy/collector.sh`; owner-run `deploy/collector.sh paper-trade` dry run (no `--submit`) after a deploy that touches the order path | per PR that touches the paths; pasted in the PR with date, SHA, operator, exit code, test count | author (owner for `jabrony`) |
@@ -83,13 +87,16 @@ variable is set (`gh variable list --repo vchance/stocktrader` empty, 2026-10-31
 
 ## Merge authority
 - Low: `.agent-rules/merge.sh <n>` once core R3–R6 hold (D5). Only prose-docs PRs can be low.
-- Until a CI test job exists, **every PR that changes anything outside prose docs is classified high** (AGENTS.md › A1,
-  stricter than core §3): since core 0.1.9 the wrapper merges every tier, so this rule sets review depth, not who merges; the manual build/test evidence recorded in the PR and the independent reviewer's check of it are the only verification (known gap until CI exists).
+- **Every PR that changes anything outside prose docs is classified high** (AGENTS.md › A1, stricter than core §3):
+  since core 0.1.9 the wrapper merges every tier, so this rule sets review depth, not who merges. The `ci` job now
+  exists and verifies clippy, the workspace tests and the release build on the head SHA; fmt and the remaining manual
+  checks are verified by the evidence recorded in the PR and the independent reviewer's check of it. A1 stays until the
+  owner decides otherwise.
 - High: `.agent-rules/merge.sh <n>` once core R3–R6 hold and the independent review verdict `ready` for the head is recorded (D5); no owner acceptance step (owner decision 2026-11-01). Emergency: declared only by the owner (vchance), never by the agent; the PR names the declarer; follow-up PR within 7 days.
 - Server-side enforcement available: **rulesets are possible (public repository) but none are configured.** Owner
   action (not done by this PR): add a ruleset on `main` requiring a pull request and the `pr-evidence` check (and the
-  proposed CI job once it exists), blocking force-pushes and deletion (audit F2). Until then the mechanisms are the
-  merge wrapper, the pre-push hook and the two workflows.
+  `ci` check), blocking force-pushes and deletion (audit F2). Until then the mechanisms are the
+  merge wrapper, the pre-push hook and the three workflows.
 
 ## Exceptions (governed)
 R-rule gaps only (core §1): what the repository cannot yet satisfy, recorded with authority and expiry. A deviation from a
@@ -124,10 +131,9 @@ Moved into `AGENTS.md › Overrides` only once the owner accepts it; until then 
 | Containers / images (owner, `jabrony`) | `vchance-stocktrader` image, `stocktrader-collector` compose project | `deploy/collector.sh stop` (owner); agents do not run Docker on `jabrony` | owner decision |
 | Worktrees | `.claude/worktrees/*` | `git worktree remove <path> && git worktree prune` | branch merged, `git status` clean |
 | Stale branches | 21 local `worktree-*` branches in the main checkout (counted 2026-10-31; audit F16) | owner triage; agents do not delete them | owner decision |
-| CI runner artifacts | none (no build workflow) | — | n/a |
+| CI runner artifacts | `ci` job's rust-cache entries (GitHub Actions cache, written only from `main`) | evicted by GitHub (7 days unused / 10 GB) | always |
 | Cloud / paid | Alpaca paper accounts, healthchecks/ntfy endpoints (owner's) | none created by agents | n/a |
 
 ## Budgets
-- CI: policy checks only (seconds per PR commit; runner minutes not measured). No build lane, so no build budget. The
-  proposed CI job's duration: to measure.
+- CI: policy checks take seconds per PR commit; the `ci` job's duration is to measure (cap `timeout-minutes: 45`).
 - Performance: to measure (collector container limits 512 MB / 1 CPU in `compose.yaml`; full market-data sync ~30–60 min, README › Market data).
