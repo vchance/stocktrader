@@ -329,6 +329,8 @@ mod tests {
     fn alpaca_url_normalizes_trailing_slash_and_case() {
         assert_eq!(check_alpaca_url("V", "https://paper-api.alpaca.markets/").unwrap(), PAPER_TRADING_URL);
         assert_eq!(check_alpaca_url("V", " https://Data.Alpaca.Markets:443/").unwrap(), DATA_URL);
+        // IDNA maps the ideographic full stop to '.', and the client gets the normalized host, not the raw text.
+        assert_eq!(check_alpaca_url("V", "https://data.alpaca。markets").unwrap(), DATA_URL);
     }
 
     #[test]
@@ -346,6 +348,9 @@ mod tests {
             "https://data.alpaca.markets/#x",
             "https://data.alpaca.markets:8443",
             "https://alpaca.markets.",
+            "https://[::1]",
+            "https://[2001:db8::1]:443",
+            "https://data.xn--alpaca-markets.example",
             "not a url",
             "",
         ];

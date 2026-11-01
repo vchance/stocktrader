@@ -61,6 +61,8 @@ async fn main() -> Result<()> {
             let http = reqwest::Client::builder()
                 .user_agent(concat!("stocktrader-marketdata/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(60))
+                // Never follow redirects: reqwest keeps custom headers (the APCA-* keys) across a cross-host hop.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?;
             let mut client = AlpacaClient::new(
                 http,
