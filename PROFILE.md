@@ -84,8 +84,8 @@ variable is set (`gh variable list --repo vchance/stocktrader` empty, 2026-10-31
 ## Merge authority
 - Low: `.agent-rules/merge.sh <n>` once core R3–R6 hold (D5). Only prose-docs PRs can be low.
 - Until a CI test job exists, **every PR that changes anything outside prose docs is classified high** (AGENTS.md › A1,
-  stricter than core §3): since core 0.1.9 the wrapper merges every tier, so this rule sets review depth, not who merges: the manual build/test evidence recorded in the PR and the independent reviewer's check of it are the only verification (known gap until CI exists).
-- High: `.agent-rules/merge.sh <n>` once core R3–R6 hold and the independent review verdict for the head is recorded (D5); no owner acceptance step (owner decision 2026-11-01). Emergency: the PR names who declared it; follow-up PR within 7 days.
+  stricter than core §3): since core 0.1.9 the wrapper merges every tier, so this rule sets review depth, not who merges; the manual build/test evidence recorded in the PR and the independent reviewer's check of it are the only verification (known gap until CI exists).
+- High: `.agent-rules/merge.sh <n>` once core R3–R6 hold and the independent review verdict `ready` for the head is recorded (D5); no owner acceptance step (owner decision 2026-11-01). Emergency: declared only by the owner (vchance), never by the agent; the PR names the declarer; follow-up PR within 7 days.
 - Server-side enforcement available: **rulesets are possible (public repository) but none are configured.** Owner
   action (not done by this PR): add a ruleset on `main` requiring a pull request and the `pr-evidence` check (and the
   proposed CI job once it exists), blocking force-pushes and deletion (audit F2). Until then the mechanisms are the
