@@ -18,8 +18,9 @@ pub const PAPER_TRADING_URL: &str = "https://paper-api.alpaca.markets";
 
 /// Validates an Alpaca base URL read from the environment variable `var` before any request (and so any API
 /// key header) is sent to it: it must parse, use https, have `alpaca.markets` or a subdomain of it as host, and
-/// carry no credentials, path, query or fragment. Returns it without the trailing slash, because request URLs are
-/// built as `{base}/v2/...`. Errors name the variable but never echo its value.
+/// carry no port (other than the implicit 443), credentials, path, query or fragment. Returns it without the
+/// trailing slash, because request URLs are built as `{base}/v2/...`. Errors name the variable but never echo
+/// its value.
 pub fn check_alpaca_url(var: &str, value: &str) -> Result<String> {
     let url = Url::parse(value).map_err(|_| anyhow!("{var} is not a valid URL"))?;
     if url.scheme() != "https" {
@@ -28,6 +29,9 @@ pub fn check_alpaca_url(var: &str, value: &str) -> Result<String> {
     let host = url.domain().unwrap_or_default();
     if host != "alpaca.markets" && !host.ends_with(".alpaca.markets") {
         bail!("{var} must point to alpaca.markets or a subdomain of it");
+    }
+    if url.port().is_some() {
+        bail!("{var} must not set a port");
     }
     if !url.username().is_empty() || url.password().is_some() {
         bail!("{var} must not contain credentials");
@@ -339,6 +343,9 @@ mod tests {
             "https://user:pw@data.alpaca.markets",
             "https://data.alpaca.markets/v2",
             "https://data.alpaca.markets/?x=1",
+            "https://data.alpaca.markets/#x",
+            "https://data.alpaca.markets:8443",
+            "https://alpaca.markets.",
             "not a url",
             "",
         ];
