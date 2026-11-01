@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Days, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use reqwest::header::{HeaderValue, RETRY_AFTER};
@@ -15,6 +15,32 @@ use crate::store::DailyBar;
 pub const DATA_URL: &str = "https://data.alpaca.markets";
 /// Paper-trading keys only work against the paper endpoint.
 pub const PAPER_TRADING_URL: &str = "https://paper-api.alpaca.markets";
+
+/// Validates an Alpaca base URL read from the environment variable `var` before any request (and so any API
+/// key header) is sent to it: it must parse, use https, have `alpaca.markets` or a subdomain of it as host, and
+/// carry no port (other than the implicit 443), credentials, path, query or fragment. Returns it without the
+/// trailing slash, because request URLs are built as `{base}/v2/...`. Errors name the variable but never echo
+/// its value.
+pub fn check_alpaca_url(var: &str, value: &str) -> Result<String> {
+    let url = Url::parse(value).map_err(|_| anyhow!("{var} is not a valid URL"))?;
+    if url.scheme() != "https" {
+        bail!("{var} must use https");
+    }
+    let host = url.domain().unwrap_or_default();
+    if host != "alpaca.markets" && !host.ends_with(".alpaca.markets") {
+        bail!("{var} must point to alpaca.markets or a subdomain of it");
+    }
+    if url.port().is_some() {
+        bail!("{var} must not set a port");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{var} must not contain credentials");
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        bail!("{var} must be a base URL without path, query or fragment");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Adjustment {
@@ -291,6 +317,51 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn alpaca_url_accepts_defaults_and_live() {
+        for url in [DATA_URL, PAPER_TRADING_URL, "https://api.alpaca.markets", "https://alpaca.markets"] {
+            assert_eq!(check_alpaca_url("V", url).unwrap(), url);
+        }
+    }
+
+    #[test]
+    fn alpaca_url_normalizes_trailing_slash_and_case() {
+        assert_eq!(check_alpaca_url("V", "https://paper-api.alpaca.markets/").unwrap(), PAPER_TRADING_URL);
+        assert_eq!(check_alpaca_url("V", " https://Data.Alpaca.Markets:443/").unwrap(), DATA_URL);
+        // IDNA maps the ideographic full stop to '.', and the client gets the normalized host, not the raw text.
+        assert_eq!(check_alpaca_url("V", "https://data.alpaca。markets").unwrap(), DATA_URL);
+    }
+
+    #[test]
+    fn alpaca_url_rejects_http_other_hosts_and_garbage() {
+        let rejected = [
+            "http://paper-api.alpaca.markets",
+            "http://127.0.0.1:8080",
+            "https://example.com",
+            "https://alpaca.markets.example.com",
+            "https://evilalpaca.markets",
+            "https://203.0.113.7",
+            "https://user:pw@data.alpaca.markets",
+            "https://data.alpaca.markets/v2",
+            "https://data.alpaca.markets/?x=1",
+            "https://data.alpaca.markets/#x",
+            "https://data.alpaca.markets:8443",
+            "https://alpaca.markets.",
+            "https://[::1]",
+            "https://[2001:db8::1]:443",
+            "https://data.xn--alpaca-markets.example",
+            "not a url",
+            "",
+        ];
+        for url in rejected {
+            let err = check_alpaca_url("ALPACA_DATA_URL", url).unwrap_err().to_string();
+            assert!(err.starts_with("ALPACA_DATA_URL "), "{url}: {err}");
+            if !url.is_empty() {
+                assert!(!err.contains(url), "error echoes the value: {err}");
+            }
+        }
+    }
 
     fn client(server: &MockServer) -> AlpacaClient {
         let mut c = AlpacaClient::new(reqwest::Client::new(), server.uri(), server.uri(), "kid", "ksecret").unwrap();

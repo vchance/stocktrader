@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::{Days, NaiveDate, Utc};
 use chrono_tz::America::New_York;
 use clap::{Parser, Subcommand};
-use st_marketdata::alpaca::{DATA_URL, PAPER_TRADING_URL};
+use st_marketdata::alpaca::{DATA_URL, PAPER_TRADING_URL, check_alpaca_url};
 use st_marketdata::{AlpacaClient, SyncConfig, summarize, sync};
 use tracing_subscriber::EnvFilter;
 
@@ -54,14 +54,20 @@ async fn main() -> Result<()> {
             let env = |key: &str| std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
             let key_id = env("APCA_API_KEY_ID").context("APCA_API_KEY_ID is not set")?;
             let secret = env("APCA_API_SECRET_KEY").context("APCA_API_SECRET_KEY is not set")?;
+            // Checked before the client exists: the API keys go in a header of every request to these URLs.
+            let data_url = check_alpaca_url("ALPACA_DATA_URL", &env("ALPACA_DATA_URL").unwrap_or_else(|| DATA_URL.into()))?;
+            let trading_url =
+                check_alpaca_url("ALPACA_TRADING_URL", &env("ALPACA_TRADING_URL").unwrap_or_else(|| PAPER_TRADING_URL.into()))?;
             let http = reqwest::Client::builder()
                 .user_agent(concat!("stocktrader-marketdata/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(60))
+                // Never follow redirects: reqwest keeps custom headers (the APCA-* keys) across a cross-host hop.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?;
             let mut client = AlpacaClient::new(
                 http,
-                env("ALPACA_DATA_URL").unwrap_or_else(|| DATA_URL.into()),
-                env("ALPACA_TRADING_URL").unwrap_or_else(|| PAPER_TRADING_URL.into()),
+                data_url,
+                trading_url,
                 &key_id,
                 &secret,
             )?;
