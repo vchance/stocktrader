@@ -1,0 +1,38 @@
+# .github/workflows/ci.yml — build, lint and test the workspace on every PR and on push to main.
+# No secrets: the tests use wiremock loopback servers (PROFILE.md › Required services for tests).
+# `cargo fmt --all --check` is not run yet: main is not rustfmt-clean today (740 hunks in 62 files at d8b8eb5);
+# add the step in the same PR that reformats the tree.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions: { contents: read }
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+jobs:
+  ci:
+    name: ci
+    # Repo/org variable RUNS_ON_SMALL (JSON list of labels) selects the runner; unset = GitHub-hosted ubuntu-24.04.
+    # This job executes PR code, including PRs from forks of this public repo: RUNS_ON_SMALL must only ever name
+    # GitHub-hosted (ephemeral) runner labels, never a self-hosted runner. Fork PRs are not skipped here; requiring
+    # approval before fork-PR workflows run is a repository setting (owner).
+    runs-on: ${{ fromJSON(vars.RUNS_ON_SMALL || '["ubuntu-24.04"]') }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with: { persist-credentials: false }   # read-only job; no token left in .git/config
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec   # stable branch @ 2026-10-16
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0   # v2.9.3
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }   # PRs restore the cache but only main writes it
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked
+      - name: build (release)
+        run: cargo build --workspace --release --locked
