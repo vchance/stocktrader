@@ -18,6 +18,9 @@ jobs:
   ci:
     name: ci
     # Repo/org variable RUNS_ON_SMALL (JSON list of labels) selects the runner; unset = GitHub-hosted ubuntu-24.04.
+    # This job executes PR code, including PRs from forks of this public repo: RUNS_ON_SMALL must only ever name
+    # GitHub-hosted (ephemeral) runner labels, never a self-hosted runner. Fork PRs are not skipped here; requiring
+    # approval before fork-PR workflows run is a repository setting (owner).
     runs-on: ${{ fromJSON(vars.RUNS_ON_SMALL || '["ubuntu-24.04"]') }}
     timeout-minutes: 45
     steps:

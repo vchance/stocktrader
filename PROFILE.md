@@ -43,18 +43,18 @@ written for "until a CI test job exists"; the job now exists and the rule stays 
 | Changed paths | Checks that run on the PR | Evidence recorded as |
 |---|---|---|
 | `README.md`, other `**/*.md` except `AGENTS.md`, `PROFILE.md` | PR review (core D6); no doc linter is configured | `docs: reviewed`; build/test `n/a: docs only` |
-| `AGENTS.md`, `PROFILE.md`, `CLAUDE.md`, `.agent-rules/**`, `.githooks/**`, `.claude/**`, `.github/**` | `policy-drift` + `pr-evidence` (CI, the only automation in this repo); **high tier** (R9) | per check |
-| `crates/cli/**` | manual: `cargo test -p st-cli` + clippy + fmt (AGENTS.md › Commands) | `cargo test -p st-cli: passed (N tests) @ sha (manual, date, operator)` |
-| `crates/signals/**` | manual: `cargo test -p st-signals -p st-cli` + clippy + fmt | as above |
-| `crates/fundamentals/**` | manual: `cargo test -p st-fundamentals -p st-cli` + clippy + fmt | as above |
-| `crates/marketdata/**` | manual: `cargo test -p st-marketdata -p st-cli` + clippy + fmt | as above |
-| `crates/collector/**` | manual: `cargo test -p st-collector -p st-signals -p st-cli` + clippy + fmt; security playbook if `src/config.rs` or a source's auth changes | as above |
-| `crates/paper/**` | manual: `cargo test -p st-paper -p st-cli` + clippy + fmt; **security playbook always** | as above |
-| `crates/engine/**` | manual: `cargo test -p st-engine -p st-marketdata -p st-paper -p st-cli` + clippy + fmt | as above |
-| `crates/core/**`, `crates/data/**`, `crates/risk/**`, `crates/strategies/**` | **escalation: full suite** `cargo test --workspace` (each is consumed by engine, marketdata, paper and cli); `crates/risk/**` also triggers the security playbook | per check |
-| `plans/**` | manual: `cargo run -p st-cli -- plans list` (every file valid) + `cargo test -p st-cli`; a plan whose `mode` becomes `paper`, or a change to `plans/_research.toml` `holdout_start`, is an Owner decision | per check |
+| `AGENTS.md`, `PROFILE.md`, `CLAUDE.md`, `.agent-rules/**`, `.githooks/**`, `.claude/**`, `.github/**` | `policy-drift` + `pr-evidence` + `ci` (CI); **high tier** (R9) | per check |
+| `crates/cli/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-cli`) + manual fmt (AGENTS.md › Commands) | `ci: passed (N tests) @ sha (CI run URL)`; fmt `@ sha (manual, date, operator)` |
+| `crates/signals/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-signals -p st-cli`) + manual fmt | as above |
+| `crates/fundamentals/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-fundamentals -p st-cli`) + manual fmt | as above |
+| `crates/marketdata/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-marketdata -p st-cli`) + manual fmt | as above |
+| `crates/collector/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-collector -p st-signals -p st-cli`) + manual fmt; security playbook if `src/config.rs` or a source's auth changes | as above |
+| `crates/paper/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-paper -p st-cli`) + manual fmt; **security playbook always** | as above |
+| `crates/engine/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-engine -p st-marketdata -p st-paper -p st-cli`) + manual fmt | as above |
+| `crates/core/**`, `crates/data/**`, `crates/risk/**`, `crates/strategies/**` | **escalation: full suite** `cargo test --workspace`, run by `ci` (each is consumed by engine, marketdata, paper and cli); `crates/risk/**` also triggers the security playbook | per check |
+| `plans/**` | manual: `cargo run -p st-cli -- plans list` (every file valid) + `ci` (tests); a plan whose `mode` becomes `paper`, or a change to `plans/_research.toml` `holdout_start`, is an Owner decision | per check |
 | `deploy/**`, `Dockerfile`, `compose.yaml`, `.dockerignore`, `.env.example` | manual: `bash -n deploy/collector.sh`; image build and `deploy/collector.sh` runs only by the owner on `jabrony` (agents do not run Docker there); high tier | pasted evidence (date, SHA, operator) |
-| `Cargo.toml`, `Cargo.lock`, any `crates/*/Cargo.toml` | **escalation: full suite** `cargo test --workspace` + clippy + fmt | per check |
+| `Cargo.toml`, `Cargo.lock`, any `crates/*/Cargo.toml` | **escalation: full suite** `cargo test --workspace` + clippy (both run by `ci`) + manual fmt | per check |
 | Uncertain mapping / more than two crates / cross-crate refactor | **escalation: full suite** | per check |
 
 Escalation triggers (any one → `cargo test --workspace`): shared crate (`core`, `data`, `risk`, `strategies`),
@@ -73,7 +73,7 @@ variable is set (`gh variable list --repo vchance/stocktrader` empty, 2026-10-31
 | Integration batch | `ci` (`.github/workflows/ci.yml`): clippy `-D warnings`, `cargo test --workspace`, `cargo build --workspace --release` (all `--locked`) on hosted `ubuntu-24.04` via `RUNS_ON_SMALL`, `permissions: contents: read`, `timeout-minutes: 45`, no secrets. `cargo fmt --all --check` is left out until the tree is reformatted | every PR commit and every push to `main` | author (PR); merger (`main`) |
 | Scheduled | none. Proposed — owner decision: weekly `cargo audit` (or `cargo deny`) once the CI job exists | — | owner |
 | Release | none automated; deployment is the owner's `deploy/collector.sh update` on `jabrony` (Release and operations) | owner | owner |
-| Manual with evidence | every build/test check in Check selection; `bash -n deploy/collector.sh`; owner-run `deploy/collector.sh paper-trade` dry run (no `--submit`) after a deploy that touches the order path | per PR that touches the paths; pasted in the PR with date, SHA, operator, exit code, test count | author (owner for `jabrony`) |
+| Manual with evidence | what `ci` does not run: `cargo fmt --all --check`, `cargo run -p st-cli -- plans list`, `bash -n deploy/collector.sh`, image build; owner-run `deploy/collector.sh paper-trade` dry run (no `--submit`) after a deploy that touches the order path | per PR that touches the paths; pasted in the PR with date, SHA, operator, exit code, test count | author (owner for `jabrony`) |
 
 ## Review triggers
 | Playbook | Triggered by paths/changes |
