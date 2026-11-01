@@ -4,7 +4,7 @@
 |---|---|
 | Repository | vchance/stocktrader · default branch `main` · visibility **public** · GitHub plan Free (public repos can have rulesets; none exist today: `gh api repos/vchance/stocktrader/rulesets` returned 0 on 2026-10-31) |
 | Classification | active product (single-user US-equity research and paper-trading system; README.md). Young: 30 commits, all 2026-10-27 (audit `evidence/repos-B.md` › stocktrader) |
-| Accountable owner | Von Chance (vchance) — merge authority for **high** tier; approver of exceptions; sole operator of the server `jabrony` and of the Alpaca, SEC, Reddit and Finnhub accounts |
+| Accountable owner | Von Chance (vchance) — approver of exceptions and owner-reserved decisions (no merge-acceptance step since core 0.1.9); sole operator of the server `jabrony` and of the Alpaca, SEC, Reddit and Finnhub accounts |
 | Supported platforms | Linux Docker host `jabrony` (README › Running on a server; `Dockerfile`, `compose.yaml`, `deploy/collector.sh`) = `manual` (owner); developer machine via `cargo` (README top) = `manual`. Nothing is `CI`: there is no build or test workflow |
 | Toolchain | Rust, edition 2024, workspace resolver 3 (`Cargo.toml`), `Cargo.lock` tracked. No `rust-toolchain.toml`; the image builds with `rust:1.97-slim-trixie` (`Dockerfile:5`) and runs on `debian:trixie-slim`. No `rustfmt.toml`/`clippy.toml`; lint and format are not enforced anywhere |
 | Required services for tests | none external: HTTP clients are tested against `wiremock` loopback servers (`crates/{paper,marketdata,fundamentals,collector,cli}`), and `check_base_url` (`crates/paper/src/alpaca.rs:150`) admits loopback for that purpose. Whether any test reaches the network was not verified (audit: unknown). No CI provides anything |
@@ -84,9 +84,8 @@ variable is set (`gh variable list --repo vchance/stocktrader` empty, 2026-10-31
 ## Merge authority
 - Low: `.agent-rules/merge.sh <n>` once core R3–R6 hold (D5). Only prose-docs PRs can be low.
 - Until a CI test job exists, **every PR that changes anything outside prose docs is classified high** (AGENTS.md › A1,
-  stricter than core §3): `merge.sh` refuses any tier but low/standard, so this is enforced by the wrapper; a
-  standard-tier code PR would otherwise merge with only `pr-evidence` green.
-- High: owner comments `approved: <sha>` before merge. Emergency: owner; follow-up PR within 7 days.
+  stricter than core §3): since core 0.1.9 the wrapper merges every tier, so this rule sets review depth, not who merges; the manual build/test evidence recorded in the PR and the independent reviewer's check of it are the only verification (known gap until CI exists).
+- High: `.agent-rules/merge.sh <n>` once core R3–R6 hold and the independent review verdict `ready` for the head is recorded (D5); no owner acceptance step (owner decision 2026-11-01). Emergency: declared only by the owner (vchance), never by the agent; the PR names the declarer; follow-up PR within 7 days.
 - Server-side enforcement available: **rulesets are possible (public repository) but none are configured.** Owner
   action (not done by this PR): add a ruleset on `main` requiring a pull request and the `pr-evidence` check (and the
   proposed CI job once it exists), blocking force-pushes and deletion (audit F2). Until then the mechanisms are the
@@ -102,14 +101,14 @@ D-rule is an override, not an exception: in force only as an `overrides: Dn` blo
 ### Proposed D-rule overrides (not in force)
 Moved into `AGENTS.md › Overrides` only once the owner accepts it; until then the core default stands as written.
 - proposed `overrides: D1` — the reviewer runs the `cargo test` selection from Check selection (and clippy) on the PR head and says what it ran — why: there is no CI evidence to reuse (audit F15, `06-worked-examples.md` §5) — authority: owner decision pending — scope: `crates/**`, `plans/**`, `Cargo.toml`, `Cargo.lock` — review: when the proposed CI job exists, or 2027-01-31.
-- D5 needs no override: the high-tier rule (A1) keeps non-docs PRs out of the wrapper's auto-merge.
+- D5 needs no override: since core 0.1.9 the wrapper merges every tier; the high-tier rule in Merge authority sets review depth for non-docs PRs, and the recorded manual evidence plus the independent review are the verification.
 
 ## Release and operations (core R11)
 | Field | Value |
 |---|---|
 | Versioning | workspace `version = "0.1.0"`, `publish = false` (`Cargo.toml`); no git tags. Not bumped per change. Proposed — owner decision: tag the commit deployed to `jabrony` |
 | Changelog / release notes | none; the README's Roadmap and Decisions tables record state. PR descriptions are the record |
-| Release procedure | owner-only: merge to `main`, then on `jabrony` `deploy/collector.sh update` (`git pull --ff-only` + rebuild + restart the collector; `deploy/collector.sh:71-73`). Timer jobs (`sync-marketdata`, `sync-fundamentals`, `paper-trade`) rebuild the image from the server checkout on their next run, so a pulled change reaches the paper timer at its next 08:45 New York run (`deploy/collector.sh:519`, `:555`) |
+| Release procedure | owner-only deploy: after the PR merges to `main` (agent, `.agent-rules/merge.sh`, D5), the owner runs on `jabrony` `deploy/collector.sh update` (`git pull --ff-only` + rebuild + restart the collector; `deploy/collector.sh:71-73`). Timer jobs (`sync-marketdata`, `sync-fundamentals`, `paper-trade`) rebuild the image from the server checkout on their next run, so a pulled change reaches the paper timer at its next 08:45 New York run (`deploy/collector.sh:519`, `:555`) |
 | Deploy targets | Docker on `jabrony`: collector service (restart unless-stopped) and one-shot jobs from the same image `vchance-stocktrader`; systemd user timers for market data (Tue–Sat 03:00 NY), fundamentals (06:00 NY), paper trading (Mon–Fri 08:45 NY), health/housekeeping. No crates.io publish |
 | Rollback | revert the PR on `main`, then `deploy/collector.sh update` on `jabrony`. To stop trading immediately: create `data/live/KILL` (blocks new exposure; exits still go out; README › Paper trading). Data files are replaced only as staged pairs (README › Market data) and the raw archive is backed up to `BACKUP_DEST`. Never tested as a drill: to confirm |
 | Post-release watch | `deploy/collector.sh health` and `status`; the next paper run's report on `ALERT_WEBHOOK_URL`; `journalctl --user -u stocktrader-marketdata` after the next sync. One trading day for order-path changes (owner) |

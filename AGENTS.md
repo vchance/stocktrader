@@ -1,7 +1,7 @@
 # Agent instructions — stocktrader
 
 <!-- agent-rules manifest (checked by policy-drift; keep these lines exact) -->
-policy: agent-rules/core@0.1.x   ·   profile: PROFILE.md   ·   core-digest: ca342c69b4f3
+policy: agent-rules/core@0.1.x   ·   profile: PROFILE.md   ·   core-digest: 1e069fd93cda
 
 Read, in this order: (1) `.agent-rules/core.md` — the shared standard this repository follows; (2) `PROFILE.md`; (3) the sections below. Then classify the change (core R2) before editing anything.
 
@@ -56,8 +56,8 @@ Never pass `--submit` (see Repository additions).
   checkout, so whatever is on `main` and pulled there is what trades next.
 
 ## Repository additions
-- **A1** Until a CI test job exists, every PR that changes anything outside prose docs is classified **high** tier and
-  the owner merges it (stricter than core §3; PROFILE.md › Merge authority).
+- **A1** Until a CI test job exists, every PR that changes anything outside prose docs is classified **high** tier
+  (stricter than core §3; this sets review depth, the wrapper merges every tier since core 0.1.9; PROFILE.md › Merge authority).
 - **A2** Agents never run `--submit` (`stocktrader paper`, `stocktrader plans paper`, `deploy/collector.sh paper-trade`),
   never set `--allow-open`, and never create, edit or delete files under `data/live/` (including `KILL`). Dry runs are
   allowed only with keys the owner has already configured; agents do not handle broker keys (audit
