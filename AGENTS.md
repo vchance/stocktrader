@@ -56,8 +56,8 @@ Never pass `--submit` (see Repository additions).
   checkout, so whatever is on `main` and pulled there is what trades next.
 
 ## Repository additions
-- **A1** Until a CI test job exists, every PR that changes anything outside prose docs is classified **high** tier and
-  the owner merges it (stricter than core §3; PROFILE.md › Merge authority).
+- **A1** Until a CI test job exists, every PR that changes anything outside prose docs is classified **high** tier
+  (review depth; since core 0.1.9 the wrapper merges every tier; stricter than core §3; PROFILE.md › Merge authority).
 - **A2** Agents never run `--submit` (`stocktrader paper`, `stocktrader plans paper`, `deploy/collector.sh paper-trade`),
   never set `--allow-open`, and never create, edit or delete files under `data/live/` (including `KILL`). Dry runs are
   allowed only with keys the owner has already configured; agents do not handle broker keys (audit
