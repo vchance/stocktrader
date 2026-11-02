@@ -10,12 +10,12 @@
 | Required services for tests | none external: HTTP clients are tested against `wiremock` loopback servers (`crates/{paper,marketdata,fundamentals,collector,cli}`), and `check_base_url` (`crates/paper/src/alpaca.rs:150`) admits loopback for that purpose. Whether any test reaches the network was not verified (audit: unknown). No CI provides anything |
 | CI runners (D9) | GitHub-hosted `ubuntu-24.04` (`ci`, policy workflows) — public repository, stays hosted (D9, owner decision 2026-11-01: free minutes; fork PRs never on paid runners); non-Ubicloud jobs (allowed by D9, listed here, not in Exceptions): none — Ubicloud coverage confirmed by: n/a (public repo keeps hosted runners); `RUNS_ON_SMALL` unset (fallback is the intended hosted label) |
 
-## Test matrix (core D10; BrowserStack)
-| Surface | Framework | PR fast lane (smoke) | Integration / release (full) | Binary or URL under test |
+## Device testing (core D10; simulators and emulators)
+| Surface | Test runner | PR fast lane (smoke) | Integration / release (full) | Where it runs |
 |---|---|---|---|---|
-| none | — | — | — | no web or mobile surface; D10 does not apply until one is added |
+| none | — | — | — | no mobile surface; D10 does not apply until one is added |
 
-Credentials: `BROWSERSTACK_USERNAME` / `BROWSERSTACK_ACCESS_KEY` at organization level, not yet set (owner). Parallels: owner decision (default 1 per platform).
+Web surfaces: the in-repo test suite the Components table lists is the browser evidence; no multi-browser matrix (core D10, 0.1.16).
 
 ## Components and critical paths
 Consumers are the reverse dependencies from each crate's `Cargo.toml` (transitive). Test counts are `#[test]`/`#[tokio::test]`
