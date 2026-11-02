@@ -8,6 +8,14 @@
 | Supported platforms | Linux Docker host `jabrony` (README › Running on a server; `Dockerfile`, `compose.yaml`, `deploy/collector.sh`) = `manual` (owner); developer machine via `cargo` (README top) = `manual`. Linux x86_64 build, clippy and tests = `CI` (`ci` job, hosted `ubuntu-24.04`); macOS and the Docker image are not built in CI |
 | Toolchain | Rust, edition 2024, workspace resolver 3 (`Cargo.toml`), `Cargo.lock` tracked. No `rust-toolchain.toml`; the image builds with `rust:1.97-slim-trixie` (`Dockerfile:5`) and runs on `debian:trixie-slim`. No `rustfmt.toml`/`clippy.toml`; clippy is enforced by the `ci` job (stable Rust), format is not enforced (the tree is not rustfmt-clean) |
 | Required services for tests | none external: HTTP clients are tested against `wiremock` loopback servers (`crates/{paper,marketdata,fundamentals,collector,cli}`), and `check_base_url` (`crates/paper/src/alpaca.rs:150`) admits loopback for that purpose. Whether any test reaches the network was not verified (audit: unknown). No CI provides anything |
+| CI runners (D9) | GitHub-hosted `ubuntu-24.04` (`ci`, policy workflows) — public repository, stays hosted (D9, owner decision 2026-11-01: free minutes; fork PRs never on paid runners); non-Ubicloud jobs (allowed by D9, listed here, not in Exceptions): none — Ubicloud coverage confirmed by: n/a (public repo keeps hosted runners); `RUNS_ON_SMALL` unset (fallback is the intended hosted label) |
+
+## Test matrix (core D10; BrowserStack)
+| Surface | Framework | PR fast lane (smoke) | Integration / release (full) | Binary or URL under test |
+|---|---|---|---|---|
+| none | — | — | — | no web or mobile surface; D10 does not apply until one is added |
+
+Credentials: `BROWSERSTACK_USERNAME` / `BROWSERSTACK_ACCESS_KEY` at organization level, not yet set (owner). Parallels: owner decision (default 1 per platform).
 
 ## Components and critical paths
 Consumers are the reverse dependencies from each crate's `Cargo.toml` (transitive). Test counts are `#[test]`/`#[tokio::test]`
