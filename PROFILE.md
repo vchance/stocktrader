@@ -8,14 +8,14 @@
 | Supported platforms | Linux Docker host `jabrony` (README › Running on a server; `Dockerfile`, `compose.yaml`, `deploy/collector.sh`) = `manual` (owner); developer machine via `cargo` (README top) = `manual`. Linux x86_64 build, clippy and tests = `CI` (`ci` job, hosted `ubuntu-24.04`); macOS and the Docker image are not built in CI |
 | Toolchain | Rust, edition 2024, workspace resolver 3 (`Cargo.toml`), `Cargo.lock` tracked. No `rust-toolchain.toml`; the image builds with `rust:1.97-slim-trixie` (`Dockerfile:5`) and runs on `debian:trixie-slim`. No `rustfmt.toml`/`clippy.toml`; clippy is enforced by the `ci` job (stable Rust), format is not enforced (the tree is not rustfmt-clean) |
 | Required services for tests | none external: HTTP clients are tested against `wiremock` loopback servers (`crates/{paper,marketdata,fundamentals,collector,cli}`), and `check_base_url` (`crates/paper/src/alpaca.rs:150`) admits loopback for that purpose. Whether any test reaches the network was not verified (audit: unknown). No CI provides anything |
-| CI runners (D9) | GitHub-hosted `ubuntu-24.04` (`ci`, policy workflows) — public repository, stays hosted (D9, owner decision 2026-11-01: free minutes; fork PRs never on paid runners); non-Ubicloud jobs (allowed by D9, listed here, not in Exceptions): none — Ubicloud coverage confirmed by: n/a (public repo keeps hosted runners); `RUNS_ON_SMALL` unset (fallback is the intended hosted label) |
+| CI runners and storage (D9, D11) | public: GitHub-hosted (core D9, owner decision 2026-11-05): public repository, every job names one standard hosted label directly (`ubuntu-24.04`: `ci`, policy workflows) with no placement gate and no `RUNS_ON_*` variable (no placement key (`github.triggering_actor`) is read), so fork pull requests and contributors with no variables still get CI; standard labels only (no larger, paid runners); anyone with write access may run workflows; Actions › Fork pull request workflows from outside collaborators is set by the owner (R8, require approval); no self-hosted runner, no Ubicloud, no artifact store (D11: no artifact uploads, no GitHub cache is used: the `rust-cache` step(s) carry the D11 guard and are skipped on hosted runners) |
 
-## Test matrix (core D10; BrowserStack)
-| Surface | Framework | PR fast lane (smoke) | Integration / release (full) | Binary or URL under test |
+## Device testing (core D10; simulators and emulators)
+| Surface | Test runner | PR fast lane (smoke) | Integration / release (full) | Where it runs |
 |---|---|---|---|---|
-| none | — | — | — | no web or mobile surface; D10 does not apply until one is added |
+| none | — | — | — | no mobile surface; D10 does not apply until one is added |
 
-Credentials: `BROWSERSTACK_USERNAME` / `BROWSERSTACK_ACCESS_KEY` at organization level, not yet set (owner). Parallels: owner decision (default 1 per platform).
+Web surfaces: the in-repo test suite the Components table lists is the browser evidence; no multi-browser matrix (core D10, 0.1.16).
 
 ## Components and critical paths
 Consumers are the reverse dependencies from each crate's `Cargo.toml` (transitive). Test counts are `#[test]`/`#[tokio::test]`
@@ -70,15 +70,12 @@ dependency or toolchain change (`Cargo.toml`, `Cargo.lock`, `Dockerfile` base im
 anything the owner will deploy to `jabrony`, a regression that escaped selection.
 
 ## Lanes
-Runner note: `policy-drift` and `pr-evidence` run on `fromJSON(vars.RUNS_ON_SMALL || '["ubuntu-24.04"]')`. No repo
-variable is set (`gh variable list --repo vchance/stocktrader` empty, 2026-10-31), so they run on GitHub-hosted
-`ubuntu-24.04` (free for public repositories). Owner action: set `RUNS_ON_SMALL` only if a different runner is wanted
-(GitHub setting; not changed by this PR).
+Runner note: every job (`ci`, `policy-drift`, `pr-evidence`) runs on GitHub-hosted `ubuntu-24.04` (public repository, core D9, owner decision 2026-11-05): no placement gate and no `RUNS_ON_*` variable.
 
 | Lane | What runs | When | Owner of a failure |
 |---|---|---|---|
 | PR (fast) | `pr-evidence` on every PR; `policy-drift` when policy paths change; `ci` (Integration batch row) | every PR commit | author |
-| Integration batch | `ci` (`.github/workflows/ci.yml`): clippy `-D warnings`, `cargo test --workspace`, `cargo build --workspace --release` (all `--locked`) on hosted `ubuntu-24.04` via `RUNS_ON_SMALL`, `permissions: contents: read`, `timeout-minutes: 45`, no secrets. `cargo fmt --all --check` is left out until the tree is reformatted | every PR commit and every push to `main` | author (PR); merger (`main`) |
+| Integration batch | `ci` (`.github/workflows/ci.yml`): clippy `-D warnings`, `cargo test --workspace`, `cargo build --workspace --release` (all `--locked`) on hosted `ubuntu-24.04`, `permissions: contents: read`, `timeout-minutes: 45`, no secrets. `cargo fmt --all --check` is left out until the tree is reformatted | every PR commit and every push to `main` | author (PR); merger (`main`) |
 | Scheduled | none. Proposed — owner decision: weekly `cargo audit` (or `cargo deny`) once the CI job exists | — | owner |
 | Release | none automated; deployment is the owner's `deploy/collector.sh update` on `jabrony` (Release and operations) | owner | owner |
 | Manual with evidence | what `ci` does not run: `cargo fmt --all --check`, `cargo run -p st-cli -- plans list`, `bash -n deploy/collector.sh`, image build; owner-run `deploy/collector.sh paper-trade` dry run (no `--submit`) after a deploy that touches the order path | per PR that touches the paths; pasted in the PR with date, SHA, operator, exit code, test count | author (owner for `jabrony`) |
