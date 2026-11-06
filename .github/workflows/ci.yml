@@ -5,8 +5,30 @@
 name: ci
 on:
   pull_request:
+    paths-ignore:
+      # Core D2 (0.1.22): the agent-policy set and .github/** select no product job.
+      - 'AGENTS.md'
+      - '**/AGENTS.md'
+      - 'CLAUDE.md'
+      - '**/CLAUDE.md'
+      - 'PROFILE.md'
+      - '.agent-rules/**'
+      - '.claude/**'
+      - '.githooks/**'
+      - '.github/**'
   push:
     branches: [main]
+    paths-ignore:
+      # Core D2 (0.1.22): the agent-policy set and .github/** select no product job.
+      - 'AGENTS.md'
+      - '**/AGENTS.md'
+      - 'CLAUDE.md'
+      - '**/CLAUDE.md'
+      - 'PROFILE.md'
+      - '.agent-rules/**'
+      - '.claude/**'
+      - '.githooks/**'
+      - '.github/**'
 permissions: { contents: read }
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
