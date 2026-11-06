@@ -39,7 +39,7 @@ attributes counted by grep on 2026-10-31 (171 in all; the audit recorded ~159), 
 | `README.md` | owner | no | review only | readers |
 
 ## Check selection (impact-based; core D2)
-The `ci` job (`.github/workflows/ci.yml`) runs on every PR and on push to `main`: `cargo clippy --workspace
+The `ci` job (`.github/workflows/ci.yml`) runs on every PR and on push to `main` except a change that touches only the agent-policy set and `.github/**` (workflow-level `paths-ignore`, core D2 0.1.22): `cargo clippy --workspace
 --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (the full suite, so it covers every selection
 row below) and `cargo build --workspace --release --locked`, on the latest stable Rust. It does not run `cargo fmt
 --check` (the tree is not rustfmt-clean yet), `plans list`, `bash -n deploy/collector.sh` or anything on `jabrony`; those
@@ -51,7 +51,7 @@ written for "until a CI test job exists"; the job now exists and the rule stays 
 | Changed paths | Checks that run on the PR | Evidence recorded as |
 |---|---|---|
 | `README.md`, other `**/*.md` except `AGENTS.md`, `PROFILE.md` | PR review (core D6); no doc linter is configured | `docs: reviewed`; build/test `n/a: docs only` |
-| `AGENTS.md`, `PROFILE.md`, `CLAUDE.md`, `.agent-rules/**`, `.githooks/**`, `.claude/**`, `.github/**` | `policy-drift` + `pr-evidence` + `ci` (CI); **high tier** (R9) | per check |
+| `AGENTS.md`, `PROFILE.md`, `CLAUDE.md`, `.agent-rules/**`, `.githooks/**`, `.claude/**`, `.github/**` | `policy-drift` + `pr-evidence`; no product job (core D2, 0.1.22: `ci` has a workflow-level `paths-ignore` for these paths on pull_request and push; a workflow edit is first exercised by the next product change); **high tier** (R9) | per check |
 | `crates/cli/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-cli`) + manual fmt (AGENTS.md › Commands) | `ci: passed (N tests) @ sha (CI run URL)`; fmt `@ sha (manual, date, operator)` |
 | `crates/signals/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-signals -p st-cli`) + manual fmt | as above |
 | `crates/fundamentals/**` | `ci` (clippy + `cargo test --workspace`, which includes `cargo test -p st-fundamentals -p st-cli`) + manual fmt | as above |
@@ -74,8 +74,8 @@ Runner note: every job (`ci`, `policy-drift`, `pr-evidence`) runs on GitHub-host
 
 | Lane | What runs | When | Owner of a failure |
 |---|---|---|---|
-| PR (fast) | `pr-evidence` on every PR; `policy-drift` when policy paths change; `ci` (Integration batch row) | every PR commit | author |
-| Integration batch | `ci` (`.github/workflows/ci.yml`): clippy `-D warnings`, `cargo test --workspace`, `cargo build --workspace --release` (all `--locked`) on hosted `ubuntu-24.04`, `permissions: contents: read`, `timeout-minutes: 45`, no secrets. `cargo fmt --all --check` is left out until the tree is reformatted | every PR commit and every push to `main` | author (PR); merger (`main`) |
+| PR (fast) | `pr-evidence` on every PR; `policy-drift` when policy paths change; `ci` (Integration batch row) unless only policy paths and `.github/**` changed | every PR commit | author |
+| Integration batch | `ci` (`.github/workflows/ci.yml`): clippy `-D warnings`, `cargo test --workspace`, `cargo build --workspace --release` (all `--locked`) on hosted `ubuntu-24.04`, `permissions: contents: read`, `timeout-minutes: 45`, no secrets. `cargo fmt --all --check` is left out until the tree is reformatted | every PR commit and every push to `main` that touches a path outside the policy set and `.github/**` | author (PR); merger (`main`) |
 | Scheduled | none. Proposed — owner decision: weekly `cargo audit` (or `cargo deny`) once the CI job exists | — | owner |
 | Release | none automated; deployment is the owner's `deploy/collector.sh update` on `jabrony` (Release and operations) | owner | owner |
 | Manual with evidence | what `ci` does not run: `cargo fmt --all --check`, `cargo run -p st-cli -- plans list`, `bash -n deploy/collector.sh`, image build; owner-run `deploy/collector.sh paper-trade` dry run (no `--submit`) after a deploy that touches the order path | per PR that touches the paths; pasted in the PR with date, SHA, operator, exit code, test count | author (owner for `jabrony`) |
@@ -97,6 +97,8 @@ Runner note: every job (`ci`, `policy-drift`, `pr-evidence`) runs on GitHub-host
   exists and verifies clippy, the workspace tests and the release build on the head SHA; fmt and the remaining manual
   checks are verified by the evidence recorded in the PR and the independent reviewer's check of it. A1 stays until the
   owner decides otherwise.
+- Whoever merges follows the default branch's push run to its end and owns a failure there (core D5, 0.1.23).
+- Flakes (core D2, 0.1.23): tallied in issue `Flaky tests` (to be opened at the first flake); a test that flakes again within 14 days is fixed or quarantined by a profile change.
 - High: `.agent-rules/merge.sh <n>` once core R3–R6 hold and the independent review verdict `ready` for the head is recorded (D5); no owner acceptance step (owner decision 2026-11-01). Emergency: declared only by the owner (vchance), never by the agent; the PR names the declarer; follow-up PR within 7 days.
 - Server-side enforcement available: **rulesets are possible (public repository) but none are configured.** Owner
   action (not done by this PR): add a ruleset on `main` requiring a pull request and the `pr-evidence` check (and the
